@@ -1,6 +1,6 @@
 > [!IMPORTANT]
-> **x86 Mac 版（Intel / x86_64）非官方分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，仅增加 Intel Mac 构建支持，功能代码与上游一致。
-> Intel / AMD 黑苹果用户请阅读 **[X86_64.md](X86_64.md)** 从源码构建安装；下文中的 Releases 下载、「Apple Silicon」要求和应用内更新均指上游 arm64 官方版。
+> **x86 Mac 版（Intel / x86_64）非官方分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，提供 Intel / AMD 黑苹果原生构建，并已将应用内检查更新切换至本仓库 `x86_64` 通道。
+> 可直接前往本仓库 [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 下载 `x86_64` 安装包，或阅读 **[X86_64.md](X86_64.md)** 了解详情与源码构建方式；下方保留上游官方 `arm64` 原版说明。
 
 <div align="center">
   <a href="https://github.com/Enzoo404/gravitybox">

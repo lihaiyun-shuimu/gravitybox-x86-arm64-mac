@@ -1,6 +1,6 @@
 > [!IMPORTANT]
-> **x86 Mac edition (Intel / x86_64), unofficial fork** of [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox). It only adds Intel Mac build support; app code is identical to upstream.
-> Intel / AMD Hackintosh users: see **[X86_64.md](X86_64.md)** (中文) to build and install from source. Releases, the "Apple Silicon" requirement and in-app updates below refer to the upstream arm64 build.
+> **x86 Mac edition (Intel / x86_64), unofficial fork** of [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) with native Intel/AMD Hackintosh builds and an independent x86_64 in-app updater.
+> Download prebuilt `x86_64` DMGs from [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) or read **[X86_64.md](X86_64.md)** (中文) to build from source. The original upstream README below refers to the official Apple Silicon (`arm64`) release.
 
 <div align="center">
   <a href="https://github.com/Enzoo404/gravitybox">
