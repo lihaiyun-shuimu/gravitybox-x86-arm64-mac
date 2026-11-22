@@ -1,9 +1,13 @@
+> [!IMPORTANT]
+> **x86 Mac edition (Intel / x86_64), unofficial fork** of [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox). It only adds Intel Mac build support; app code is identical to upstream.
+> Intel / AMD Hackintosh users: see **[X86_64.md](X86_64.md)** (中文) to build and install from source. Releases, the "Apple Silicon" requirement and in-app updates below refer to the upstream arm64 build.
+
 <div align="center">
   <a href="https://github.com/Enzoo404/gravitybox">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="80" height="80" />
   </a>
 
-  <h1>GravityBox</h1>
+  <h1>GravityBox · x86 Mac Edition</h1>
 
   <p>
     <strong>Native macOS Companion for Google Antigravity on Apple Silicon</strong><br />

@@ -28,6 +28,7 @@
     "verify": "node tools/verify.mjs",
     "verify:strict": "node tools/verify.mjs --strict",
     "package:mac": "npm run verify && node tools/package-mac.mjs",
+    "package:mac:x64": "npm run build && node tools/package-mac-x64-local.mjs --dmg",
     "package:mac:full": "npm run verify && node tools/package-mac.mjs && node tools/update-acceptance.mjs && node tools/check-docs.mjs",
     "i18n:extract": "node tools/extract-ui-strings.mjs",
     "i18n:coverage": "node tools/coverage-report.mjs",

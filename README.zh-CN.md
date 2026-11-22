@@ -1,9 +1,13 @@
+> [!IMPORTANT]
+> **x86 Mac 版（Intel / x86_64）非官方分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，仅增加 Intel Mac 构建支持，功能代码与上游一致。
+> Intel / AMD 黑苹果用户请阅读 **[X86_64.md](X86_64.md)** 从源码构建安装；下文中的 Releases 下载、「Apple Silicon」要求和应用内更新均指上游 arm64 官方版。
+
 <div align="center">
   <a href="https://github.com/Enzoo404/gravitybox">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="80" height="80" />
   </a>
 
-  <h1>GravityBox</h1>
+  <h1>GravityBox · x86 Mac 版</h1>
 
   <p>
     <strong>面向 Apple Silicon Mac 的 Google Antigravity 原生增强伴侣</strong><br />
