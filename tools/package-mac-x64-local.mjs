@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { join, relative } from 'node:path';
-import { includeDictionaryPath, listCompiledScripts } from './release-integrity.mjs';
+import { includeDictionaryPath, listCompiledScripts, writeSha256Sidecar, verifySha256Sidecar } from './release-integrity.mjs';
 import { includePackagedAssetPath, escapeXml, computeMacBuildNumber, validateLocalizations } from './package-mac.mjs';
 import { nativeBuildArgs } from './native-build.mjs';
 const run = promisify(execFile), root = fileURLToPath(new URL('../', import.meta.url));
@@ -70,5 +70,10 @@ if (process.argv.includes('--dmg')) {
   await run('/bin/ln', ['-sf', '/Applications', join(stage, 'Applications')]);
   const dmg = join(output, `GravityBox-${version}-x86_64.dmg`);
   await run('/usr/bin/hdiutil', ['create', '-ov', '-volname', 'GravityBox', '-fs', 'HFS+', '-srcfolder', stage, '-format', 'ULFO', dmg], { maxBuffer: 2e6 });
+  await run('/usr/bin/hdiutil', ['verify', dmg], { maxBuffer: 2e6 });
+  const sidecar = await writeSha256Sidecar(dmg);
+  const sidecarCheck = await verifySha256Sidecar(dmg);
+  if (sidecarCheck.hash !== sidecar.hash) throw new Error('DMG sha256 校验文件写入后复核不一致');
   console.log(`[x64] DMG：${dmg}`);
+  console.log(`[x64] SHA-256：${sidecarCheck.hash} (${sidecar.sidecarPath})`);
 }

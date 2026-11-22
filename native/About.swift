@@ -248,7 +248,7 @@ final class AboutPage: NSObject {
         let osStr = osVer.patchVersion > 0
             ? "macOS \(osVer.majorVersion).\(osVer.minorVersion).\(osVer.patchVersion)"
             : "macOS \(osVer.majorVersion).\(osVer.minorVersion)"
-        let copyText = "GravityBox v\(ver) (\(buildPart)) · \(antigravityPart) · \(osStr) arm64"
+        let copyText = "GravityBox v\(ver) (\(buildPart)) · \(antigravityPart) · \(osStr) \(AppUpdateManager.releaseArch)"
         enableTextCopy(versionSpecLabel, value: copyText, title: L10n.t("about.copy_version_info", fallback: "复制版本与环境信息"))
     }
 

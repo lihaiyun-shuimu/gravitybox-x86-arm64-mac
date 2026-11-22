@@ -24,8 +24,15 @@ final class AppUpdateManager {
         case failed(String)
     }
 
+    #if arch(x86_64)
+    static let releaseArch = "x86_64"
+    static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/lihaiyun-shuimu/gravitybox/releases/latest")!
+    static let releasesPageURL = URL(string: "https://github.com/lihaiyun-shuimu/gravitybox/releases")!
+    #else
+    static let releaseArch = "arm64"
     static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/Enzoo404/gravitybox/releases/latest")!
     static let releasesPageURL = URL(string: "https://github.com/Enzoo404/gravitybox/releases")!
+    #endif
 
     private static func httpsURL(from raw: String?) -> URL? {
         guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -273,7 +280,7 @@ final class AppUpdateManager {
                     guard let assetName = asset["name"] as? String,
                           let downloadStr = asset["browser_download_url"] as? String,
                           let url = Self.httpsURL(from: downloadStr) else { continue }
-                    let expectedName = "GravityBox-\(remoteVersion)-arm64.dmg"
+                    let expectedName = "GravityBox-\(remoteVersion)-\(Self.releaseArch).dmg"
                     if assetName == expectedName { dmgURL = url }
                     else if assetName == expectedName + ".sha256" { sha256URL = url }
                 }
@@ -402,7 +409,7 @@ final class AppUpdateManager {
     }
 
     private func cachedDMGPath(for version: String) -> URL {
-        app.state.appendingPathComponent("updates/v\(version)/GravityBox-\(version)-arm64.dmg")
+        app.state.appendingPathComponent("updates/v\(version)/GravityBox-\(version)-\(Self.releaseArch).dmg")
     }
 
     private static func configureSilentProcess(_ proc: Process) {
@@ -631,6 +638,7 @@ final class AppUpdateManager {
         if bundlePath.hasSuffix(".app"),
            !bundlePath.hasPrefix("/Volumes/"),
            !bundlePath.contains("/build/dmg-stage/"),
+           !bundlePath.contains("/build/x64-stage/"),
            FileManager.default.isWritableFile(atPath: (bundlePath as NSString).deletingLastPathComponent) {
             return bundlePath
         }
