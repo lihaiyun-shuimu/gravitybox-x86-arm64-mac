@@ -22,7 +22,7 @@ GravityBox 致力于为 macOS 用户提供优雅、原生且注重隐私安全�
 
 ## 1. 开发环境要求
 
-- **操作系统**：macOS 14 (Sonoma) 或更高版本（推荐 Apple Silicon 芯片）
+- **操作系统**：macOS 14 (Sonoma) 或更高版本（支持 Intel / x86_64 Mac、AMD 黑苹果及 Apple Silicon）
 - **Node.js**：`>=22.15.0 <23`（推荐使用 nvm 或 fnm 管理）
 - **Swift / Xcode CLI Tools**：系统自带 `swiftc`（Xcode Command Line Tools）
 - **Google Chrome**：用于运行基于 CDP 的无头浏览器回归套件（`/Applications/Google Chrome.app`）
@@ -38,8 +38,8 @@ npm run doctor
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/Enzoo404/gravitybox.git
-cd gravitybox
+git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac.git
+cd gravitybox-x86-arm64-mac
 
 # 2. 安装开发依赖并初始化环境
 npm ci
@@ -48,7 +48,10 @@ npm run setup:dev
 # 3. 运行常规编译与单元/集成测试
 npm test
 
-# 4. 运行完整发布门禁（含浏览器回归、Swift -O 检查与全版本词典门禁）
+# 4. 打包 Intel (x86_64) Mac 应用与 DMG（详细说明见 X86_64.md）
+npm run package:mac:x64
+
+# 5. 运行完整发布门禁（含浏览器回归、Swift -O 检查与全版本词典门禁）
 npm run verify
 ```
 
@@ -123,7 +126,7 @@ npm run verify
 2. 基于 `main` 分支拉取开发分支（例如 `feat/your-feature-name`）。
 3. 编写代码并增加对应的单元测试或浏览器测试。
 4. 运行 `npm test`（日常单测）与 `npm run verify`（提交发布相关改动时），确保完整门禁通过。
-5. 推送至个人分支并向 `Enzoo404/gravitybox:main` 发起 Pull Request。
+5. 推送至个人分支并向 `lihaiyun-shuimu/gravitybox-x86-arm64-mac:main` 发起 Pull Request（若为通用核心功能改进，也欢迎同步向上游 `Enzoo404/gravitybox` 贡献）。
 6. CI 自动化检查通过后，核心维护者将对 PR 进行 Review 并合并。
 
 ## 7. 维护与版本发布

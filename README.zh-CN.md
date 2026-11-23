@@ -1,23 +1,23 @@
 > [!IMPORTANT]
-> **x86 Mac 版（Intel / x86_64）非官方分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，提供 Intel / AMD 黑苹果原生构建，并已将应用内检查更新切换至本仓库 `x86_64` 通道。
-> 可直接前往本仓库 [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 下载 `x86_64` 安装包，或阅读 **[X86_64.md](X86_64.md)** 了解详情与源码构建方式；下方保留上游官方 `arm64` 原版说明。
+> **x86 Mac 版（Intel / x86_64）非官方社区分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，提供 Intel / AMD 黑苹果原生构建，并已将应用内检查更新切换至本仓库 `x86_64` 通道。
+> 可直接前往本仓库 [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 下载 `x86_64` 安装包，或阅读 **[X86_64.md](X86_64.md)** 了解详情与源码构建方式。
 
 <div align="center">
-  <a href="https://github.com/Enzoo404/gravitybox">
+  <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="80" height="80" />
   </a>
 
   <h1>GravityBox · x86 Mac 版</h1>
 
   <p>
-    <strong>面向 Apple Silicon Mac 的 Google Antigravity 原生增强伴侣</strong><br />
+    <strong>面向 Intel (x86_64) 与 Apple Silicon Mac 的 Google Antigravity 原生增强伴侣</strong><br />
     零改包双语适配 · 输入框 Telemetry HUD · 双周期配额账单 · 多账号安全切换 · 可撤回缓存瘦身
   </p>
 
   <p>
-    <a href="https://github.com/Enzoo404/gravitybox/releases/latest"><img src="https://img.shields.io/github/v/release/Enzoo404/gravitybox?style=flat-square&color=2563EB" alt="Latest Release"></a>
-    <a href="https://github.com/Enzoo404/gravitybox/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Enzoo404/gravitybox/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
-    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Apple Silicon">
+    <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest"><img src="https://img.shields.io/github/v/release/lihaiyun-shuimu/gravitybox-x86-arm64-mac?style=flat-square&color=2563EB" alt="Latest Release"></a>
+    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Intel%20x86__64-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Intel x86_64">
+    <a href="https://github.com/Enzoo404/gravitybox"><img src="https://img.shields.io/badge/upstream-Enzoo404%2Fgravitybox-6B7280?style=flat-square&logo=github" alt="Upstream"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="MIT License"></a>
   </p>
 
@@ -64,7 +64,7 @@
 
 ## 快速上手
 
-1. **下载与安装**：前往 [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 获取最新 `GravityBox-<version>-arm64.dmg`，将 **GravityBox.app** 拖入 **Applications**。因开源版本未经过 Apple 付费公证，首次运行前在终端执行一次放行命令即可（也可在「系统设置 → 隐私与安全性」点击仍要打开）：
+1. **下载与安装**：前往本仓库 [GitHub Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 获取最新 `GravityBox-<version>-x86_64.dmg`（Apple Silicon 用户请前往[上游 Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 下载 `arm64` 版），将 **GravityBox.app** 拖入 **Applications**。因开源版本未经过 Apple 付费公证，首次运行前在终端执行一次放行命令即可（也可在「系统设置 → 隐私与安全性」点击仍要打开）：
    ```bash
    xattr -cr /Applications/GravityBox.app
    ```
@@ -234,12 +234,12 @@ HUD 挂载于每个 Antigravity 对话输入框下方，支持分栏独立状态
 
 ## 安装与升级
 
-- **运行环境**：macOS 14 (Sonoma) 或 macOS 15+ (Sequoia)、Apple Silicon (`arm64`)、官方正式版 `/Applications/Antigravity.app`（不支持也不干扰 Insiders 预览版），安装包内置运行环境、零外部依赖。
+- **运行环境**：macOS 14 (Sonoma) 或 macOS 15+ (Sequoia)、Intel / x86_64 Mac（含 AMD 黑苹果；Apple Silicon 请下载[上游官方版](https://github.com/Enzoo404/gravitybox/releases/latest)）、官方原版 `/Applications/Antigravity.app`（需保留 Google 官方签名，不支持也不干扰 Insiders 预览版），安装包内置运行环境、零外部依赖。
 - **SHA-256 校验（可选）**：
   ```bash
-  shasum -a 256 -c GravityBox-<version>-arm64.dmg.sha256
+  shasum -a 256 -c GravityBox-<version>-x86_64.dmg.sha256
   ```
-- **覆盖无损升级**：退出旧版 GravityBox 后将新版拖入 `/Applications` 替换，或在 **关于** 页检查更新（默认关闭后台检查）。账号库、历史账单、个人词典与恢复点均独立保存在 `~/Library/Application Support/GravityBox`。
+- **覆盖无损升级**：退出旧版 GravityBox 后将新版拖入 `/Applications` 替换，或在 **关于** 页点击检查更新（默认关闭后台检查，自动拉取本仓库 `x86_64` 版本）。账号库、历史账单、个人词典与恢复点均独立保存在 `~/Library/Application Support/GravityBox`。
 
 <details>
 <summary>进阶可选：为过期备用账号配置后台云端刷新凭据</summary>
@@ -278,14 +278,14 @@ flowchart LR
 源码构建需本机安装 Xcode Command Line Tools 与 Node.js `>=22.15.0 <23`：
 
 ```bash
-git clone https://github.com/Enzoo404/gravitybox.git
-cd gravitybox
+git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac.git
+cd gravitybox-x86-arm64-mac
 npm ci
 
-npm test                # 编译 TS、校验价格资产并运行单元/集成测试
-npm run check:swift     # Swift 6 AppKit 编译与布局检查
-npm run verify          # 全量发布门禁（TS + 单测 + 无头浏览器 E2E + Swift -O + 词典门禁）
-npm run package:mac     # 构建 Apple Silicon .app 与 .dmg 安装包
+npm test                    # 编译 TS、校验价格资产并运行单元/集成测试
+npm run check:swift         # Swift 6 AppKit 编译检查（自动匹配 x86_64 / arm64）
+npm run package:mac:x64     # 构建 Intel (x86_64) .app、.dmg 与 .sha256（详见 X86_64.md）
+npm run package:mac         # 构建 Apple Silicon (arm64) .app 与 .dmg 安装包
 ```
 
 <details>
@@ -334,14 +334,14 @@ Antigravity 运行时会持续持有本地 SQLite（`state.vscdb`）与认证文
 
 ## 参与贡献与开源协议
 
-提交代码或反馈请先阅读 [CONTRIBUTING.md](./CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)、[SECURITY.md](./SECURITY.md) 与 [CHANGELOG.md](./CHANGELOG.md)，欢迎在 [GitHub Issues](https://github.com/Enzoo404/gravitybox/issues) 提交讨论。
+提交代码或反馈请先阅读 [X86_64.md](./X86_64.md)、[CONTRIBUTING.md](./CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)、[SECURITY.md](./SECURITY.md) 与 [CHANGELOG.md](./CHANGELOG.md)，x86_64 版问题欢迎在 [GitHub Issues](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/issues) 提交讨论。上游原项目：[Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)。
 
 <div align="center">
-  <a href="https://star-history.com/#Enzoo404/gravitybox&Date">
-    <img src="https://api.star-history.com/svg?repos=Enzoo404/gravitybox&type=Date" alt="Star History Chart" width="680" />
+  <a href="https://star-history.com/#lihaiyun-shuimu/gravitybox-x86-arm64-mac&Date">
+    <img src="https://api.star-history.com/svg?repos=lihaiyun-shuimu/gravitybox-x86-arm64-mac&type=Date" alt="Star History Chart" width="680" />
   </a>
 </div>
 
 <p align="center">
-  <sub>基于 <a href="./LICENSE">MIT License</a> 开源 · 第三方许可见 <a href="./THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a> · 与 Google / Antigravity 官方无从属或背书关系。</sub>
+  <sub>Fork 自 <a href="https://github.com/Enzoo404/gravitybox">Enzoo404/gravitybox</a> · 基于 <a href="./LICENSE">MIT License</a> 开源 · 第三方许可见 <a href="./THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a> · 与 Google / Antigravity 官方无从属或背书关系。</sub>
 </p>

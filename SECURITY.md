@@ -2,6 +2,9 @@
 
 GravityBox 高度重视用户的数据安全与隐私保护。作为一款涉及本地账号凭据管理与系统级辅助功能的工具箱，我们采取了多层次的安全与隐私隔离设计。
 
+> [!NOTE]
+> 本仓库（`lihaiyun-shuimu/gravitybox-x86-arm64-mac`）是 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) 的 Intel / x86_64 Mac 社区分支。若安全问题涉及本分支的 `x86_64` 构建、打包或更新通道，请直接在本仓库提报；若属于上游核心逻辑漏洞，建议同时向上游仓库私密提报。
+
 ---
 
 ## 1. 受支持的版本 (Supported Versions)
@@ -25,7 +28,7 @@ GravityBox 高度重视用户的数据安全与隐私保护。作为一款涉及
 1. **GitHub Private Vulnerability Reporting**（首选）：
    前往仓库的 **Security** -> **Advisories** -> **Report a vulnerability** 页面，在线提交加密漏洞报告。
 2. **私密邮件沟通**：
-   发送详细报告至项目维护者邮箱：[enzoo404@users.noreply.github.com](mailto:enzoo404@users.noreply.github.com)
+   发送详细报告至本分支维护者邮箱：[259303138+lihaiyun-shuimu@users.noreply.github.com](mailto:259303138+lihaiyun-shuimu@users.noreply.github.com)（如涉及上游核心漏洞，也可同步报告至上游维护者）
 
 ### 提报内容建议包含：
 - 漏洞类型与详细描述（如凭据隔离失效、IPC 未授权执行、未脱敏日志泄露等）；

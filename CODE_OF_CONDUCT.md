@@ -38,7 +38,7 @@
 
 滥用、骚扰或其他不可接受的行为可通过联系项目维护者进行举报：
 
-* **联系邮箱**：[enzoo404@users.noreply.github.com](mailto:enzoo404@users.noreply.github.com)
+* **联系邮箱**：[259303138+lihaiyun-shuimu@users.noreply.github.com](mailto:259303138+lihaiyun-shuimu@users.noreply.github.com)
 
 所有投诉都将得到及时和公平的审查与调查。所有社区维护者都有义务尊重任何事件举报者的隐私和安全。
 

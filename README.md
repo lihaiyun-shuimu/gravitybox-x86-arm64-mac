@@ -1,23 +1,23 @@
 > [!IMPORTANT]
-> **x86 Mac edition (Intel / x86_64), unofficial fork** of [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) with native Intel/AMD Hackintosh builds and an independent x86_64 in-app updater.
-> Download prebuilt `x86_64` DMGs from [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) or read **[X86_64.md](X86_64.md)** (中文) to build from source. The original upstream README below refers to the official Apple Silicon (`arm64`) release.
+> **x86 Mac edition (Intel / x86_64), unofficial community fork** of [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) with native Intel / AMD Hackintosh builds and an independent `x86_64` in-app updater channel.
+> Download prebuilt `x86_64` DMGs from [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) or read **[X86_64.md](X86_64.md)** (中文) for build & upgrade details.
 
 <div align="center">
-  <a href="https://github.com/Enzoo404/gravitybox">
+  <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="80" height="80" />
   </a>
 
   <h1>GravityBox · x86 Mac Edition</h1>
 
   <p>
-    <strong>Native macOS Companion for Google Antigravity on Apple Silicon</strong><br />
+    <strong>Native macOS Companion for Google Antigravity on Intel (x86_64) &amp; Apple Silicon</strong><br />
     Zero-Patch Bilingual UI · In-IDE Telemetry HUD · Dual-Window Quotas · Safe Account Switching · Reversible Cache Trim
   </p>
 
   <p>
-    <a href="https://github.com/Enzoo404/gravitybox/releases/latest"><img src="https://img.shields.io/github/v/release/Enzoo404/gravitybox?style=flat-square&color=2563EB" alt="Latest Release"></a>
-    <a href="https://github.com/Enzoo404/gravitybox/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Enzoo404/gravitybox/ci.yml?branch=main&style=flat-square&logo=github" alt="CI Status"></a>
-    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Apple%20Silicon-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Apple Silicon">
+    <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest"><img src="https://img.shields.io/github/v/release/lihaiyun-shuimu/gravitybox-x86-arm64-mac?style=flat-square&color=2563EB" alt="Latest Release"></a>
+    <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Intel%20x86__64-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Intel x86_64">
+    <a href="https://github.com/Enzoo404/gravitybox"><img src="https://img.shields.io/badge/upstream-Enzoo404%2Fgravitybox-6B7280?style=flat-square&logo=github" alt="Upstream"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="MIT License"></a>
   </p>
 
@@ -64,7 +64,7 @@
 
 ## Quick Start
 
-1. **Install**: Download `GravityBox-<version>-arm64.dmg` from [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest), drag **GravityBox.app** into **Applications**, and clear Gatekeeper quarantine once (open-source builds are not Apple-notarized):
+1. **Install**: Download `GravityBox-<version>-x86_64.dmg` from [GitHub Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) (Apple Silicon users can download `arm64` from [upstream](https://github.com/Enzoo404/gravitybox/releases/latest)), drag **GravityBox.app** into **Applications**, and clear Gatekeeper quarantine once (open-source builds are not Apple-notarized):
    ```bash
    xattr -cr /Applications/GravityBox.app
    ```
@@ -234,12 +234,12 @@ Hover over or click any capsule to inspect its breakdown (`Esc` or click outside
 
 ## Installation
 
-- **Requirements**: macOS 14 (Sonoma) or macOS 15+ (Sequoia), Apple Silicon (`arm64`), official stable `/Applications/Antigravity.app` (Insiders is neither supported nor altered), and zero external runtime dependencies.
+- **Requirements**: macOS 14 (Sonoma) or macOS 15+ (Sequoia), Intel / x86_64 Mac (including AMD Hackintosh; Apple Silicon builds available from [upstream](https://github.com/Enzoo404/gravitybox/releases/latest)), official unmodified `/Applications/Antigravity.app` (Insiders is neither supported nor altered), and zero external runtime dependencies.
 - **Verify Checksum (optional)**:
   ```bash
-  shasum -a 256 -c GravityBox-<version>-arm64.dmg.sha256
+  shasum -a 256 -c GravityBox-<version>-x86_64.dmg.sha256
   ```
-- **Non-Destructive Upgrades**: Quit GravityBox and drag the new app over `/Applications/GravityBox.app`, or enable **Auto-Check Updates** in **About** (off by default). Accounts, ledgers, custom dictionary overrides, and cleanup recovery points live in `~/Library/Application Support/GravityBox`.
+- **Non-Destructive Upgrades**: Quit GravityBox and drag the new app over `/Applications/GravityBox.app`, or enable **Auto-Check Updates** in **About** (off by default; automatically pulls `x86_64` releases from this repository). Accounts, ledgers, custom dictionary overrides, and cleanup recovery points live in `~/Library/Application Support/GravityBox`.
 
 <details>
 <summary>Optional: Background OAuth refresh credentials for expired standby accounts</summary>
@@ -278,14 +278,14 @@ flowchart LR
 Requires Xcode Command Line Tools and Node.js `>=22.15.0 <23`:
 
 ```bash
-git clone https://github.com/Enzoo404/gravitybox.git
-cd gravitybox
+git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac.git
+cd gravitybox-x86-arm64-mac
 npm ci
 
-npm test                # Build TS, verify pricing parity, and run unit/integration suites
-npm run check:swift     # Typecheck Swift 6 AppKit UI and test harness
-npm run verify          # Full gate: TS, tests, headless browser CDP E2E, Swift -O, dict gates
-npm run package:mac     # Build arm64 .app and distributable .dmg
+npm test                    # Build TS, verify pricing parity, and run unit/integration suites
+npm run check:swift         # Typecheck Swift 6 AppKit UI (auto-selects x86_64 / arm64)
+npm run package:mac:x64     # Build Intel (x86_64) .app, .dmg, and .sha256 (see X86_64.md)
+npm run package:mac         # Build Apple Silicon (arm64) .app and .dmg with full verify gate
 ```
 
 <details>
@@ -334,14 +334,14 @@ Quit GravityBox (Antigravity requires no cleanup because its files are never alt
 
 ## Contributing & License
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), [SECURITY.md](./SECURITY.md), and [CHANGELOG.md](./CHANGELOG.md). Feedback and bug reports are welcome via [GitHub Issues](https://github.com/Enzoo404/gravitybox/issues).
+See [X86_64.md](./X86_64.md), [CONTRIBUTING.md](./CONTRIBUTING.md), [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md), [SECURITY.md](./SECURITY.md), and [CHANGELOG.md](./CHANGELOG.md). Feedback and bug reports for the x86_64 build are welcome via [GitHub Issues](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/issues). Upstream original project: [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox).
 
 <div align="center">
-  <a href="https://star-history.com/#Enzoo404/gravitybox&Date">
-    <img src="https://api.star-history.com/svg?repos=Enzoo404/gravitybox&type=Date" alt="Star History Chart" width="680" />
+  <a href="https://star-history.com/#lihaiyun-shuimu/gravitybox-x86-arm64-mac&Date">
+    <img src="https://api.star-history.com/svg?repos=lihaiyun-shuimu/gravitybox-x86-arm64-mac&type=Date" alt="Star History Chart" width="680" />
   </a>
 </div>
 
 <p align="center">
-  <sub>Released under the <a href="./LICENSE">MIT License</a> · Third-party notices in <a href="./THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a> · Not affiliated with or endorsed by Google or Antigravity.</sub>
+  <sub>Forked from <a href="https://github.com/Enzoo404/gravitybox">Enzoo404/gravitybox</a> · Released under the <a href="./LICENSE">MIT License</a> · Third-party notices in <a href="./THIRD_PARTY_NOTICES.md">THIRD_PARTY_NOTICES.md</a> · Not affiliated with or endorsed by Google or Antigravity.</sub>
 </p>
