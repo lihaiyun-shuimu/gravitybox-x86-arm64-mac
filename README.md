@@ -64,7 +64,7 @@
 
 ## Quick Start
 
-1. **Install**: Download `GravityBox-<version>-x86_64.dmg` from [GitHub Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/releases/latest) (Apple Silicon users can download `arm64` from [upstream](https://github.com/Enzoo404/gravitybox/releases/latest)), drag **GravityBox.app** into **Applications**, and clear Gatekeeper quarantine once (open-source builds are not Apple-notarized):
+1. **Install**: Download `GravityBox-<version>-arm64.dmg` from [GitHub Releases](https://github.com/Enzoo404/gravitybox/releases/latest), drag **GravityBox.app** into **Applications**, and clear Gatekeeper quarantine once (open-source builds are not Apple-notarized):
    ```bash
    xattr -cr /Applications/GravityBox.app
    ```
