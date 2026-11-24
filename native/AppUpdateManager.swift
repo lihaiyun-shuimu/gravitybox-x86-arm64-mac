@@ -26,8 +26,8 @@ final class AppUpdateManager {
 
     #if arch(x86_64)
     static let releaseArch = "x86_64"
-    static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest")!
-    static let releasesPageURL = URL(string: "https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases")!
+    static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/lihaiyun-shuimu/gravitybox-x86-mac/releases/latest")!
+    static let releasesPageURL = URL(string: "https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/releases")!
     #else
     static let releaseArch = "arm64"
     static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/Enzoo404/gravitybox/releases/latest")!
