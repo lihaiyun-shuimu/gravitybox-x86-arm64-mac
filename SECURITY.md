@@ -3,7 +3,7 @@
 GravityBox 高度重视用户的数据安全与隐私保护。作为一款涉及本地账号凭据管理与系统级辅助功能的工具箱，我们采取了多层次的安全与隐私隔离设计。
 
 > [!NOTE]
-> 本仓库（`lihaiyun-shuimu/gravitybox-x86-arm64-mac`）是 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) 的 Intel / x86_64 Mac 社区分支。若安全问题涉及本分支的 `x86_64` 构建、打包或更新通道，请直接在本仓库提报；若属于上游核心逻辑漏洞，建议同时向上游仓库私密提报。
+> 本仓库（`lihaiyun-shuimu/gravitybox-x86-mac`）是 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox) 的 Intel / x86_64 Mac 社区分支。若安全问题涉及本分支的 `x86_64` 构建、打包或更新通道，请直接在本仓库提报；若属于上游核心逻辑漏洞，建议同时向上游仓库私密提报。
 
 ---
 

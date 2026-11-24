@@ -38,8 +38,8 @@ npm run doctor
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac.git
-cd gravitybox-x86-arm64-mac
+git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-mac.git
+cd gravitybox-x86-mac
 
 # 2. 安装开发依赖并初始化环境
 npm ci
@@ -126,7 +126,7 @@ npm run verify
 2. 基于 `main` 分支拉取开发分支（例如 `feat/your-feature-name`）。
 3. 编写代码并增加对应的单元测试或浏览器测试。
 4. 运行 `npm test`（日常单测）与 `npm run verify`（提交发布相关改动时），确保完整门禁通过。
-5. 推送至个人分支并向 `lihaiyun-shuimu/gravitybox-x86-arm64-mac:main` 发起 Pull Request（若为通用核心功能改进，也欢迎同步向上游 `Enzoo404/gravitybox` 贡献）。
+5. 推送至个人分支并向 `lihaiyun-shuimu/gravitybox-x86-mac:main` 发起 Pull Request（若为通用核心功能改进，也欢迎同步向上游 `Enzoo404/gravitybox` 贡献）。
 6. CI 自动化检查通过后，核心维护者将对 PR 进行 Review 并合并。
 
 ## 7. 维护与版本发布

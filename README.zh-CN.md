@@ -1,9 +1,9 @@
 > [!IMPORTANT]
 > **x86 Mac 版（Intel / x86_64）非官方社区分支** · 本仓库 fork 自 [Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)，提供 Intel / AMD 黑苹果原生构建，并已将应用内检查更新切换至本仓库 `x86_64` 通道。
-> 可直接前往本仓库 [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 下载 `x86_64` 安装包，或阅读 **[X86_64.md](X86_64.md)** 了解详情与源码构建方式。
+> 可直接前往本仓库 [Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/releases/latest) 下载 `x86_64` 安装包，或阅读 **[X86_64.md](X86_64.md)** 了解详情与源码构建方式。
 
 <div align="center">
-  <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac">
+  <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-mac">
     <img src="assets/master-1024.png" alt="GravityBox Logo" width="80" height="80" />
   </a>
 
@@ -15,7 +15,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest"><img src="https://img.shields.io/github/v/release/lihaiyun-shuimu/gravitybox-x86-arm64-mac?style=flat-square&color=2563EB" alt="Latest Release"></a>
+    <a href="https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/releases/latest"><img src="https://img.shields.io/github/v/release/lihaiyun-shuimu/gravitybox-x86-mac?style=flat-square&color=2563EB" alt="Latest Release"></a>
     <img src="https://img.shields.io/badge/macOS-14%2B%20%C2%B7%20Intel%20x86__64-111827?style=flat-square&logo=apple&logoColor=white" alt="macOS 14+ Intel x86_64">
     <a href="https://github.com/Enzoo404/gravitybox"><img src="https://img.shields.io/badge/upstream-Enzoo404%2Fgravitybox-6B7280?style=flat-square&logo=github" alt="Upstream"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="MIT License"></a>
@@ -64,7 +64,7 @@
 
 ## 快速上手
 
-1. **下载与安装**：前往本仓库 [GitHub Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/releases/latest) 获取最新 `GravityBox-<version>-x86_64.dmg`（Apple Silicon 用户请前往[上游 Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 下载 `arm64` 版），将 **GravityBox.app** 拖入 **Applications**。因开源版本未经过 Apple 付费公证，首次运行前在终端执行一次放行命令即可（也可在「系统设置 → 隐私与安全性」点击仍要打开）：
+1. **下载与安装**：前往本仓库 [GitHub Releases](https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/releases/latest) 获取最新 `GravityBox-<version>-x86_64.dmg`（Apple Silicon 用户请前往[上游 Releases](https://github.com/Enzoo404/gravitybox/releases/latest) 下载 `arm64` 版），将 **GravityBox.app** 拖入 **Applications**。因开源版本未经过 Apple 付费公证，首次运行前在终端执行一次放行命令即可（也可在「系统设置 → 隐私与安全性」点击仍要打开）：
    ```bash
    xattr -cr /Applications/GravityBox.app
    ```
@@ -278,8 +278,8 @@ flowchart LR
 源码构建需本机安装 Xcode Command Line Tools 与 Node.js `>=22.15.0 <23`：
 
 ```bash
-git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac.git
-cd gravitybox-x86-arm64-mac
+git clone https://github.com/lihaiyun-shuimu/gravitybox-x86-mac.git
+cd gravitybox-x86-mac
 npm ci
 
 npm test                    # 编译 TS、校验价格资产并运行单元/集成测试
@@ -334,11 +334,11 @@ Antigravity 运行时会持续持有本地 SQLite（`state.vscdb`）与认证文
 
 ## 参与贡献与开源协议
 
-提交代码或反馈请先阅读 [X86_64.md](./X86_64.md)、[CONTRIBUTING.md](./CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)、[SECURITY.md](./SECURITY.md) 与 [CHANGELOG.md](./CHANGELOG.md)，x86_64 版问题欢迎在 [GitHub Issues](https://github.com/lihaiyun-shuimu/gravitybox-x86-arm64-mac/issues) 提交讨论。上游原项目：[Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)。
+提交代码或反馈请先阅读 [X86_64.md](./X86_64.md)、[CONTRIBUTING.md](./CONTRIBUTING.md)、[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)、[SECURITY.md](./SECURITY.md) 与 [CHANGELOG.md](./CHANGELOG.md)，x86_64 版问题欢迎在 [GitHub Issues](https://github.com/lihaiyun-shuimu/gravitybox-x86-mac/issues) 提交讨论。上游原项目：[Enzoo404/gravitybox](https://github.com/Enzoo404/gravitybox)。
 
 <div align="center">
-  <a href="https://star-history.com/#lihaiyun-shuimu/gravitybox-x86-arm64-mac&Date">
-    <img src="https://api.star-history.com/svg?repos=lihaiyun-shuimu/gravitybox-x86-arm64-mac&type=Date" alt="Star History Chart" width="680" />
+  <a href="https://star-history.com/#lihaiyun-shuimu/gravitybox-x86-mac&Date">
+    <img src="https://api.star-history.com/svg?repos=lihaiyun-shuimu/gravitybox-x86-mac&type=Date" alt="Star History Chart" width="680" />
   </a>
 </div>
 
