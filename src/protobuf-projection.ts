@@ -90,7 +90,7 @@ export interface ProtoProjectionLimits {
   skipOversizedLeafFields?: boolean;
 }
 
-export const USAGE_PROJECTION_VERSION = 2;
+export const USAGE_PROJECTION_VERSION = 3;
 
 export const DEFAULT_PROTO_LIMITS: ProtoProjectionLimits = {
   maxReadBytes: 4 * 1024 * 1024,

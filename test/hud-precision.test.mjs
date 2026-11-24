@@ -1921,7 +1921,11 @@ test('Orchestrator 吸收同名独立模型阶段及单物理模型跨角色合�
 
 test('Swarm 1 Working + 2 Standing by (swarm_wait / WAITING) + Needs you 仅计 1 个运行中子智能体，且 0 Working / 2 Concurrent / WAITING(9) 耗时均准确', async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-swarm-wait-'));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  const openDbs = [];
+  t.after(() => {
+    for (const d of openDbs.splice(0)) { try { d.close(); } catch {} }
+    fs.rmSync(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
   const convDir = path.join(baseDir, 'conversations');
   fs.mkdirSync(convDir, { recursive: true });
 
@@ -1932,9 +1936,7 @@ test('Swarm 1 Working + 2 Standing by (swarm_wait / WAITING) + Needs you 仅计 
 
   const createConvDb = (id, parentId = null) => {
     const db = new DatabaseSync(path.join(convDir, `${id}.db`));
-    t.after(() => {
-      try { db.close(); } catch {}
-    });
+    openDbs.push(db);
     db.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, render_info BLOB, step_payload BLOB);
@@ -1950,9 +1952,7 @@ test('Swarm 1 Working + 2 Standing by (swarm_wait / WAITING) + Needs you 仅计 
   };
 
   const summariesDb = new DatabaseSync(path.join(baseDir, 'conversation_summaries.db'));
-  t.after(() => {
-    try { summariesDb.close(); } catch {}
-  });
+  openDbs.push(summariesDb);
   summariesDb.exec(`
     PRAGMA journal_mode = WAL;
     CREATE TABLE conversation_parents (child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL);
@@ -2387,10 +2387,12 @@ test('P0-1 回归：2.34.0 可配置 Orchestrator (plan_model=1532, execution_mo
 
   // 2. 端到端 SQLite executor_metadata + gen_metadata f3.1/f3.60.1 解析验证（含空对话与活跃对话）
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-execmeta-'));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const convId = '85315fe1-0000-4000-8000-000000000001';
   const db = new DatabaseSync(path.join(baseDir, `${convId}.db`));
-  t.after(() => { try { db.close(); } catch {} });
+  t.after(() => {
+    try { db.close(); } catch {}
+    fs.rmSync(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
   db.exec(`
     CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
     CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
@@ -2670,10 +2672,12 @@ test('P0-1 审计复验回归：2.34.0 可配置 Orchestrator 执行步宿主将
 
 test('P1-1 回归：>4MB 超大 gen_metadata 投影成功不静默丢弃，且 >64KB 历史行不阻塞 genPrefixCutoffIdx 增量推进', async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-large-gen-'));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
   const dbPath = path.join(baseDir, 'large.db');
   const db = new DatabaseSync(dbPath);
-  t.after(() => { try { db.close(); } catch {} });
+  t.after(() => {
+    try { db.close(); } catch {}
+    fs.rmSync(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  });
   db.exec(`
     CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
     CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
@@ -2744,18 +2748,16 @@ test('2.34.0 主对话 trajectory_metadata_blob field 6 引用自身 UUID 时不
   const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-self-root-ref-'));
   const convDir = path.join(baseDir, 'antigravity', 'conversations');
   await fs.promises.mkdir(convDir, { recursive: true });
-  t.after(async () => {
-    await fs.promises.rm(baseDir, { recursive: true, force: true });
-  });
 
   const mainId = '91111111-1111-4111-8111-111111111111';
   const childId = '92222222-2222-4222-8222-222222222222';
   const dbPath = path.join(convDir, `${mainId}.db`);
   const mainDb = new DatabaseSync(dbPath);
   const childDb = new DatabaseSync(path.join(convDir, `${childId}.db`));
-  t.after(() => {
+  t.after(async () => {
     try { mainDb.close(); } catch {}
     try { childDb.close(); } catch {}
+    await fs.promises.rm(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
 
   const createSchema = (db) => {
@@ -2811,9 +2813,6 @@ test('step_type 132 同时满足 metadata > 64KB 且 render_info > 64KB 时仍�
   const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-hud-renderinfo-proj-'));
   const convDir = path.join(baseDir, 'antigravity', 'conversations');
   await fs.promises.mkdir(convDir, { recursive: true });
-  t.after(async () => {
-    await fs.promises.rm(baseDir, { recursive: true, force: true });
-  });
 
   const mainId = 'a1111111-1111-4111-8111-111111111111';
   const childId = 'b2222222-2222-4222-8222-222222222222';
@@ -2829,9 +2828,10 @@ test('step_type 132 同时满足 metadata > 64KB 且 render_info > 64KB 时仍�
 
   const mainDb = new DatabaseSync(path.join(convDir, `${mainId}.db`));
   const childDb = new DatabaseSync(path.join(convDir, `${childId}.db`));
-  t.after(() => {
+  t.after(async () => {
     try { mainDb.close(); } catch {}
     try { childDb.close(); } catch {}
+    await fs.promises.rm(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
   createSchema(mainDb);
   createSchema(childDb);
@@ -2888,4 +2888,278 @@ test('step_type 132 同时满足 metadata > 64KB 且 render_info > 64KB 时仍�
   assert.equal(result.session.subagentCount, 1, 'step_type=132 双大字段超 64KB 必须通过投影保留 AgentRef');
   assert.equal(result.tokens.outputTokens, 450, '主库 100 + 子库 350 = 450');
 });
+
+test('P0-2 回归：等待审批 (status=9) 与 swarm_wait 休眠步在空闲/待命期不得拉活主会话或令计时器永不停表', () => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  // 场景 A：主会话停在等待用户审批/提问 (status=9)，前台 DOM 已判 idle (isStreaming=false)
+  const approvalPaused = buildConversationHudMetrics({
+    conversationId: 'conv-p02-approval',
+    isStreaming: false,
+    allowDbActiveStepInference: true,
+    steps: [
+      { idx: 0, stepType: 14, status: 3, startTimeSeconds: nowSec - 600, endTimeSeconds: nowSec - 600 },
+      { idx: 1, stepType: 15, status: 3, startTimeSeconds: nowSec - 598, endTimeSeconds: nowSec - 590, rawInputTokens: 100, outputTokens: 40 },
+      { idx: 2, stepType: 21, status: 9, toolCallName: 'ask_user_question', startTimeSeconds: nowSec - 580 },
+    ],
+  });
+  assert.equal(approvalPaused.isStreaming, false, '空闲期 status=9 不得反推 isStreaming=true');
+  assert.equal(approvalPaused.activityPhase, 'idle', '空闲期 status=9 活动阶段应为 idle');
+  assert.equal(approvalPaused.session.activeToolStepCount, 0, 'status=9 等待审批不得计入 activeToolStepCount');
+  assert.equal(approvalPaused.session.inFlightToolDurationSeconds, 0, 'status=9 等待审批不得计入 inFlightToolDurationSeconds');
+  assert.ok(
+    approvalPaused.session.currentTurnDurationSeconds <= 15,
+    `空闲期等待审批不应将 580s 空等计入本轮用时，实际=${approvalPaused.session.currentTurnDurationSeconds}`
+  );
+
+  // 场景 B：Swarm 所有子智能体处于 swarm_wait (status=2) 或等待审批 (status=9)，主会话已空闲
+  const mainContextSteps = [
+    { idx: 0, stepType: 14, status: 3, startTimeSeconds: nowSec - 300, endTimeSeconds: nowSec - 300 },
+    { idx: 1, stepType: 15, status: 3, startTimeSeconds: nowSec - 298, endTimeSeconds: nowSec - 290, rawInputTokens: 100, outputTokens: 30 },
+  ];
+  const childStandbySteps = [
+    { idx: 0, stepType: 15, status: 3, startTimeSeconds: nowSec - 289, endTimeSeconds: nowSec - 285, rawInputTokens: 50, outputTokens: 20 },
+    { idx: 1, stepType: 21, status: 2, toolCallName: 'swarm_wait', startTimeSeconds: nowSec - 280 },
+    { idx: 2, stepType: 21, status: 9, toolCallName: 'run_command', startTimeSeconds: nowSec - 270 },
+  ];
+  const swarmStandby = buildConversationHudMetrics({
+    conversationId: 'conv-p02-swarm-standby',
+    isStreaming: false,
+    isSubagentRunning: false,
+    runningSubagentCount: 0,
+    allowDbActiveStepInference: true,
+    contextSteps: mainContextSteps,
+    steps: [...mainContextSteps, ...childStandbySteps],
+  });
+  assert.equal(swarmStandby.isStreaming, false, '子智能体 swarm_wait/status=9 待命不得拉活主会话');
+  assert.equal(swarmStandby.isSubagentRunning, false);
+  assert.equal(swarmStandby.session.activeToolStepCount, 0, 'swarm_wait 与子智能体 status=9 不得计入 activeToolStepCount');
+  assert.equal(swarmStandby.session.inFlightToolDurationSeconds, 0, 'swarm_wait 与子智能体 status=9 不得计入 inFlightToolDurationSeconds');
+  assert.ok(
+    swarmStandby.session.currentTurnDurationSeconds <= 20,
+    `全部子智能体待命后本轮用时应冻结在最后完结步而非外推 300s，实际=${swarmStandby.session.currentTurnDurationSeconds}`
+  );
+
+  // 场景 C：前台仍流式 (isStreaming=true) 时，swarm_wait/status=9 仍不计入进行中工具执行时间，但保留轮次挂钟活跃契约
+  const foregroundStreamingWithWait = buildConversationHudMetrics({
+    conversationId: 'conv-p02-fg-streaming',
+    isStreaming: true,
+    allowDbActiveStepInference: true,
+    steps: [
+      { idx: 0, stepType: 14, status: 3, startTimeSeconds: nowSec - 20, endTimeSeconds: nowSec - 20 },
+      { idx: 1, stepType: 21, status: 2, toolCallName: 'default_api:swarm_wait', startTimeSeconds: nowSec - 15 },
+      { idx: 2, stepType: 21, status: 9, toolCallName: 'run_command', startTimeSeconds: nowSec - 10 },
+    ],
+  });
+  assert.equal(foregroundStreamingWithWait.session.activeToolStepCount, 0, 'swarm_wait 与 status=9 不得计入 activeToolStepCount');
+  assert.equal(foregroundStreamingWithWait.session.inFlightToolDurationSeconds, 0, 'swarm_wait 与 status=9 不得计入 inFlightToolDurationSeconds');
+  assert.ok(foregroundStreamingWithWait.session.currentTurnDurationSeconds >= 10, '前台流式时仍保留 status=9 轮次挂钟活跃');
+});
+
+test('P0-3 回归：主会话派发步 childConversationIds 混入主会话自身或无关 UUID 时，所有关联子库完结后仍应正确归一化并停表', async (t) => {
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-hud-p03-'));
+  const convDir = path.join(baseDir, 'antigravity', 'conversations');
+  await fs.promises.mkdir(convDir, { recursive: true });
+  t.after(async () => {
+    await fs.promises.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const mainId = 'c1111111-1111-4111-8111-111111111111';
+  const childId = 'd2222222-2222-4222-8222-222222222222';
+  const strayUuid = 'e3333333-3333-4333-8333-333333333333';
+  const createSchema = (db) => {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, data BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+    `);
+  };
+
+  const mainDb = new DatabaseSync(path.join(convDir, `${mainId}.db`));
+  const childDb = new DatabaseSync(path.join(convDir, `${childId}.db`));
+  t.after(() => {
+    try { mainDb.close(); } catch {}
+    try { childDb.close(); } catch {}
+  });
+  createSchema(mainDb);
+  createSchema(childDb);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  mainDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(mainId, mainId);
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 60))
+  );
+  // 模拟宿主未将已结束的 invoke_subagent 派发步 status=2 更新为 3，且 data 中混入主会话 UUID 与无关 UUID
+  const dispatchData = Buffer.from(
+    JSON.stringify({ parent: mainId, child: childId, unrelatedRef: strayUuid }),
+    'utf8'
+  );
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata, data) VALUES (1, 127, 2, ?, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 55), ...message(4, string(2, 'invoke_subagent'))]),
+    dispatchData
+  );
+
+  // 子库已正常完结 (status=3)
+  childDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(childId, childId);
+  childDb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', Buffer.from(string(5, mainId)));
+  childDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 50), ...seconds(6, nowSec - 49), ...seconds(7, nowSec - 45), ...message(9, usageBytes(usage({ outputTokens: 80 })))])
+  );
+  childDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 2, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 44))
+  );
+  mainDb.close();
+  childDb.close();
+
+  const engine = new ConversationMetricsEngine({ geminiDir: baseDir });
+  const result = await engine.getConversationMetrics({
+    conversationId: mainId,
+    isStreaming: false,
+  });
+  assert.equal(result.session.subagentCount, 1);
+  assert.equal(result.isSubagentRunning, false, '无关 UUID 混入派发步不得导致 isSubagentRunning 永久卡死');
+  assert.equal(result.runningSubagentCount, 0, '关联子库全部完结后 runningSubagentCount 必须归零');
+  assert.equal(result.isStreaming, false, '关联子库全部完结且主会话空闲时 isStreaming 必须为 false');
+});
+
+test('P1-5 回归：本机第 2 遍回填缺失内联 usage 的模型步时，多条重试 gen_metadata 按竞争仲裁选出最终成功响应绑定步骤', async (t) => {
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-hud-p15-'));
+  const convDir = path.join(baseDir, 'antigravity', 'conversations');
+  await fs.promises.mkdir(convDir, { recursive: true });
+  t.after(async () => {
+    await fs.promises.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const mainId = 'f1111111-1111-4111-8111-111111111111';
+  const db = new DatabaseSync(path.join(convDir, `${mainId}.db`));
+  t.after(() => {
+    try { db.close(); } catch {}
+  });
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
+    CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+  `);
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 20))
+  );
+  // step 1 (PLANNER_RESPONSE) 缺少内联 field 9 usage，仅带起止时间与 executionId
+  const execIdBytes = Buffer.from('aabbccdd', 'hex');
+  db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 15, 3, ?)').run(
+    Buffer.from([...seconds(1, nowSec - 15), ...seconds(7, nowSec - 10), ...message(12, execIdBytes)])
+  );
+
+  // gen 0：第 1 次失败/中断重试（outputTokens=0，旧上下文 12000）
+  const genRetryFailed = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 12000, outputTokens: 0, cachedReadTokens: 0, cacheWriteTokens: 0 }))),
+      ...string(19, 'gemini-3.8-flash'),
+    ]),
+    ...scalar(2, 1),
+    ...message(4, execIdBytes),
+  ]);
+  // gen 1：第 2 次最终成功响应（outputTokens=600，新上下文 18000）
+  const genFinalSuccess = Buffer.from([
+    ...message(1, [
+      ...message(4, usageBytes(usage({ rawInputTokens: 18000, outputTokens: 600, cachedReadTokens: 0, cacheWriteTokens: 0 }))),
+      ...message(11, seconds(1, 1)),
+      ...message(12, seconds(1, 4)),
+      ...string(19, 'gemini-3.8-flash'),
+    ]),
+    ...scalar(2, 1),
+    ...message(4, execIdBytes),
+  ]);
+  db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)').run(genRetryFailed, genRetryFailed.length);
+  db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)').run(genFinalSuccess, genFinalSuccess.length);
+  db.close();
+
+  const engine = new ConversationMetricsEngine({ geminiDir: baseDir });
+  const metrics = await engine.getConversationMetrics({ conversationId: mainId, isStreaming: false });
+  assert.equal(metrics.context.usedTokens, 18000, '当前上下文必须取最终成功响应 (18000) 而非失败重试 (12000)');
+  assert.equal(metrics.tokens.uncachedInputTokens, 30000, '总账本应保留重试 + 最终成功之和 (12000 + 18000)');
+  assert.equal(metrics.tokens.outputTokens, 600);
+  assert.ok(metrics.session.outputTps > 100, `最终成功响应 (600 tok / 5s = 120 tok/s) 必须参与 TPS 计算，实际=${metrics.session.outputTps}`);
+});
+
+test('P1-7 回归：超过 128 个终态历史子库时自动降级轻量缓存（释放 rawSteps）且保护活跃主库不被淘汰', async (t) => {
+  const baseDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gb-hud-p17-'));
+  const convDir = path.join(baseDir, 'antigravity', 'conversations');
+  await fs.promises.mkdir(convDir, { recursive: true });
+  t.after(async () => {
+    await fs.promises.rm(baseDir, { recursive: true, force: true });
+  });
+
+  const mainId = '10000000-0000-4000-8000-000000000000';
+  const childCount = 135;
+  const childIds = Array.from({ length: childCount }, (_, i) =>
+    `20000000-0000-4000-8000-${String(i + 1).padStart(12, '0')}`
+  );
+  const createSchema = (db) => {
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB, data BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE trajectory_meta (trajectory_id TEXT PRIMARY KEY, cascade_id TEXT, trajectory_type INTEGER);
+      CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+    `);
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const mainDb = new DatabaseSync(path.join(convDir, `${mainId}.db`));
+  createSchema(mainDb);
+  mainDb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(mainId, mainId);
+  mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 14, 3, ?)').run(
+    Buffer.from(seconds(1, nowSec - 200))
+  );
+  const insertDispatch = mainDb.prepare('INSERT INTO steps (idx, step_type, status, metadata, data) VALUES (?, 127, 3, ?, ?)');
+  const dispatchMeta = Buffer.from([...seconds(1, nowSec - 190), ...message(4, string(2, 'invoke_subagent'))]);
+  for (let i = 0; i < childIds.length; i++) {
+    insertDispatch.run(i + 1, dispatchMeta, Buffer.from(childIds[i], 'utf8'));
+  }
+  mainDb.close();
+
+  const childStepMeta = Buffer.from([
+    ...seconds(1, nowSec - 180),
+    ...seconds(6, nowSec - 179),
+    ...seconds(7, nowSec - 178),
+    ...message(9, usageBytes(usage({ rawInputTokens: 100, outputTokens: 10 }))),
+  ]);
+  const closeStepMeta = Buffer.from(seconds(1, nowSec - 177));
+  const parentBlob = Buffer.from(string(5, mainId));
+  for (const cid of childIds) {
+    const cdb = new DatabaseSync(path.join(convDir, `${cid}.db`));
+    createSchema(cdb);
+    cdb.prepare('INSERT INTO trajectory_meta VALUES (?, ?, 0)').run(cid, cid);
+    cdb.prepare('INSERT INTO trajectory_metadata_blob VALUES (?, ?)').run('main', parentBlob);
+    cdb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (0, 15, 3, ?)').run(childStepMeta);
+    cdb.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (1, 2, 3, ?)').run(closeStepMeta);
+    cdb.close();
+  }
+
+  const engine = new ConversationMetricsEngine({ geminiDir: baseDir });
+  const first = await engine.getConversationMetrics({ conversationId: mainId, isStreaming: false });
+  assert.equal(first.session.subagentCount, childCount);
+  assert.equal(first.tokens.outputTokens, childCount * 10);
+
+  // 验证活跃主库留在主缓存未被 135 个子库淘汰，且终态历史子库已降级到 terminalChildCache 并释放 rawSteps
+  const mainPath = engine.resolveDbPath(mainId);
+  assert.equal(engine.cache.has(mainPath), true, '活跃主库必须受保护保留在主缓存中');
+  assert.equal(engine.terminalChildCache.size, childCount, '135 个终态子库应全部降级入轻量 terminalChildCache');
+  const sampleCompact = engine.terminalChildCache.values().next().value;
+  assert.equal(sampleCompact.isCompactTerminalChild, true);
+  assert.equal(sampleCompact.rawSteps.length, 0, '轻量终态子库缓存必须释放 rawSteps 副本');
+  assert.equal(sampleCompact.generations.size, 0, '轻量终态子库缓存必须释放 generations Map');
+
+  // 第二次读取结果完全一致且全部命中缓存（不再淘汰重建）
+  const second = await engine.getConversationMetrics({ conversationId: mainId, isStreaming: false });
+  assert.equal(second.session.subagentCount, childCount);
+  assert.equal(second.tokens.outputTokens, childCount * 10);
+  assert.equal(engine.cache.has(mainPath), true);
+  assert.equal(engine.terminalChildCache.size, childCount);
+});
+
+
 

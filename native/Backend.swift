@@ -282,7 +282,8 @@ final class BackendBridge {
             "maintenance_scan", "maintenance_history", "usage_summary", "usage_events",
             "usage_snapshot_release", "usage_ledger_review", "auto_switch_get",
             "account_recovery_info", "api_pricing_get", "pricing_sync_status",
-            "quota_refresh", "quota_refresh_start"
+            "quota_refresh", "quota_refresh_start", "remote_quota_refresh",
+            "proxy_get"
         ]
         let isReadOnlyAutoSwitch = command == "auto_switch_best" && (payload["execute"] as? Bool != true)
         let useControlThrottle = readOnlyCommands.contains(command) || isReadOnlyAutoSwitch
@@ -416,10 +417,6 @@ final class BackendBridge {
             throw BackendFailure(message: L10n.t("backend.error.reply_invalid", fallback: "后台响应无效或连接已中断"))
         }
         return value
-    }
-
-    func stop(completion: @escaping () -> Void) {
-        send(["command": "stop"]) { _ in completion() }
     }
 
     /// Best-effort fast stop for self-update or forced termination: bypasses the serial `queue`

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, readFile, writeFile, rm, stat} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {execFileSync} from 'node:child_process';
+import {DatabaseSync} from 'node:sqlite';
 import {AccountsManager, MockKeychainAdapter} from '../dist/accounts.js';
 import {AccountSwitchService, DatabaseTransaction} from '../dist/account-switch.js';
 
@@ -13,7 +13,7 @@ async function fixture(t, withDatabase = true) {
   const stateDir=join(root,'state'), profile=join(root,'profile');
   await mkdir(join(profile,'User/globalStorage'),{recursive:true});
   const db=join(profile,'User/globalStorage/state.vscdb');
-  const sql=s=>execFileSync('/usr/bin/sqlite3',[db,s],{encoding:'utf8'}).trim();
+  const sql=s=>{const conn=new DatabaseSync(db);try{if(/^\s*SELECT\b/i.test(s))return conn.prepare(s).all().map(r=>Object.values(r).join('|')).join('\n');conn.exec(s);return '';}finally{conn.close();}};
   if(withDatabase) sql('CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value TEXT);');
   const manager=new AccountsManager(stateDir), keychain=new MockKeychainAdapter();
   await keychain.writePassword('gemini','antigravity','synthetic-initial');
@@ -58,7 +58,7 @@ test('补偿也失败：持久恢复记录阻止清除，下次服务重建后�
   f.keychain.writePassword=async(s,a,v)=>{if(blocked){if(v==='synthetic-initial')await write(s,a,v);throw Error('synthetic unavailable');}return write(s,a,v);};
   await assert.rejects(f.service.rollback(),/自动补偿受阻/);
   const recovery=await f.service.recoveryInfo();assert.equal(recovery.pending,true);assert.equal(recovery.status,'rollback-pending');
-  assert.equal((await stat(f.undo)).mode&0o777,0o600);
+  if (process.platform !== 'win32') assert.equal((await stat(f.undo)).mode&0o777,0o600);
   await assert.rejects(f.service.clearRecovery(recovery.digest),/恢复材料不可清除/);
   blocked=false;
   const next=new AccountSwitchService(new AccountsManager(f.stateDir),f.options);

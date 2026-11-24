@@ -16,7 +16,6 @@ enum PerformanceSignpost {
 enum Design {
     /// Density roles, not a mandate to make menu cards and full pages equally spacious.
     enum Spacing {
-        static let compact: CGFloat = 6
         static let standard: CGFloat = 12
         static let roomy: CGFloat = 14
         static let page: CGFloat = 10
@@ -25,7 +24,9 @@ enum Design {
         static let card: CGFloat = 14
         static let medium: CGFloat = 12
         static let popover: CGFloat = 11
-        static let compact: CGFloat = 10
+        static let control: CGFloat = 8.0
+        static let controlCompact: CGFloat = 7.5
+        static let badge: CGFloat = 5.5
     }
     static func shouldAnimate(in view: NSView?) -> Bool {
         DesignMotion.defaultShouldAnimate(in: view)
@@ -36,8 +37,16 @@ enum Design {
             return NSColor(srgbRed: CGFloat((n >> 16) & 255)/255, green: CGFloat((n >> 8) & 255)/255, blue: CGFloat(n & 255)/255, alpha: 1)
         }
     }
-    static let dangerText = color(0xC62828, 0xFB7185)
-    static let warningText = color(0xB45309, 0xFBBF24)
+    static let dangerText = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? .systemRed
+            : NSColor(srgbRed: 185.0 / 255.0, green: 28.0 / 255.0, blue: 28.0 / 255.0, alpha: 1.0)
+    }
+    static let warningText = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? .systemOrange
+            : NSColor(srgbRed: 180.0 / 255.0, green: 83.0 / 255.0, blue: 9.0 / 255.0, alpha: 1.0)
+    }
     static func dynamicAlpha(_ base: NSColor, _ lightAlpha: CGFloat, _ darkAlpha: CGFloat? = nil) -> NSColor {
         let darkValue = darkAlpha ?? lightAlpha
         return NSColor(name: nil) { appearance in
@@ -124,6 +133,9 @@ enum Design {
     static let popoverCardBackground = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.07) : NSColor.white.withAlphaComponent(0.76) }
     static let popoverCardBorder = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.095) : NSColor.black.withAlphaComponent(0.07) }
     static let popoverFooterBackground = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.04) : NSColor.black.withAlphaComponent(0.025) }
+    static let menuSegmentAccent = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(srgbRed: 0.44, green: 0.72, blue: 1.0, alpha: 1.0) : Design.blue }
+    static let chartTooltipFill = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(white: 0.18, alpha: 0.94) : NSColor(white: 0.15, alpha: 0.88) }
+    static let chartTooltipBorder = NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.18) : NSColor.black.withAlphaComponent(0.12) }
 
     static func isInPopover(_ view: NSView?) -> Bool {
         var cur = view?.superview
@@ -253,41 +265,168 @@ enum Design {
         cachedBrandMark = result
         return result
     }
+    private static var activePopUpMenuDepth: Int = 0
+    static var isTrackingPopUpMenu: Bool { activePopUpMenuDepth > 0 }
+    static let popUpMenuDidCloseNotification = Notification.Name("GravityBox.DesignPopUpMenuDidClose")
+
+    static func activateApplicationForcingFront() {
+        #if !NATIVE_UI_TEST
+        NSApp.activate(ignoringOtherApps: true)
+        #endif
+    }
+
     static func popUpOrigin(below anchor: NSView, spacing: CGFloat = 6) -> NSPoint {
         let yOffset = anchor.isFlipped ? (anchor.bounds.maxY + spacing) : (anchor.bounds.minY - spacing)
         return NSPoint(x: 0, y: yOffset)
+    }
+
+    static func isTrackedPopUpContainerWindow(_ window: NSWindow, excluding hostWindow: NSWindow) -> Bool {
+        guard window.isVisible, window !== hostWindow else { return false }
+        guard window.level.rawValue >= NSWindow.Level.popUpMenu.rawValue else { return false }
+        let className = window.className
+        if className.contains("StatusBar") { return false }
+        // Liquid Glass menus render inside a child _NSGlassEffectWindow owned by NSPopupMenuWindow;
+        // attach the container window so both move into the host window's space together.
+        if className.contains("Glass") && window.parent != nil { return false }
+        return className.contains("Popup") || className.contains("Menu") || window.parent == nil
+    }
+
+    @discardableResult
+    static func anchorTrackedPopUpWindows(
+        to hostWindow: NSWindow,
+        in windows: [NSWindow] = NSApp.windows,
+        alreadyAnchored: inout [NSWindow]
+    ) -> [NSWindow] {
+        var newlyAnchored: [NSWindow] = []
+        for candidate in windows {
+            guard isTrackedPopUpContainerWindow(candidate, excluding: hostWindow) else { continue }
+            guard !alreadyAnchored.contains(where: { $0 === candidate }) else { continue }
+            let targetLevel = NSWindow.Level(rawValue: max(candidate.level.rawValue, NSWindow.Level.popUpMenu.rawValue))
+            let childLevels = (candidate.childWindows ?? []).map {
+                ($0, NSWindow.Level(rawValue: max($0.level.rawValue, NSWindow.Level.popUpMenu.rawValue)))
+            }
+            if let existingParent = candidate.parent, existingParent !== hostWindow {
+                existingParent.removeChildWindow(candidate)
+            }
+            if candidate.parent === hostWindow {
+                // Re-attach once so WindowServer synchronizes child windows (e.g. _NSGlassEffectWindow) onto hostWindow's active space.
+                hostWindow.removeChildWindow(candidate)
+            }
+            hostWindow.addChildWindow(candidate, ordered: .above)
+            if candidate.level != targetLevel {
+                candidate.level = targetLevel
+            }
+            for (child, childLevel) in childLevels where child.level != childLevel {
+                child.level = childLevel
+            }
+            alreadyAnchored.append(candidate)
+            newlyAnchored.append(candidate)
+        }
+        return newlyAnchored
+    }
+
+    static func detachTrackedPopUpWindows(_ windows: [NSWindow], from hostWindow: NSWindow?) {
+        guard let hostWindow else { return }
+        for popupWindow in windows where popupWindow.parent === hostWindow {
+            hostWindow.removeChildWindow(popupWindow)
+        }
     }
 
     static func popUpMenu(_ menu: NSMenu, below anchor: NSView, spacing: CGFloat = 6, matchAnchorWidth: Bool = false) {
         if matchAnchorWidth {
             menu.minimumWidth = max(menu.minimumWidth, anchor.bounds.width)
         }
+        let hostWindow = anchor.window
+        #if !NATIVE_UI_TEST
+        if let panel = hostWindow as? MenuFloatingPanel {
+            if !panel.isKeyWindow {
+                panel.makeKey()
+            }
+        } else if let hostWindow, hostWindow.canBecomeKey {
+            if !NSApp.isActive {
+                activateApplicationForcingFront()
+            }
+            if !hostWindow.isKeyWindow {
+                hostWindow.makeKeyAndOrderFront(nil)
+            }
+        }
+        #else
+        if let panel = hostWindow as? MenuFloatingPanel, !panel.isKeyWindow {
+            panel.makeKey()
+        }
+        #endif
+        var isTrackingThisMenu = true
+        var anchoredPopUpWindows: [NSWindow] = []
+        var trackingObserver: NSObjectProtocol?
+        if let hostWindow {
+            trackingObserver = NotificationCenter.default.addObserver(
+                forName: NSMenu.didBeginTrackingNotification,
+                object: nil,
+                queue: .main
+            ) { [weak hostWindow] _ in
+                DispatchQueue.main.async {
+                    guard isTrackingThisMenu, let hostWindow, hostWindow.isVisible else { return }
+                    _ = anchorTrackedPopUpWindows(to: hostWindow, alreadyAnchored: &anchoredPopUpWindows)
+                }
+            }
+        }
+        activePopUpMenuDepth += 1
+        defer {
+            isTrackingThisMenu = false
+            if let trackingObserver {
+                NotificationCenter.default.removeObserver(trackingObserver)
+            }
+            detachTrackedPopUpWindows(anchoredPopUpWindows, from: hostWindow)
+            activePopUpMenuDepth = max(0, activePopUpMenuDepth - 1)
+            if let panel = anchor.window as? MenuFloatingPanel, panel.isVisible {
+                panel.makeKey()
+                DispatchQueue.main.async { [weak panel] in
+                    guard let panel, panel.isVisible else { return }
+                    panel.makeKey()
+                }
+            }
+            if activePopUpMenuDepth == 0 {
+                NotificationCenter.default.post(name: popUpMenuDidCloseNotification, object: nil)
+            }
+        }
         menu.popUp(positioning: nil, at: popUpOrigin(below: anchor, spacing: spacing), in: anchor)
     }
 
-    static func fittedPopUpWidth(_ popup: NSPopUpButton, minimum: CGFloat? = nil) -> CGFloat {
+    static func fittedPopUpWidth(_ popup: NSPopUpButton, minimum: CGFloat? = nil, maxWidth: CGFloat? = nil) -> CGFloat {
         let isSmall = popup.controlSize == .small
         let fontSize: CGFloat = isSmall ? 11.5 : 12
         let drawFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
-        let itemTitles = popup.pullsDown
-            ? [popup.title]
-            : (popup.menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title)
+        let popUpCell = popup.cell as? DesignPopUpCell
+        let fitsSelectedOnly = popUpCell?.fitsSelectedTitleOnly == true
+        let itemTitles: [String]
+        if popup.pullsDown {
+            itemTitles = [popup.title]
+        } else if fitsSelectedOnly {
+            itemTitles = [popup.selectedItem?.title ?? popup.title]
+        } else {
+            itemTitles = (popup.menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title)
+        }
         let candidates = itemTitles.isEmpty ? [popup.title] : itemTitles
         let maxTitleW = candidates.reduce(CGFloat(0)) { acc, item in
             max(acc, ceil((item as NSString).size(withAttributes: [.font: drawFont]).width))
         }
-        let hasSymbol = ((popup.cell as? DesignPopUpCell)?.leadingSymbolName?.isEmpty == false)
-        let iconExtra: CGFloat = hasSymbol ? 18 : 0
-        // DesignPopUpCell draws text at x = minX + 10 (+ iconExtra) with chevron centered at maxX - 13.
-        let chrome: CGFloat = (isSmall ? 34 : 38) + iconExtra
-        let floorWidth: CGFloat = minimum ?? (isSmall ? 78 : 88)
+        let hasLeadingIcon = (popUpCell?.leadingImage != nil) || (popUpCell?.leadingSymbolName?.isEmpty == false)
+        let iconExtra: CGFloat = hasLeadingIcon ? 18 : 0
+        // DesignPopUpCell draws text at x = minX + 11 (small: 9.5) (+ iconExtra) with chevron centered at maxX - 12.5 (small: 11.5).
+        let baseChrome: CGFloat = (popUpCell?.visualStyle ?? .form) == .form ? (isSmall ? 34 : 38) : (isSmall ? 35 : 39)
+        let chrome: CGFloat = baseChrome + iconExtra
+        let floorWidth: CGFloat = minimum ?? (isSmall ? 58 : 64)
         let raw = max(floorWidth, maxTitleW + chrome)
-        return popup.pullsDown ? min(150, raw) : raw
+        let bounded = popup.pullsDown ? min(150, raw) : raw
+        if let maxWidth {
+            return min(maxWidth, bounded)
+        }
+        return bounded
     }
 
     @discardableResult
-    static func syncPopUpWidth(_ popup: NSPopUpButton) -> CGFloat {
-        let targetWidth = fittedPopUpWidth(popup)
+    static func syncPopUpWidth(_ popup: NSPopUpButton, maxWidth: CGFloat? = nil) -> CGFloat {
+        let targetWidth = fittedPopUpWidth(popup, maxWidth: maxWidth)
         if let existing = popup.constraints.first(where: { $0.identifier == "design-control-width" }) {
             existing.constant = targetWidth
         } else {
@@ -296,6 +435,19 @@ enum Design {
             width.priority = .required
             width.isActive = true
         }
+        if let maxWidth {
+            if let existingMax = popup.constraints.first(where: { $0.identifier == "design-control-max-width" }) {
+                existingMax.constant = maxWidth
+            } else {
+                let maxC = popup.widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth)
+                maxC.identifier = "design-control-max-width"
+                maxC.priority = NSLayoutConstraint.Priority(999)
+                maxC.isActive = true
+            }
+        } else if let existingMax = popup.constraints.first(where: { $0.identifier == "design-control-max-width" }) {
+            existingMax.isActive = false
+            popup.removeConstraint(existingMax)
+        }
         popup.invalidateIntrinsicContentSize()
         return targetWidth
     }
@@ -303,17 +455,35 @@ enum Design {
     static func applyControls(_ view: NSView) {
         if let popup = view as? NSPopUpButton {
             let origControlSize = popup.controlSize
-            let prevSymbol = (popup.cell as? DesignPopUpCell)?.leadingSymbolName
+            let prevCell = popup.cell as? DesignPopUpCell
+            let prevSymbol = prevCell?.leadingSymbolName
+            let prevImage = prevCell?.leadingImage
+            let prevFitsSelectedOnly = prevCell?.fitsSelectedTitleOnly ?? false
+            let prevVisualStyle = prevCell?.visualStyle ?? .form
+            let prevCustomHeight = prevCell?.customHeight
+            let prevIsActiveState = prevCell?.isActiveState ?? false
+            let prevMaxWidth = popup.constraints.first(where: { $0.identifier == "design-control-max-width" })?.constant
             if !(popup.cell is DesignPopUpCell) {
                 let menu = popup.menu, selected = popup.indexOfSelectedItem, target = popup.target, action = popup.action, enabled = popup.isEnabled
                 let cell = DesignPopUpCell(textCell: "", pullsDown: popup.pullsDown)
                 cell.controlSize = origControlSize
                 cell.leadingSymbolName = prevSymbol
+                cell.leadingImage = prevImage
+                cell.fitsSelectedTitleOnly = prevFitsSelectedOnly
+                cell.visualStyle = prevVisualStyle
+                cell.customHeight = prevCustomHeight
+                cell.isActiveState = prevIsActiveState
                 cell.menu = menu; popup.cell = cell; popup.selectItem(at: max(0, selected)); popup.target = target; popup.action = action; popup.isEnabled = enabled
                 popup.controlSize = origControlSize
                 popup.invalidateIntrinsicContentSize()
             } else if let cell = popup.cell as? DesignPopUpCell {
                 cell.controlSize = origControlSize
+                cell.leadingSymbolName = prevSymbol
+                cell.leadingImage = prevImage
+                cell.fitsSelectedTitleOnly = prevFitsSelectedOnly
+                cell.visualStyle = prevVisualStyle
+                cell.customHeight = prevCustomHeight
+                cell.isActiveState = prevIsActiveState
             }
             if !popup.subviews.contains(where: { $0 is DesignPopUpHoverOverlay }) {
                 let overlay = DesignPopUpHoverOverlay()
@@ -328,20 +498,23 @@ enum Design {
             }
             let isSmall = origControlSize == .small
             popup.font = .systemFont(ofSize: isSmall ? 11.5 : 12, weight: .medium); popup.isBordered = false
+            popup.focusRingType = .none
+            popup.cell?.focusRingType = .none
             popup.translatesAutoresizingMaskIntoConstraints = false
+            let targetHeight = prevCustomHeight ?? (isSmall ? 26 : 28)
             if let existingH = popup.constraints.first(where: { $0.identifier == "design-control-height" }) {
-                existingH.constant = isSmall ? 26 : 28
+                existingH.constant = targetHeight
             } else {
-                let height = popup.heightAnchor.constraint(equalToConstant: isSmall ? 26 : 28); height.identifier = "design-control-height"; height.isActive = true
+                let height = popup.heightAnchor.constraint(equalToConstant: targetHeight); height.identifier = "design-control-height"; height.isActive = true
             }
-            syncPopUpWidth(popup)
+            syncPopUpWidth(popup, maxWidth: prevMaxWidth)
         } else if let field = view as? NSTextField, field.isEditable {
             if field.identifier?.rawValue == "native-percent-input" { field.font = .systemFont(ofSize:12); return }
             let currentFont = field.font ?? .systemFont(ofSize: 12)
-            if !(field is NSSearchField), !(field is NSComboBox), !(field.cell is DesignTextCell), !(field.cell is DesignSecureCell) {
+            if !(field is NSSearchField), !(field is NSComboBox), !(field is NSSecureTextField), !(field.cell is DesignTextCell) {
                 let value = field.stringValue, placeholder = field.placeholderString, enabled = field.isEnabled
                 let alignment = field.alignment, target = field.target, action = field.action
-                let cell: NSTextFieldCell = field is NSSecureTextField ? DesignSecureCell(textCell: value) : DesignTextCell(textCell: value)
+                let cell = DesignTextCell(textCell: value)
                 cell.font = currentFont
                 cell.alignment = alignment
                 cell.placeholderString = placeholder
@@ -473,6 +646,11 @@ final class MetricCardBox: NSBox {
         return super.accessibilityValue()
     }
 
+    override func accessibilityPerformPress() -> Bool {
+        guard let target = clickTarget, let action = clickAction else { return false }
+        return NSApp.sendAction(action, to: target, from: self)
+    }
+
     override func keyDown(with event: NSEvent) {
         if let target = clickTarget, let action = clickAction, (event.keyCode == 36 || event.keyCode == 49) { // Return or Space
             NSApp.sendAction(action, to: target, from: self)
@@ -570,7 +748,7 @@ func compactMetric(_ title: String, value: NSTextField, detail: NSTextField, act
         case .tokens: return ("sparkles", Design.blue)
         case .cost: return ("dollarsign.circle.fill", .systemTeal)
         case .requests: return ("paperplane.fill", .systemIndigo)
-        case .general: return ("chart.bar.fill", Design.blue)
+        case .general: return ("chart.xyaxis.line", Design.blue)
         }
     }()
     let badgeBox = NSBox()

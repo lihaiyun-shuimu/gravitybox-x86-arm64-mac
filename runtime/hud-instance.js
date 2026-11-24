@@ -273,10 +273,12 @@ export class HudInstance {
     this.cascadeId = cascadeId || 'default-pane';
     this.paneSlotId = options.paneSlotId || this.cascadeId;
     this.isPrimaryPane = Boolean(options.isPrimaryPane);
-    this.isSubpane = Boolean(options.isSubpane);
+    this.paneKind = options.paneKind || (options.isSubpane ? 'subagent' : 'main');
+    this.isSubpane = Boolean(options.isSubpane || this.paneKind !== 'main');
     this.locale = normalizeHudLocale(options.locale || options.languageMode || 'zh-Hans');
     this.languageMode = this.locale === 'zh-Hans' ? 'zh' : this.locale;
     this.onBridgeEvent = typeof options.onBridgeEvent === 'function' ? options.onBridgeEvent : null;
+    this.onPopoverOpen = typeof options.onPopoverOpen === 'function' ? options.onPopoverOpen : null;
     this.allocateRevision = typeof options.allocateRevision === 'function' ? options.allocateRevision : null;
     this.onVisibilityResume = typeof options.onVisibilityResume === 'function' ? options.onVisibilityResume : null;
     this.currentConvId = null;
@@ -453,6 +455,10 @@ export class HudInstance {
       );
       if (!wasActiveWork && this.hasActiveWork) {
         this.streamResumeAtMs = Date.now();
+        if (this.lastMetrics?.availability === 'remote_unbridged') {
+          this.turnHighWaterMark = null;
+          this.frozenClockSnapshot = null;
+        }
       }
       this.activityPhase = this.computeMergedActivityPhase();
       this.syncStreamingClass();
@@ -470,13 +476,19 @@ export class HudInstance {
   computeMergedActivityPhase(metricsOverride = null) {
     const refMetrics = metricsOverride || this.lastMetrics;
     const subpaneDbActive =
-      Boolean(this.isSubpane || refMetrics?.session?.isSubagentTrajectory) &&
+      Boolean(
+        this.isSubpane ||
+          this.paneKind === 'btw' ||
+          this.paneKind === 'subagent' ||
+          refMetrics?.session?.isSubagentTrajectory
+      ) &&
       ((refMetrics?.session?.activeModelStepCount || 0) > 0 ||
         (refMetrics?.session?.activeToolStepCount || 0) > 0);
     const subagentTrajectoryStreaming = this.isSubagentBackendStreaming(refMetrics);
-    // 当前分栏前台模型未处于流式轮次时（除非是独立子智能体分栏且底层数据库实锤存在活跃步或后端判定子轨迹流式中），小圆点保持灰色 idle
+    // 当前分栏前台模型未处于流式轮次时（除非是独立子智能体/BTW 分栏且底层数据库实锤存在活跃步或后端判定子轨迹流式中），小圆点保持灰色 idle
     if (!this.domIsStreaming && !subpaneDbActive && !subagentTrajectoryStreaming) return 'idle';
-    if (this.domActivityPhase === 'executing' || this.backendActivityPhase === 'executing') {
+    const refBackendPhase = metricsOverride?.activityPhase ?? this.backendActivityPhase;
+    if (this.domActivityPhase === 'executing' || refBackendPhase === 'executing') {
       return 'executing';
     }
     return 'generating';
@@ -555,6 +567,10 @@ export class HudInstance {
       );
       if (!wasActiveWork && this.hasActiveWork) {
         this.streamResumeAtMs = Date.now();
+        if (this.lastMetrics?.availability === 'remote_unbridged') {
+          this.turnHighWaterMark = null;
+          this.frozenClockSnapshot = null;
+        }
       }
       this.activityPhase = this.computeMergedActivityPhase();
       if (!this.hasActiveWork) {
@@ -683,6 +699,7 @@ export class HudInstance {
       conversationId: this.currentConvId,
       cascadeId: this.cascadeId,
       paneSlotId: this.paneSlotId,
+      paneKind: this.paneKind,
       sessionRevision: this.sessionRevision,
       modelId: this.currentModelId,
       ...(typeof this.currentModelCapacity === 'number' && this.currentModelCapacity > 0
@@ -790,6 +807,8 @@ export class HudInstance {
       this.streamResumeAtMs = 0;
       if (
         metrics.availability !== 'cached' &&
+        metrics.availability !== 'remote_stale' &&
+        metrics.availability !== 'remote_unbridged' &&
         isRawNumber(metrics.session?.currentTurnDurationSeconds)
       ) {
         const rawTurns = isRawNumber(metrics.session?.turns) ? metrics.session.turns : 0;
@@ -1060,7 +1079,22 @@ export class HudInstance {
 
   mount(targetComposer) {
     if (!targetComposer) return;
+    const isRemount = Boolean(this.host || this.shadow);
+    const preservedClocks =
+      this.hasActiveWork &&
+      (this.turnClockAnchor || this.modelClockAnchor || this.toolClockAnchor)
+        ? {
+            turnClockAnchor: this.turnClockAnchor ? { ...this.turnClockAnchor } : null,
+            modelClockAnchor: this.modelClockAnchor ? { ...this.modelClockAnchor } : null,
+            toolClockAnchor: this.toolClockAnchor ? { ...this.toolClockAnchor } : null,
+          }
+        : null;
     this.cleanupListeners();
+    if (preservedClocks) {
+      this.turnClockAnchor = preservedClocks.turnClockAnchor;
+      this.modelClockAnchor = preservedClocks.modelClockAnchor;
+      this.toolClockAnchor = preservedClocks.toolClockAnchor;
+    }
     this.targetComposer = targetComposer;
 
     const doc = targetComposer.ownerDocument || (typeof document !== 'undefined' ? document : null);
@@ -1091,7 +1125,7 @@ export class HudInstance {
       minWidth: '0',
       height: '24px',
       marginTop: '4px',
-      marginBottom: '0px',
+      marginBottom: '4px',
       pointerEvents: 'none',
       userSelect: 'none',
       transform: 'none',
@@ -1133,6 +1167,9 @@ export class HudInstance {
     this.bindEvents(targetComposer);
     if (this.lastMetrics) {
       this.applyMetricsToDom(this.lastMetrics);
+    }
+    if (isRemount && preservedClocks && this.currentConvId) {
+      this.requestRefresh();
     }
   }
 
@@ -1929,13 +1966,14 @@ export class HudInstance {
       const s = this.lastMetrics?.session || {};
       const rawTurns = isRawNumber(s.turns) ? s.turns : 0;
       const rawSteps = isRawNumber(s.steps) ? s.steps : 0;
+      const sessionCompCount = Math.max(0, Math.floor(Number(s.compactionCount) || 0));
       const liveModel = this.modelClockAnchor ? this.getLiveClockSeconds(this.modelClockAnchor, nowMs) : Number(s.modelDurationSeconds || 0);
       const liveTool = this.toolClockAnchor ? this.getLiveClockSeconds(this.toolClockAnchor, nowMs) : Number(s.toolDurationSeconds || 0);
       const popSession = this.getShadowEl('#hud-popover-session');
       if (popSession) {
         popSession.setAttribute(
           'data-exact-summary',
-          `turns=${rawTurns}; steps=${rawSteps}; modelSec=${liveModel.toFixed(2)}; toolSec=${liveTool.toFixed(2)}; ttftSec=${Number(s.averageTtftSeconds || 0).toFixed(2)}; tps=${Number(s.outputTps || 0).toFixed(2)}`
+          `turns=${rawTurns}; steps=${rawSteps}; modelSec=${liveModel.toFixed(2)}; toolSec=${liveTool.toFixed(2)}; ttftSec=${Number(s.averageTtftSeconds || 0).toFixed(2)}; tps=${Number(s.outputTps || 0).toFixed(2)}; compactions=${sessionCompCount}`
         );
       }
       const baseModelSnap = Number(s.modelDurationSeconds || 0) + Number(s.inFlightModelDurationSeconds || 0);
@@ -1951,21 +1989,25 @@ export class HudInstance {
       );
     }
     const anchorTurnSec = this.turnClockAnchor.baseSeconds + (nowMs - this.turnClockAnchor.anchorMs) / 1000;
-    const highTurnSec = this.isSameOrMigratedFirstTurn(
+    const hwMatchesAnchor = this.isSameOrMigratedFirstTurn(
       this.turnHighWaterMark,
       this.turnClockAnchor.turns,
       anchorTurnSec
-    )
-      ? this.turnHighWaterMark.seconds
-      : 0;
+    );
+    const highTurnSec = hwMatchesAnchor ? this.turnHighWaterMark.seconds : 0;
     const elapsedSec = Math.max(anchorTurnSec, highTurnSec);
-    if (!this.turnClockAnchor.awaitingNewTurnFlush && highTurnSec > 0 && this.turnHighWaterMark) {
+    if (!this.turnClockAnchor.awaitingNewTurnFlush && hwMatchesAnchor && this.turnHighWaterMark) {
       this.turnHighWaterMark.seconds = Math.max(this.turnHighWaterMark.seconds, elapsedSec);
     }
     const roundedSec = Math.max(0, Math.round(elapsedSec));
     if (roundedSec <= this.turnClockAnchor.lastRenderedSec) return;
     this.turnClockAnchor.lastRenderedSec = roundedSec;
-    this.setTurnDurationText(this.formatCompactTurnDuration(elapsedSec, this.locale));
+    const compactTickDur = this.formatCompactTurnDuration(elapsedSec, this.locale);
+    const tickTurnLabel =
+      this.lastMetrics?.availability === 'remote_unbridged'
+        ? this.t('remoteObservedDur', { dur: compactTickDur })
+        : compactTickDur;
+    this.setTurnDurationText(tickTurnLabel);
     const valTurnDurEl = this.getShadowEl('#val-turn-dur');
     if (valTurnDurEl) {
       const nextCardText = durationText(elapsedSec, this.locale);
@@ -2015,8 +2057,11 @@ export class HudInstance {
     const t = metrics.tokens || {};
     const c = metrics.context || {};
     const b = c.breakdown || {};
+    const isRemoteUnbridged = metrics.availability === 'remote_unbridged';
+    const isRemoteStale = metrics.availability === 'remote_stale';
     const unavailable = metrics.availability === 'unavailable' || metrics.availability === 'loading';
-    const hasContextUsage = !unavailable && c.hasUsageData !== false;
+    const hasTelemetry = !unavailable && !isRemoteUnbridged;
+    const hasContextUsage = hasTelemetry && c.hasUsageData !== false;
 
     const subagentRunning = Boolean(
       metrics.isSubagentRunning ||
@@ -2045,9 +2090,11 @@ export class HudInstance {
     const activeSubagentsBar = formatBarCompactCount(activeSubagents);
     const isWorkingNow = Boolean(this.hasActiveWork || this.isStreaming || this.isSubagentRunning);
     const awaitingNewTurnFlush = isWorkingNow && this.isAwaitingPostIdleNewTurnFlush(metrics);
+    const isFrozenRemoteStale = isRemoteStale && (!this.isStreaming || !metrics.isStreaming);
     const clockActive =
       isWorkingNow &&
       !unavailable &&
+      !isFrozenRemoteStale &&
       (metrics.availability !== 'cached' || Boolean(this.turnClockAnchor));
     this.syncTurnClock(metrics, clockActive);
     const clockNowMs = Date.now();
@@ -2077,6 +2124,7 @@ export class HudInstance {
         frozenTurnSec,
         highWaterCandidate > 0 &&
           (this.turnHighWaterMark?.hasSubagent ||
+            isRemoteUnbridged ||
             (s.turnAborted === true &&
               (rawBackendTurnSec === null ||
                 rawBackendTurnSec <= 0 ||
@@ -2140,7 +2188,7 @@ export class HudInstance {
       ? this.t('tpsMeasuring')
       : formatRateMetric(s.outputTps, s.outputTpsFormatted, ' tok/s');
 
-    const isSubagentSession = Boolean(this.isSubpane || s.isSubagentTrajectory);
+    const isSubagentSession = Boolean(this.paneKind === 'subagent' || s.isSubagentTrajectory === true);
     if (turnsEl) {
       turnsEl.textContent =
         isSubagentSession && rawTurns === 0 && rawSteps > 0
@@ -2196,13 +2244,13 @@ export class HudInstance {
       rawShortLabel && rawShortLabel !== '—' && rawShortLabel !== 'pending' && rawShortLabel !== 'unknown'
         ? rawShortLabel
         : '';
-    const showMultiModel = !unavailable && Boolean(c.isMultiModel && visibleStages.length > 0 && validShortLabel);
+    const showMultiModel = hasTelemetry && Boolean(c.isMultiModel && visibleStages.length > 0 && validShortLabel);
     const activeStageObj = stages.find((st) => st && st.isActive);
-    const sessionCompCount = unavailable ? 0 : Math.max(0, Math.floor(Number(s.compactionCount) || 0));
+    const sessionCompCount = !hasTelemetry ? 0 : Math.max(0, Math.floor(Number(s.compactionCount) || 0));
     const hasPerModelCompaction =
       isRawNumber(c.activeModelCompactionCount) ||
       stages.some((st) => st && isRawNumber(st.compactionCount));
-    const effectiveModelCompCount = unavailable
+    const effectiveModelCompCount = !hasTelemetry
       ? 0
       : showMultiModel && hasPerModelCompaction
       ? Math.max(
@@ -2321,7 +2369,7 @@ export class HudInstance {
     setTxt('#lbl-ttft-latest', this.t('lblTtftLatest'));
     const latestStepTtftRawFormatted = isZh ? s.latestStepTtftFormatted : s.latestStepTtftFormattedEn;
     const hasLatestStepTtft =
-      !unavailable &&
+      hasTelemetry &&
       isRawNumber(s.latestStepTtftSeconds) &&
       Boolean(latestStepTtftRawFormatted) &&
       latestStepTtftRawFormatted !== '—';
@@ -2331,7 +2379,7 @@ export class HudInstance {
     setTxt('#val-ttft-latest', latestStepTtftText);
     setTxt('#lbl-tps-latest', this.t('lblTpsLatest'));
     const hasLatestStepTps =
-      !unavailable &&
+      hasTelemetry &&
       isRawNumber(s.latestStepOutputTps) &&
       Boolean(s.latestStepOutputTpsFormatted) &&
       s.latestStepOutputTpsFormatted !== '—';
@@ -2359,17 +2407,31 @@ export class HudInstance {
     );
     const statusNoteEl = q('#hud-session-status-note');
     if (statusNoteEl) {
-      if (metrics.availability === 'partial' || metrics.availability === 'cached') {
+      if (isRemoteUnbridged) {
+        statusNoteEl.textContent = this.t('remoteUnbridgedNote');
+        statusNoteEl.removeAttribute('hidden');
+      } else if (
+        metrics.availability === 'partial' ||
+        metrics.availability === 'cached' ||
+        isRemoteStale
+      ) {
         const obsLocale = locale === 'en' ? 'en-US' : 'zh-CN';
-        const obs = metrics.observedAt
-          ? new Date(metrics.observedAt).toLocaleTimeString(obsLocale, {
+        const ts = isRemoteStale
+          ? (metrics.lastSuccessAt ?? metrics.observedAt)
+          : metrics.observedAt;
+        const obs = ts
+          ? new Date(ts).toLocaleTimeString(obsLocale, {
               hour: '2-digit',
               minute: '2-digit',
               second: '2-digit',
               hour12: false,
             })
           : '';
-        const baseNote = metrics.availability === 'cached' ? this.t('noteCached') : this.t('notePartial');
+        const baseNote = isRemoteStale
+          ? this.t('remoteStaleNote')
+          : metrics.availability === 'cached'
+          ? this.t('noteCached')
+          : this.t('notePartial');
         const timePart = obs ? this.t('noteTimeParen', { time: obs }) : '';
         statusNoteEl.textContent = `${baseNote}${timePart}`;
         statusNoteEl.removeAttribute('hidden');
@@ -2455,7 +2517,7 @@ export class HudInstance {
     }
 
     const formatUsdDisplay = (usd, formatted) => {
-      if (unavailable || formatted === '—') return '—';
+      if (!hasTelemetry || formatted === '—') return '—';
       if (isRawNumber(usd)) return compactUsd(usd);
       if (typeof formatted === 'string') {
         const trimmed = formatted.trim();
@@ -2487,13 +2549,13 @@ export class HudInstance {
     const activeRole = activeStageObj?.role;
     const hasActiveRole = activeRole === 'planner' || activeRole === 'executor';
     let popCtxPrefixText = this.t('popCtxPrefix');
-    if (!unavailable && (showMultiModel || hasActiveRole) && validShortLabel) {
+    if (hasTelemetry && (showMultiModel || hasActiveRole) && validShortLabel) {
       popCtxPrefixText = this.t('popCtxPrefixWithModel', { model: validShortLabel });
     }
     setTxt('#pop-ctx-prefix', popCtxPrefixText);
     const popRoleEl = q('#pop-ctx-role');
     if (popRoleEl) {
-      if (!unavailable && validShortLabel && (activeRole === 'planner' || activeRole === 'executor')) {
+      if (hasTelemetry && validShortLabel && (activeRole === 'planner' || activeRole === 'executor')) {
         popRoleEl.textContent =
           activeRole === 'planner' ? this.t('stageRolePlannerBadge') : this.t('stageRoleExecutorBadge');
         popRoleEl.className = `hud-role-badge is-role-${activeRole}`;
@@ -2684,6 +2746,42 @@ export class HudInstance {
       this.renderModelStagesList(stagesListEl, [], isDark);
       modelRow?.removeAttribute('hidden');
       for (const sel of ['#hud-txt-tokens .hud-tok-total','#hud-txt-tokens .hud-cache-val','#hud-txt-context','#pop-session-badge','#pop-tokens-badge','#val-cache-hit','#val-uncached-in','#val-cached-read','#val-output-tok','#val-est-cost','#val-cache-saved','#val-model-dur','#val-tool-dur','#val-ttft','#val-tps','#val-ttft-latest','#val-tps-latest','#val-turn-dur','#val-ctx-peak']) setTxt(sel, '—');
+    } else if (isRemoteUnbridged) {
+      const cleanHost = typeof metrics.remoteHostLabel === 'string' ? metrics.remoteHostLabel.trim() : '';
+      const hostLabel = cleanHost
+        ? this.t('remoteHostBadge', { host: cleanHost })
+        : this.t('remoteHostFallback');
+      const observedSec =
+        isWorkingNow || (liveElapsedSec !== null && liveElapsedSec > 0)
+          ? Math.max(0, Number(liveElapsedSec || 0))
+          : 0;
+      const hasObservedDur = isWorkingNow || observedSec > 0;
+      const durText = hasObservedDur
+        ? this.t('remoteObservedDur', { dur: this.formatCompactTurnDuration(observedSec, locale) })
+        : this.t('statusRemoteUnbridged');
+      const sep = locale === 'en' ? ': ' : '：';
+      if (capSession) {
+        capSession.setAttribute('aria-label', `${this.t('capsuleSessionLabel')}${sep}${hostLabel} · ${durText}`);
+      }
+      if (capTokens) {
+        capTokens.setAttribute('aria-label', `${this.t('capsuleTokensLabel')}${sep}${this.t('dataUnavailableAria')}`);
+      }
+      if (capContext) {
+        capContext.setAttribute('aria-label', `${this.t('capsuleContextLabel')}${sep}${this.t('dataUnavailableAria')}`);
+      }
+      setTxt('#hud-txt-session .hud-turns', `${hostLabel} `);
+      this.setTurnDurationText(durText, true);
+      setTxt('#hud-txt-session .hud-speed', '');
+      q('#val-tps-latest')?.removeAttribute('hidden');
+      ctxCapsule?.classList?.remove('has-model-tag');
+      modelTagEl?.setAttribute('hidden', '');
+      setElText(modelFullEl, '');
+      setElText(modelShortEl, '');
+      stagesWrapEl?.setAttribute('hidden', '');
+      this.renderModelStagesList(stagesListEl, [], isDark);
+      modelRow?.removeAttribute('hidden');
+      for (const sel of ['#hud-txt-tokens .hud-tok-total','#hud-txt-tokens .hud-cache-val','#hud-txt-context','#pop-session-badge','#pop-tokens-badge','#val-cache-hit','#val-uncached-in','#val-cached-read','#val-output-tok','#val-est-cost','#val-cache-saved','#val-model-dur','#val-tool-dur','#val-ttft','#val-tps','#val-ttft-latest','#val-tps-latest','#val-ctx-peak']) setTxt(sel, '—');
+      setTxt('#val-turn-dur', hasObservedDur ? durationText(observedSec, locale) : '—');
     }
     if (this.activePopoverId) this.repositionActivePopover(false);
   }
@@ -3121,6 +3219,11 @@ export class HudInstance {
 
   showPopover(id) {
     if (!this.shadow) return;
+    if (this.onPopoverOpen) {
+      try {
+        this.onPopoverOpen(this.paneSlotId);
+      } catch {}
+    }
     this.activePopoverId = id;
     const capsules = this.getShadowCapsules();
     capsules.forEach((cap) => {

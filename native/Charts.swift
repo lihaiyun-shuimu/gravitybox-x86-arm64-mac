@@ -154,7 +154,7 @@ final class QuotaBarView: NSView {
         }
     }
 
-    init(title: String = "", percentage: Int? = nil, resetText: String = "", icon: String = "sparkles", unknownPlaceholder: String? = nil, stale: Bool = false) {
+    init(title: String = "", percentage: Int? = nil, resetText: String = "", icon: String = "hexagon", unknownPlaceholder: String? = nil, stale: Bool = false) {
         self.percentage = max(0, min(100, percentage ?? 0))
         self.percentageKnown = percentage != nil
         self.staleData = stale
@@ -328,7 +328,7 @@ final class QuotaBarView: NSView {
                 iconView.image = icon.isEmpty ? nil : NSImage(systemSymbolName: icon, accessibilityDescription: nil)
                 iconView.isHidden = icon.isEmpty
             }
-            applyModelIcon(fallback: icon ?? "sparkles")
+            applyModelIcon(fallback: icon ?? "hexagon")
         }
         self.percentage = nextPct
         self.percentageKnown = nextKnown
@@ -355,7 +355,7 @@ final class QuotaBarView: NSView {
     }
 }
 
-func quotaBar(title: String = "", percentage: Int? = nil, resetText: String = "", icon: String = "sparkles", unknownPlaceholder: String? = nil, stale: Bool = false) -> QuotaBarView {
+func quotaBar(title: String = "", percentage: Int? = nil, resetText: String = "", icon: String = "hexagon", unknownPlaceholder: String? = nil, stale: Bool = false) -> QuotaBarView {
     QuotaBarView(title: title, percentage: percentage, resetText: resetText, icon: icon, unknownPlaceholder: unknownPlaceholder, stale: stale)
 }
 
@@ -429,9 +429,6 @@ final class UsageTrendChartView: NSView {
             }
             startRevealAnimation()
         }
-    }
-    var subtitle: String = L10n.t("component.chart.recent_distribution", fallback: "近期消耗分布") {
-        didSet { needsDisplay = true }
     }
     private var hoverTrackingArea: NSTrackingArea?
     private var hoveredIndex: Int? = nil {
@@ -972,7 +969,8 @@ final class ModelDonutChartView: NSView {
             let hSlice = validSlices[hIdx]
             activeUsd = hSlice.usd
             let pct = Int(round((hSlice.usd / sumUsd) * 100.0))
-            subLabelString = L10n.t("component.donut.share_pct", ["pct": pct], fallback: "占比 \(pct)%")
+            let pctText = (hSlice.usd > 0 && pct == 0) ? "<1" : "\(pct)"
+            subLabelString = L10n.t("component.donut.share_pct", ["pct": pctText], fallback: "占比 \(pctText)%")
         } else {
             activeUsd = totalUsd
             subLabelString = L10n.t("component.donut.equivalent_bill", fallback: "等效账单")

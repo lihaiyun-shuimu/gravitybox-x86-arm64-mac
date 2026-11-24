@@ -23,10 +23,7 @@ env:
   CI: true
   TZ: UTC
 
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+permissions: {}
 
 jobs:
   purge-cdn:
@@ -40,10 +37,17 @@ jobs:
         shell: bash
         run: |
           PURGE_URL="https://purge.jsdelivr.net/gh/${{ github.repository }}@main/assets/pricing-feed.json"
-          if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
-            echo "jsDelivr purge succeeded: $PURGE_RESP"
-          else
-            echo "::warning::jsDelivr CDN purge failed for $PURGE_URL: $PURGE_RESP"
+          PURGED=false
+          for attempt in 1 2; do
+            if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
+              echo "jsDelivr purge succeeded (attempt $attempt): $PURGE_RESP"
+              PURGED=true
+              break
+            fi
+            [ "$attempt" -lt 2 ] && sleep 3
+          done
+          if [ "$PURGED" != "true" ]; then
+            echo "::warning::jsDelivr CDN purge failed after 2 attempts for $PURGE_URL: $PURGE_RESP"
           fi
 
   pricing-audit:
@@ -51,13 +55,17 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           token: ${{ secrets.PRICING_AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: 'npm'
@@ -215,10 +223,17 @@ jobs:
               echo "Auto-merged immediately into ${{ github.ref_name }}."
               echo "merged=true" >> "$GITHUB_OUTPUT"
               PURGE_URL="https://purge.jsdelivr.net/gh/${{ github.repository }}@main/assets/pricing-feed.json"
-              if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
-                echo "jsDelivr purge succeeded: $PURGE_RESP"
-              else
-                echo "::warning::jsDelivr CDN purge failed for $PURGE_URL: $PURGE_RESP"
+              PURGED=false
+              for attempt in 1 2; do
+                if PURGE_RESP=$(curl -fsS --max-time 15 "$PURGE_URL" 2>&1); then
+                  echo "jsDelivr purge succeeded (attempt $attempt): $PURGE_RESP"
+                  PURGED=true
+                  break
+                fi
+                [ "$attempt" -lt 2 ] && sleep 3
+              done
+              if [ "$PURGED" != "true" ]; then
+                echo "::warning::jsDelivr CDN purge failed after 2 attempts for $PURGE_URL: $PURGE_RESP"
               fi
             elif gh pr merge "$PR_URL" --auto --squash --delete-branch; then
               echo "Enabled auto-merge pending required status checks."
@@ -256,7 +271,7 @@ jobs:
 
       - name: Open, Update, or Auto-Close Pricing Drift Alert Issue
         if: inputs.dry_run != true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           DECISION: ${{ steps.audit.outputs.decision }}
           GATE_PASSED: ${{ steps.gate.outputs.passed }}

@@ -39,8 +39,7 @@ export class Tasks {
               await atomicText(historyPath,lines.slice(-Math.max(200,Math.floor(lines.length/2))).join('\n')+'\n').catch(()=>{});
             }
           }
-          await atomicJson(join(this.stateDir,'activity.json'),snapshot); } } finally {this.writing=false;} });
-      this.chain.catch(()=>{});
+          await atomicJson(join(this.stateDir,'activity.json'),snapshot); } } finally {this.writing=false;} }).catch(()=>{});
     }
     this.changed();
   }
@@ -77,5 +76,5 @@ export class Tasks {
     current.abort.abort(new Error(bt('tasks.abort_reason')));
     return true;
   }
-  async stop() { this.cancel(); await this.current?.work; await this.chain; }
+  async stop() { this.cancel(); await this.current?.work?.catch(() => {}); await this.chain.catch(() => {}); }
 }

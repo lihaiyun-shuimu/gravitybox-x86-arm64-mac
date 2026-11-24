@@ -512,7 +512,7 @@ export async function captureHudScreenshots({ outDir = defaultOutDir } = {}) {
           const bootPayload = {
             origin,
             path: '/',
-            dictionary: { version: '2.33.0', entries: {} },
+            dictionary: { version: '2.34.0', entries: {} },
             conservative: true,
             runtimeId: `hud-shot-${fileName}`,
             shortcutEnabled: false,

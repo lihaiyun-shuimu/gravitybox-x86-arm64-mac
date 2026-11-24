@@ -2,16 +2,27 @@ import { type ApplicationChannel, type ApplicationTarget, applicationTarget } fr
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile, mkdir, lstat, unlink, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { createRequire } from 'node:module';
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { atomicJson, atomicText, sanitizeError } from './files.js';
 import { withProcessLease } from './process-lock.js';
-import { AccountsManager, SystemKeychainAdapter, buildGoOauthPayload, syncAccountToKeychain, type KeychainAdapter, type Account } from './accounts.js';
+import { AccountsManager, SystemKeychainAdapter, buildGoOauthPayload, decodeKeychainOauthPayload, syncAccountToKeychain, type KeychainAdapter, type Account } from './accounts.js';
 import { ProtobufWriter as Writer } from './protobuf.js';
-import { replaceTopicRow } from './account-state.js';
-export { replaceTopicRow } from './account-state.js';
+import { removeTopicRow, replaceTopicRow } from './account-state.js';
+export { removeTopicRow, replaceTopicRow } from './account-state.js';
 import { bt } from './i18n.js';
+import {
+  appProcesses,
+  defaultAntigravityInstallDirs,
+  defaultGravityBoxStateDir,
+  isOwnedByCurrentUser,
+  isPathUnder,
+  isWindows,
+  pathsEqual,
+} from './platform/index.js';
 
 const run = promisify(execFile);
 const TOKEN = 'antigravityUnifiedStateSync.oauthToken';
@@ -22,6 +33,14 @@ const KEYS = [TOKEN, USER, INIT, PROJECT, 'antigravityOnboarding'];
 const quote = (s: string) => `'${s.replaceAll("'", "''")}'`;
 type Rows = Record<string, string>;
 type SavedFile = { path: string; before: string; after: string; afterDigest?: string };
+type CliSnapshot = {
+  path: string;
+  existedBefore: boolean;
+  before: string | null;
+  afterDigest?: string;
+  afterEmail?: string;
+  afterRefreshDigest?: string;
+};
 type Journal = {
   version: 1;
   status: string;
@@ -29,6 +48,7 @@ type Journal = {
   after: Rows;
   afterDigest?: string;
   files: SavedFile[];
+  cliSnapshots?: CliSnapshot[];
   keychainBefore: string | null;
   keychainAfter: string;
   keychainAfterDigest?: string;
@@ -42,6 +62,7 @@ type RollbackRecord = {
   rowsBefore: Rows;
   rowsAfter: Rows;
   files: SavedFile[];
+  cliSnapshots?: CliSnapshot[];
   keychainBefore: string | null;
   keychainAfter: string | null;
   originalJournal: Journal;
@@ -54,9 +75,29 @@ function rowsDigest(rows: Rows): string {
   return sha256(JSON.stringify(Object.entries(rows || {}).sort()));
 }
 
+const requireForSqlite = createRequire(import.meta.url);
+let cachedDatabaseSyncCtor: (new (location: string) => DatabaseSyncType) | null = null;
+function loadDatabaseSync(): new (location: string) => DatabaseSyncType {
+  if (!cachedDatabaseSyncCtor) {
+    const mod = requireForSqlite('node:sqlite') as { DatabaseSync: new (location: string) => DatabaseSyncType };
+    cachedDatabaseSyncCtor = mod.DatabaseSync;
+  }
+  return cachedDatabaseSyncCtor;
+}
+
+interface DatabaseTransactionBackend {
+  sql?(sql: string): Promise<string>;
+  begin(): Promise<void>;
+  rows(): Promise<Rows>;
+  replace(rows: Rows): Promise<void>;
+  finish(commit: boolean): Promise<void>;
+  close(): Promise<void>;
+}
+
+// macOS / POSIX path: unchanged upstream sqlite3 CLI transaction.
 // sqlite3 stays in BEGIN IMMEDIATE while the other resources are committed. SQL goes through
 // stdin, so neither tokens nor database values appear in command arguments or diagnostics.
-export class DatabaseTransaction {
+class PosixSqliteCliTransaction implements DatabaseTransactionBackend {
   private child;
   private output = '';
   private pending?: { marker: string; resolve: (s: string) => void; reject: (e: Error) => void };
@@ -106,6 +147,149 @@ export class DatabaseTransaction {
   }
 }
 
+// Windows path: in-process node:sqlite BEGIN IMMEDIATE write transaction (loaded lazily so macOS
+// never loads node:sqlite or emits ExperimentalWarning on stderr).
+class WindowsNodeSqliteTransaction implements DatabaseTransactionBackend {
+  private db: DatabaseSyncType | null = null;
+  private inTransaction = false;
+  private closed = false;
+  private initError: Error | null = null;
+
+  constructor(private readonly dbPath: string) {
+    try {
+      const DatabaseSync = loadDatabaseSync();
+      this.db = new DatabaseSync(this.dbPath);
+      this.db.exec('PRAGMA busy_timeout = 3000;');
+    } catch (error) {
+      this.initError = this.wrapError(error);
+      this.closed = true;
+    }
+  }
+
+  private wrapError(error: unknown): Error {
+    const msg = error instanceof Error ? error.message : String(error ?? '');
+    if (/SQLITE_BUSY|database is locked|locked/i.test(msg)) {
+      return new Error(bt('switch.err.db_busy'));
+    }
+    return new Error(bt('switch.err.db_tx_failed'));
+  }
+
+  private requireDb(): DatabaseSyncType {
+    if (this.initError) throw this.initError;
+    if (this.closed || !this.db) throw new Error(bt('switch.err.db_closed'));
+    return this.db;
+  }
+
+  private closeSync(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const conn = this.db;
+    this.db = null;
+    if (!conn) return;
+    if (this.inTransaction) {
+      try { conn.exec('ROLLBACK;'); } catch {}
+      this.inTransaction = false;
+    }
+    try { conn.close(); } catch {}
+  }
+
+  async begin(): Promise<void> {
+    const db = this.requireDb();
+    try {
+      db.exec('BEGIN IMMEDIATE;');
+      this.inTransaction = true;
+    } catch (error) {
+      throw this.wrapError(error);
+    }
+  }
+
+  async rows(): Promise<Rows> {
+    const db = this.requireDb();
+    try {
+      const placeholders = KEYS.map(() => '?').join(',');
+      const rawRows = db
+        .prepare(`SELECT key, value FROM ItemTable WHERE key IN (${placeholders})`)
+        .all(...KEYS) as Array<{ key?: unknown; value?: unknown }>;
+      const result: Rows = {};
+      for (const row of rawRows) {
+        if (typeof row.key === 'string' && typeof row.value === 'string') {
+          result[row.key] = row.value;
+        }
+      }
+      return result;
+    } catch (error) {
+      throw this.wrapError(error);
+    }
+  }
+
+  async replace(rows: Rows): Promise<void> {
+    const db = this.requireDb();
+    try {
+      const placeholders = KEYS.map(() => '?').join(',');
+      db.prepare(`DELETE FROM ItemTable WHERE key IN (${placeholders})`).run(...KEYS);
+      const insertStmt = db.prepare('INSERT INTO ItemTable(key, value) VALUES(?, ?)');
+      for (const [k, v] of Object.entries(rows)) {
+        insertStmt.run(k, v);
+      }
+    } catch (error) {
+      throw this.wrapError(error);
+    }
+  }
+
+  async finish(commit: boolean): Promise<void> {
+    const db = this.requireDb();
+    try {
+      if (this.inTransaction) {
+        db.exec(commit ? 'COMMIT;' : 'ROLLBACK;');
+        this.inTransaction = false;
+      }
+    } catch (error) {
+      throw this.wrapError(error);
+    } finally {
+      this.closeSync();
+    }
+  }
+
+  async close(): Promise<void> {
+    this.closeSync();
+  }
+}
+
+export class DatabaseTransaction {
+  private readonly backend: DatabaseTransactionBackend;
+
+  constructor(path: string) {
+    this.backend = isWindows()
+      ? new WindowsNodeSqliteTransaction(path)
+      : new PosixSqliteCliTransaction(path);
+  }
+
+  async sql(sql: string): Promise<string> {
+    if (!this.backend.sql) throw new Error(bt('switch.err.db_tx_failed'));
+    return await this.backend.sql(sql);
+  }
+
+  async begin(): Promise<void> {
+    await this.backend.begin();
+  }
+
+  async rows(): Promise<Rows> {
+    return await this.backend.rows();
+  }
+
+  async replace(rows: Rows): Promise<void> {
+    await this.backend.replace(rows);
+  }
+
+  async finish(commit: boolean): Promise<void> {
+    await this.backend.finish(commit);
+  }
+
+  async close(): Promise<void> {
+    await this.backend.close();
+  }
+}
+
 
 function nextRows(before: Rows, acc: Account): Rows {
   const token = acc.token;
@@ -123,22 +307,34 @@ function nextRows(before: Rows, acc: Account): Rows {
     [USER]: replaceTopicRow(undefined, 'userStatusSentinelKey', Buffer.concat([Writer.encodeString(3, acc.name || acc.email), Writer.encodeString(7, acc.email)])),
     antigravityOnboarding: 'true',
   };
-  // Enterprise preferences may contain unrelated rows; preserve them when updating a project.
-  // Personal accounts have no project row at all, so the correct move is to drop it rather than
-  // block the switch (a personal-target switch used to fail permanently here).
-  if (token.project_id) after[PROJECT] = replaceTopicRow(before[PROJECT], 'enterpriseGcpProjectId', Writer.encodeString(3, token.project_id));
-  else delete after[PROJECT];
+  if (token.project_id) {
+    after[PROJECT] = replaceTopicRow(before[PROJECT], 'enterpriseGcpProjectId', Writer.encodeString(3, token.project_id));
+  } else if (before[PROJECT] !== undefined) {
+    let nextProject: string | null = null;
+    try {
+      nextProject = removeTopicRow(before[PROJECT], 'enterpriseGcpProjectId');
+    } catch {
+      // Legacy non-protobuf fixture values fall back to deleting the row on personal switch.
+      nextProject = null;
+    }
+    if (nextProject === null) delete after[PROJECT];
+    else after[PROJECT] = nextProject;
+  }
   delete after[INIT];
   return after;
 }
 
+const NON_SENSITIVE_STATE_ROW_KEYS = new Set<string>(['antigravityOnboarding']);
+
 function sanitizeJournalRows(rows: Rows): Rows {
   const result: Rows = {};
   for (const [k, v] of Object.entries(rows || {})) {
-    if (k === TOKEN || k.toLowerCase().includes('token') || k.toLowerCase().includes('oauth')) {
+    if (NON_SENSITIVE_STATE_ROW_KEYS.has(k)) {
+      result[k] = v;
+    } else if (k === TOKEN || k.toLowerCase().includes('token') || k.toLowerCase().includes('oauth')) {
       result[k] = '[REDACTED_OAUTH_TOKEN]';
     } else {
-      result[k] = v;
+      result[k] = '[REDACTED_STATE_ROW]';
     }
   }
   return result;
@@ -149,7 +345,7 @@ function sanitizeJournalRows(rows: Rows): Rows {
  * 一律视为可能包含 OAuth 凭据并彻底脱敏。
  */
 function isNonSensitiveIndexFile(filePath: string): boolean {
-  return filePath.endsWith('/accounts.json') || filePath === 'accounts.json';
+  return basename(filePath.replaceAll('\\', '/')) === 'accounts.json';
 }
 
 function sanitizeJournalFiles(files: SavedFile[]): SavedFile[] {
@@ -163,6 +359,91 @@ function sanitizeJournalFiles(files: SavedFile[]): SavedFile[] {
     }
     return f;
   });
+}
+
+function sanitizeJournalCliSnapshots(snapshots?: CliSnapshot[]): CliSnapshot[] | undefined {
+  if (!snapshots) return undefined;
+  return snapshots.map(s => ({
+    path: s.path,
+    existedBefore: s.existedBefore,
+    before: s.before !== null ? '[REDACTED_CLI]' : null,
+  }));
+}
+
+function tryParseJsonRecord(raw: string): Record<string, any> | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveManagedFileTarget(
+  file: SavedFile,
+  currentContent: string,
+  targetDirection: 'before' | 'after'
+): string | null {
+  const matchesBefore = currentContent === file.before;
+  const matchesAfter = (file.afterDigest ? sha256(currentContent) === file.afterDigest : false) || currentContent === file.after;
+  if (matchesBefore || matchesAfter) {
+    return targetDirection === 'before' ? file.before : file.after;
+  }
+
+  const curObj = tryParseJsonRecord(currentContent);
+  const beforeObj = tryParseJsonRecord(file.before);
+  if (!curObj || !beforeObj) return null;
+
+  if (isNonSensitiveIndexFile(file.path)) {
+    const afterObj = tryParseJsonRecord(file.after);
+    const matchesIndexBefore =
+      (curObj.current_account_id ?? null) === (beforeObj.current_account_id ?? null) &&
+      (curObj.current_target_ide ?? null) === (beforeObj.current_target_ide ?? null);
+    const matchesIndexAfter = Boolean(
+      afterObj &&
+      (curObj.current_account_id ?? null) === (afterObj.current_account_id ?? null) &&
+      (curObj.current_target_ide ?? null) === (afterObj.current_target_ide ?? null)
+    );
+    if (!matchesIndexBefore && !matchesIndexAfter) return null;
+    if (targetDirection === 'after') return afterObj ? file.after : null;
+
+    const merged: Record<string, any> = { ...curObj };
+    if ('current_account_id' in beforeObj) merged.current_account_id = beforeObj.current_account_id;
+    else delete merged.current_account_id;
+    if ('current_target_ide' in beforeObj) merged.current_target_ide = beforeObj.current_target_ide;
+    else delete merged.current_target_ide;
+
+    const targetAccountId = typeof afterObj?.current_account_id === 'string' ? afterObj.current_account_id : null;
+    if (targetAccountId && Array.isArray(curObj.accounts) && Array.isArray(beforeObj.accounts)) {
+      const prevEntry = beforeObj.accounts.find((a: any) => a && typeof a === 'object' && a.id === targetAccountId);
+      if (prevEntry) {
+        merged.accounts = curObj.accounts.map((a: any) => {
+          if (!a || typeof a !== 'object' || a.id !== targetAccountId) return a;
+          const nextEntry = { ...a };
+          if ('last_used' in prevEntry) nextEntry.last_used = prevEntry.last_used;
+          else delete nextEntry.last_used;
+          return nextEntry;
+        });
+      }
+    }
+    return JSON.stringify(merged, null, 2) + '\n';
+  }
+
+  if (
+    curObj.id !== beforeObj.id ||
+    curObj.email !== beforeObj.email ||
+    Boolean(curObj.disabled) !== Boolean(beforeObj.disabled) ||
+    Boolean(curObj.validation_blocked) !== Boolean(beforeObj.validation_blocked) ||
+    (curObj.token?.refresh_token ?? null) !== (beforeObj.token?.refresh_token ?? null) ||
+    (curObj.token?.project_id ?? null) !== (beforeObj.token?.project_id ?? null)
+  ) {
+    return null;
+  }
+  if (targetDirection === 'after') return file.after;
+  const mergedAccount: Record<string, any> = { ...curObj };
+  if ('last_used' in beforeObj) mergedAccount.last_used = beforeObj.last_used;
+  else delete mergedAccount.last_used;
+  return JSON.stringify(mergedAccount, null, 2) + '\n';
 }
 
 export class AccountSwitchService {
@@ -183,7 +464,7 @@ export class AccountSwitchService {
   private getCliCredentialPaths(): string[] {
     const baseGeminiDir = this.options.geminiDir
       ?? (this.options.homeDir ? join(this.options.homeDir, '.gemini') : undefined)
-      ?? (this.options.stateDir === join(homedir(), 'Library', 'Application Support', 'GravityBox') ? join(homedir(), '.gemini') : undefined);
+      ?? (pathsEqual(this.options.stateDir, defaultGravityBoxStateDir()) ? join(homedir(), '.gemini') : undefined);
     if (!baseGeminiDir) return [];
     return [
       join(baseGeminiDir, 'antigravity-cli', 'antigravity-oauth-token'),
@@ -205,7 +486,7 @@ export class AccountSwitchService {
           throw err;
         });
         if (!info) continue;
-        if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) {
+        if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) {
           warnings.push(`${cliPath}: skipped non-regular or non-user file`);
           continue;
         }
@@ -219,10 +500,10 @@ export class AccountSwitchService {
   }
 
   private async resolveRollbackCliPayload(journal: Journal): Promise<string | null> {
-    if (typeof journal.keychainBefore === 'string' && journal.keychainBefore.startsWith('go-keyring-base64:')) {
+    const decodedBefore = decodeKeychainOauthPayload(journal.keychainBefore);
+    if (decodedBefore) {
       try {
-        const raw = Buffer.from(journal.keychainBefore.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(decodedBefore);
         if (parsed && typeof parsed === 'object' && parsed.token && typeof parsed.token.refresh_token === 'string' && parsed.token.refresh_token) {
           return JSON.stringify(parsed);
         }
@@ -254,9 +535,96 @@ export class AccountSwitchService {
   private get rollbackPath() { return this.journalPath + '.rollback.json'; }
   private database(path: string) { return this.options.databaseFactory?.(path) ?? new DatabaseTransaction(path); }
 
+  private async snapshotExistingCliCredentials(payloadJson: string | null, acc: Account): Promise<CliSnapshot[]> {
+    const snapshots: CliSnapshot[] = [];
+    const afterText = payloadJson ? (payloadJson.endsWith('\n') ? payloadJson : `${payloadJson}\n`) : null;
+    const afterDigest = afterText ? sha256(afterText) : undefined;
+    const afterRefreshDigest = acc.token?.refresh_token ? sha256(acc.token.refresh_token) : undefined;
+    for (const cliPath of this.getCliCredentialPaths()) {
+      const info = await lstat(cliPath).catch((err: NodeJS.ErrnoException) => {
+        if (err?.code === 'ENOENT') return null;
+        throw err;
+      });
+      if (!info) continue;
+      if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) continue;
+      const before = await readFile(cliPath, 'utf8');
+      snapshots.push({
+        path: cliPath,
+        existedBefore: true,
+        before,
+        ...(afterDigest ? { afterDigest } : {}),
+        ...(acc.email ? { afterEmail: acc.email } : {}),
+        ...(afterRefreshDigest ? { afterRefreshDigest } : {}),
+      });
+    }
+    return snapshots;
+  }
+
+  private async restoreCliSnapshots(
+    snapshots: CliSnapshot[] | undefined,
+    fallbackJournal?: Journal
+  ): Promise<{ syncedPaths: string[]; warnings: string[] }> {
+    if (!snapshots || snapshots.length === 0) {
+      if (fallbackJournal) {
+        const fallbackPayload = await this.resolveRollbackCliPayload(fallbackJournal);
+        return await this.syncExistingCliCredentials(fallbackPayload);
+      }
+      return { syncedPaths: [], warnings: [] };
+    }
+    const syncedPaths: string[] = [];
+    const warnings: string[] = [];
+    for (const snap of snapshots) {
+      if (!snap.existedBefore || snap.before === null || snap.before === '[REDACTED_CLI]') continue;
+      try {
+        const info = await lstat(snap.path).catch((err: NodeJS.ErrnoException) => {
+          if (err?.code === 'ENOENT') return null;
+          throw err;
+        });
+        if (!info) {
+          warnings.push(`${snap.path}: skipped restore (file missing)`);
+          continue;
+        }
+        if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) {
+          warnings.push(`${snap.path}: skipped non-regular or non-user file`);
+          continue;
+        }
+        const current = await readFile(snap.path, 'utf8');
+        if (current === snap.before) {
+          syncedPaths.push(snap.path);
+          continue;
+        }
+        const matchesAfterDigest = Boolean(snap.afterDigest && sha256(current) === snap.afterDigest);
+        let matchesSameAccountRefresh = false;
+        if (!matchesAfterDigest && snap.afterEmail) {
+          const parsed = tryParseJsonRecord(current);
+          const curEmail = parsed?.token?.email ?? parsed?.id_token_email;
+          const curRefresh = parsed?.token?.refresh_token;
+          if (
+            typeof curEmail === 'string' &&
+            curEmail.toLowerCase() === snap.afterEmail.toLowerCase() &&
+            (!snap.afterRefreshDigest || (typeof curRefresh === 'string' && sha256(curRefresh) === snap.afterRefreshDigest))
+          ) {
+            matchesSameAccountRefresh = true;
+          }
+        }
+        if (!matchesAfterDigest && !matchesSameAccountRefresh) {
+          warnings.push(`${snap.path}: skipped restore due to external CLI credential change`);
+          continue;
+        }
+        await atomicText(snap.path, snap.before);
+        syncedPaths.push(snap.path);
+      } catch (error) {
+        warnings.push(sanitizeError((error as Error)?.message ?? String(error)));
+      }
+    }
+    return { syncedPaths, warnings };
+  }
+
   private completedRollback(journal: Journal): Journal {
     return { ...journal, before: sanitizeJournalRows(journal.before), after: sanitizeJournalRows(journal.after),
-      afterDigest: undefined, files: sanitizeJournalFiles(journal.files), keychainBefore: null,
+      afterDigest: undefined, files: sanitizeJournalFiles(journal.files),
+      ...(journal.cliSnapshots ? { cliSnapshots: sanitizeJournalCliSnapshots(journal.cliSnapshots) } : {}),
+      keychainBefore: null,
       keychainAfter: '', keychainAfterDigest: undefined, status: 'rolled-back' };
   }
 
@@ -269,10 +637,16 @@ export class AccountSwitchService {
     try { await this.regular(this.rollbackPath); record = JSON.parse(await readFile(this.rollbackPath, 'utf8')); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'none'; throw error; }
     const dbPath = join(this.options.profile, 'User', 'globalStorage', 'state.vscdb');
-    const allowed = new Set([join(this.options.stateDir, 'accounts.json')]);
-    if (record.version !== 1 || !['prepared', 'committed'].includes(record.phase) || record.databasePath !== dbPath ||
-        !Array.isArray(record.files) || record.files.some(f => !allowed.has(f.path) &&
-          !(f.path.startsWith(join(this.options.stateDir, 'accounts') + '/') && /^[a-zA-Z0-9_-]+\.json$/.test(f.path.slice(join(this.options.stateDir, 'accounts').length + 1))))) {
+    const accountsIndexPath = join(this.options.stateDir, 'accounts.json');
+    const accountsDirPath = join(this.options.stateDir, 'accounts');
+    const isAllowedRollbackFile = (filePath: string): boolean => {
+      if (pathsEqual(filePath, accountsIndexPath)) return true;
+      if (!isPathUnder(filePath, accountsDirPath)) return false;
+      const name = basename(filePath.replaceAll('\\', '/'));
+      return /^[a-zA-Z0-9_-]+\.json$/.test(name) && pathsEqual(filePath, join(accountsDirPath, name));
+    };
+    if (record.version !== 1 || !['prepared', 'committed'].includes(record.phase) || !pathsEqual(record.databasePath, dbPath) ||
+        !Array.isArray(record.files) || record.files.some(f => !isAllowedRollbackFile(f.path))) {
       throw new Error(bt('switch.err.rollback_identity'));
     }
     const currentJournal = JSON.parse(await readFile(this.journalPath, 'utf8')) as Journal;
@@ -290,13 +664,18 @@ export class AccountSwitchService {
       for (const file of record.files) {
         await this.regular(file.path);
         const value = await readFile(file.path, 'utf8');
-        if (value !== file.before && value !== file.after) throw new Error(bt('switch.err.account_file_external'));
+        if (value !== file.before && value !== file.after && !resolveManagedFileTarget(file, value, committed ? 'after' : 'before')) {
+          throw new Error(bt('switch.err.account_file_external'));
+        }
       }
       const password = await this.keychain.readPassword('gemini', 'antigravity');
       if (password !== record.keychainBefore && password !== record.keychainAfter) throw new Error(bt('switch.err.keychain_external'));
       for (const file of record.files) {
-        const desired = committed ? file.after : file.before;
-        if (await readFile(file.path, 'utf8') !== desired) await atomicText(file.path, desired);
+        const current = await readFile(file.path, 'utf8');
+        const desired = committed
+          ? (current === file.after ? file.after : (resolveManagedFileTarget(file, current, 'after') ?? file.after))
+          : (current === file.before ? file.before : (resolveManagedFileTarget(file, current, 'before') ?? file.before));
+        if (current !== desired) await atomicText(file.path, desired);
       }
       const desiredPassword = committed ? record.keychainAfter : record.keychainBefore;
       if (password !== desiredPassword) {
@@ -309,22 +688,37 @@ export class AccountSwitchService {
       await unlink(this.rollbackPath);
       this.manager.invalidateRuntimeCaches?.();
       if (committed) {
-        const rollbackCliPayload = await this.resolveRollbackCliPayload(original);
-        await this.syncExistingCliCredentials(rollbackCliPayload);
+        const cliSnapshots = record.cliSnapshots ?? original.cliSnapshots;
+        await this.restoreCliSnapshots(cliSnapshots, original);
       }
       return committed ? 'rolled-back' : 'restored';
     } finally { await tx?.close(); }
   }
   private async guardStopped() {
+    if (this.options.isRunning) {
+      if (await this.options.isRunning()) throw new Error(bt('switch.err.stop_app_first'));
+      return;
+    }
+    if (isWindows()) {
+      const candidateRoots = new Set<string>([this.target.appPath]);
+      for (const dir of defaultAntigravityInstallDirs()) {
+        candidateRoots.add(join(dir, 'Antigravity'));
+        candidateRoots.add(join(dir, 'Antigravity - Insiders'));
+        candidateRoots.add(join(dir, 'Antigravity Insiders'));
+        candidateRoots.add(join(dir, 'Antigravity-Insiders'));
+      }
+      const procs = await appProcesses(Array.from(candidateRoots));
+      if (procs.length > 0) throw new Error(bt('switch.err.stop_app_first'));
+      return;
+    }
     const candidatePrefixes = Array.from(
       // Insiders shares official credentials: block switching while it runs, without managing it.
       new Set([this.target.appPath, '/Applications/Antigravity.app', '/Applications/Antigravity - Insiders.app']),
     ).map(p => p + '/Contents/');
-    const running = this.options.isRunning ? await this.options.isRunning() :
-      (await run('/bin/ps', ['-ax', '-ww', '-o', 'args='], { timeout: 3000 })).stdout.split('\n').some(line => {
-        const trimmed = line.trim();
-        return candidatePrefixes.some(prefix => trimmed.startsWith(prefix));
-      });
+    const running = (await run('/bin/ps', ['-ax', '-ww', '-o', 'args='], { timeout: 3000 })).stdout.split('\n').some(line => {
+      const trimmed = line.trim();
+      return candidatePrefixes.some(prefix => trimmed.startsWith(prefix));
+    });
     if (running) throw new Error(bt('switch.err.stop_app_first'));
   }
   private async archivePreviousJournal(previous: Journal) {
@@ -336,6 +730,7 @@ export class AccountSwitchService {
       keychainBefore: previous.keychainBefore ? '[REDACTED]' : null,
       keychainAfter: previous.keychainAfter ? '[REDACTED]' : '',
       files: sanitizeJournalFiles(previous.files),
+      ...(previous.cliSnapshots ? { cliSnapshots: sanitizeJournalCliSnapshots(previous.cliSnapshots) } : {}),
     };
     const now = Date.now();
     await atomicJson(join(backupsDir, `${now}_${randomUUID().slice(0, 8)}.json`), sanitized);
@@ -358,7 +753,7 @@ export class AccountSwitchService {
 
   private async regular(path: string) {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('switch.err.invalid_login_file'));
+    if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) throw new Error(bt('switch.err.invalid_login_file'));
   }
   private async optionalRegular(path: string): Promise<boolean> {
     try {
@@ -379,17 +774,18 @@ export class AccountSwitchService {
     );
   }
   private async restoreFiles(files: SavedFile[], keychainBefore: string | null, keychainAfter: string, keychainAfterDigest?: string) {
+    const resolvedTargets: Array<{ path: string; target: string }> = [];
     for (const file of files) {
       const value = await readFile(file.path, 'utf8');
-      const matchesBefore = value === file.before;
-      const matchesAfter = (file.afterDigest ? sha256(value) === file.afterDigest : false) || value === file.after;
-      if (!matchesBefore && !matchesAfter) throw new Error(bt('switch.err.files_changed_after'));
+      const target = resolveManagedFileTarget(file, value, 'before');
+      if (target === null) throw new Error(bt('switch.err.files_changed_after'));
+      resolvedTargets.push({ path: file.path, target });
     }
     const current = await this.keychain.readPassword('gemini', 'antigravity');
     const matchesKeychainBefore = current === keychainBefore;
     const matchesKeychainAfter = (keychainAfter && keychainAfter !== '[REDACTED]' && current === keychainAfter) || (keychainAfterDigest && current !== null && sha256(current) === keychainAfterDigest);
     if (!matchesKeychainBefore && !matchesKeychainAfter) throw new Error(bt('switch.err.keychain_updated'));
-    for (const file of files) await atomicText(file.path, file.before);
+    for (const item of resolvedTargets) await atomicText(item.path, item.target);
     if (keychainBefore === null) await this.keychain.deletePassword('gemini', 'antigravity');
     else await this.keychain.writePassword('gemini', 'antigravity', keychainBefore);
   }
@@ -436,11 +832,13 @@ export class AccountSwitchService {
         const keychainBefore = await this.keychain.readPassword('gemini', 'antigravity');
         // Build the exact intended value with an in-memory adapter; no system write yet.
         let keychainAfter = '';
-        await syncAccountToKeychain(acc, { readPassword: async () => null, deletePassword: async () => {}, writePassword: async (_s, _a, value) => { keychainAfter = value; } });
+        await syncAccountToKeychain(acc, { payloadEncoding: this.keychain.payloadEncoding, readPassword: async () => null, deletePassword: async () => {}, writePassword: async (_s, _a, value) => { keychainAfter = value; } });
         const afterDigest = rowsDigest(after);
         const keychainAfterDigest = sha256(keychainAfter);
         const filesWithDigest: SavedFile[] = files.map(f => ({ ...f, afterDigest: sha256(f.after) }));
-        journal = { version: 1, status: 'pending', before, after, afterDigest, files: filesWithDigest, keychainBefore, keychainAfter, keychainAfterDigest, at: new Date().toISOString() };
+        const cliPayload = buildGoOauthPayload(acc);
+        const cliSnapshots = await this.snapshotExistingCliCredentials(cliPayload, acc);
+        journal = { version: 1, status: 'pending', before, after, afterDigest, files: filesWithDigest, ...(cliSnapshots.length ? { cliSnapshots } : {}), keychainBefore, keychainAfter, keychainAfterDigest, at: new Date().toISOString() };
         if (previous) await this.archivePreviousJournal(previous);
         await atomicJson(this.journalPath, journal);
         await this.guardStopped();
@@ -467,7 +865,7 @@ export class AccountSwitchService {
             afterDigest: f.afterDigest,
           })),
         });
-        const cliSync = await this.syncExistingCliCredentials(buildGoOauthPayload(acc));
+        const cliSync = await this.syncExistingCliCredentials(cliPayload);
         return {
           switchedTo: acc.email,
           message: bt('switch.msg.switched'),
@@ -493,7 +891,8 @@ export class AccountSwitchService {
       const at=Date.parse(journal.at), expiresAt=Number.isFinite(at)?new Date(at+7*86400000).toISOString():null;
       const interruptedUndo = await this.optionalRegular(this.rollbackPath);
       const pending=interruptedUndo||!['complete','rolled-back','cleared'].includes(journal.status);
-      return {available:journal.status!=='cleared'||interruptedUndo,status:interruptedUndo?'rollback-pending':journal.status,createdAt:journal.at,expiresAt,pending,expired:!pending&&(!expiresAt||Date.parse(expiresAt)<Date.now()),digest:sha256(raw),containsCredentials:interruptedUndo||!!Object.keys(journal.before??{}).length||!!journal.keychainBefore};
+      const hasCliCreds = Boolean(journal.cliSnapshots?.some(s => s.existedBefore && s.before !== null && s.before !== '[REDACTED_CLI]'));
+      return {available:journal.status!=='cleared'||interruptedUndo,status:interruptedUndo?'rollback-pending':journal.status,createdAt:journal.at,expiresAt,pending,expired:!pending&&(!expiresAt||Date.parse(expiresAt)<Date.now()),digest:sha256(raw),containsCredentials:interruptedUndo||!!Object.keys(journal.before??{}).length||!!journal.keychainBefore||hasCliCreds};
     } catch(error) {if((error as NodeJS.ErrnoException).code==='ENOENT')return{available:false}; throw new Error(bt('switch.err.recovery_unreadable'));}
   }
   async clearRecovery(expectedDigest: string) {
@@ -502,7 +901,7 @@ export class AccountSwitchService {
       const raw=await readFile(this.journalPath,'utf8'), journal=JSON.parse(raw) as Journal;
       if(sha256(raw)!==expectedDigest)throw new Error(bt('switch.err.recovery_changed_repreview'));
       if(!['complete','rolled-back'].includes(journal.status))throw new Error(bt('switch.err.incomplete_clear_forbidden'));
-      await atomicJson(this.journalPath,{version:1,status:'cleared',at:journal.at,clearedAt:new Date().toISOString(),before:{},after:{},files:[],keychainBefore:null,keychainAfter:''});
+      await atomicJson(this.journalPath,{version:1,status:'cleared',at:journal.at,clearedAt:new Date().toISOString(),before:{},after:{},files:[],cliSnapshots:[],keychainBefore:null,keychainAfter:''});
       return {message:bt('switch.msg.recovery_cleared')};
     });
   }
@@ -536,10 +935,13 @@ export class AccountSwitchService {
         const snapshots: SavedFile[] = [];
         for (const file of journal.files) {
           await this.regular(file.path);
-          snapshots.push({ path: file.path, before: await readFile(file.path, 'utf8'), after: file.before });
+          const current = await readFile(file.path, 'utf8');
+          const resolved = resolveManagedFileTarget(file, current, 'before');
+          if (resolved === null) throw new Error(bt('switch.err.files_changed_after'));
+          snapshots.push({ path: file.path, before: current, after: resolved });
         }
         record = { version: 1, phase: 'prepared', databasePath: db, hadDatabase: hasDb, rowsBefore: rows, rowsAfter: journal.before,
-          files: snapshots, keychainBefore: await this.keychain.readPassword('gemini', 'antigravity'), keychainAfter: journal.keychainBefore, originalJournal: journal };
+          files: snapshots, ...(journal.cliSnapshots ? { cliSnapshots: journal.cliSnapshots } : {}), keychainBefore: await this.keychain.readPassword('gemini', 'antigravity'), keychainAfter: journal.keychainBefore, originalJournal: journal };
         await atomicJson(this.rollbackPath, record);
         await atomicJson(this.journalPath, { ...journal, status: 'rolling-back' });
         await this.restoreFiles(journal.files, journal.keychainBefore, journal.keychainAfter, journal.keychainAfterDigest);
@@ -550,8 +952,7 @@ export class AccountSwitchService {
         record.phase = 'committed'; await atomicJson(this.rollbackPath, record);
         await atomicJson(this.journalPath, this.completedRollback(journal));
         await unlink(this.rollbackPath);
-        const rollbackCliPayload = await this.resolveRollbackCliPayload(journal);
-        const cliSync = await this.syncExistingCliCredentials(rollbackCliPayload);
+        const cliSync = await this.restoreCliSnapshots(journal.cliSnapshots, journal);
         return {
           message: bt('switch.msg.restored_previous'),
           ...(cliSync.syncedPaths.length ? { cliSynced: cliSync.syncedPaths.length } : {}),

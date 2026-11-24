@@ -270,7 +270,8 @@ import Cocoa
         check(ultraChoices.filter { !$0.isSeparator }.map(\.title) == ["全部可用模型", "Gemini", "Claude/GPT"], "Ultra monitored choices omit Argon and redundant Gemini All")
         check(QuotaPresentation.effectiveMonitoredModelKey("argon", activeAccount: ultraAccPayload) == "gemini", "Ultra remaps argon to shared gemini pool")
         check(QuotaPresentation.effectiveMonitoredModelKey("gemini_all", activeAccount: ultraAccPayload) == "gemini", "Ultra remaps gemini_all to shared gemini pool")
-        check(QuotaPresentation.monitoredScopeSubtitle(for: "gemini", activeAccount: ultraAccPayload).contains("Argon 与 Carbon 并入此共享池"), "Ultra gemini subtitle explains pooled Argon/Carbon")
+        check(QuotaPresentation.pooledUltraGeminiModelNames(ultraAccPayload).isEmpty, "Ultra without member evidence must not assume Argon/Carbon")
+        check(QuotaPresentation.monitoredScopeSubtitle(for: "gemini", activeAccount: ultraAccPayload) == "仅监测当前 Ultra 账号的 Gemini 共享配额池", "Ultra gemini subtitle uses neutral copy without member evidence")
         check(QuotaPresentation.monitoredModelDisplayName("argon", activeAccount: ultraAccPayload) == "Gemini", "Ultra display name resolves argon to Gemini")
         var ultraWithOnlyOrchestrator = ultraAccPayload
         ultraWithOnlyOrchestrator["models"] = [
@@ -345,7 +346,7 @@ import Cocoa
         ultraWithNonMemberDesc["models"] = [
             ["name": "gemini-4-neon", "model_id": "gemini-4-neon", "display_name": "Gemini 4 Neon", "family": "gemini", "disabled": false]
         ]
-        check(QuotaPresentation.pooledUltraGeminiModelNames(ultraWithNonMemberDesc) == ["Argon", "Carbon", "Neon"], "Non-member description with colon smoothly falls back to visible Gemini models")
+        check(QuotaPresentation.pooledUltraGeminiModelNames(ultraWithNonMemberDesc) == ["Neon"], "Non-member description with colon smoothly falls back to visible Gemini models without guessing Argon/Carbon")
         var ultraWithVisibleModels = ultraAccPayload
         ultraWithVisibleModels["models"] = [
             ["name": "gemini-4-argon", "model_id": "gemini-4-argon", "display_name": "Gemini 4 Argon", "family": "gemini", "disabled": false],

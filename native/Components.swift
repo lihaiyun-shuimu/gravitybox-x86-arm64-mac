@@ -66,7 +66,7 @@ func symbol(_ name: String, size: CGFloat = 22, color: NSColor = .controlAccentC
 func button(_ title: String, target: AnyObject?, action: Selector) -> NSButton {
     let view = DesignButton(title: title, target: target, action: action)
     view.bezelStyle = .rounded; view.isBordered = false; view.font = .systemFont(ofSize: 12, weight: .medium)
-    view.setAccessibilityLabel(title); return view
+    return view
 }
 class DesignCardBox: NSBox {
     var enablesHoverHighlight: Bool = false {

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   MISSING_OAUTH_CLIENT_PATTERN,
+  buildAccountQuotaOverview,
   computeAccountRemaining,
   computeStandbyRefreshStatus,
   evaluateStandbyCandidate,
@@ -20,6 +21,7 @@ import { AccountSwitchService } from '../dist/account-switch.js';
 import { replaceTopicRow } from '../dist/account-state.js';
 import { bt, getActiveLocale, setActiveLocale } from '../dist/i18n.js';
 import { ProtobufWriter as Writer } from '../dist/protobuf.js';
+import { sendBackendRpc, sqliteExec, stopBackendChild, waitForBackendReady } from './test-ipc.mjs';
 
 function makeQuota({
   lastUpdatedSec,
@@ -147,50 +149,13 @@ async function createStateVscdb(vscdbPath, { accessToken, refreshToken, expirySe
     'CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value TEXT);',
     ...rows.map(r => `INSERT OR REPLACE INTO ItemTable(key, value) VALUES('${r.key}', '${r.value}');`),
   ].join('\n');
-  const { execFile } = await import('node:child_process');
-  const { promisify } = await import('node:util');
-  await promisify(execFile)('/usr/bin/sqlite3', [vscdbPath, sql]);
+  sqliteExec(vscdbPath, sql);
 }
 
 const pause = ms => new Promise(r => setTimeout(r, ms));
-async function stopChild(child) {
-  if (!child || child.exitCode !== null) return;
-  child.kill('SIGTERM');
-  await Promise.race([once(child, 'exit'), pause(3000)]);
-  if (child.exitCode === null) {
-    child.kill('SIGKILL');
-    await once(child, 'exit');
-  }
-}
-async function waitReady(dir) {
-  for (let i = 0; i < 300; i++) {
-    try {
-      await access(join(dir, 'control.sock'));
-      await new Promise((res, rej) => {
-        const s = createConnection(join(dir, 'control.sock'));
-        s.once('connect', () => { s.destroy(); res(); });
-        s.once('error', rej);
-      });
-      return;
-    } catch {}
-    await pause(20);
-  }
-  throw new Error('backend socket not ready');
-}
-const rpc = (dir, payload) => new Promise((resolve, reject) => {
-  const s = createConnection(join(dir, 'control.sock'));
-  let buf = '';
-  s.on('error', reject);
-  s.on('connect', () => s.write(JSON.stringify(payload) + '\n'));
-  s.setTimeout(10_000, () => { s.destroy(); reject(new Error('rpc timeout')); });
-  s.on('data', chunk => {
-    buf += chunk;
-    if (buf.includes('\n')) {
-      s.end();
-      resolve(JSON.parse(buf.split('\n')[0]));
-    }
-  });
-});
+const stopChild = child => stopBackendChild(child);
+const waitReady = dir => waitForBackendReady(dir);
+const rpc = (dir, payload) => sendBackendRpc(dir, payload, { timeoutMs: 10_000 });
 
 test('Scenario 1: computeStandbyRefreshStatus, plain-language OAuth patterns, IPC projection & revision', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'gb-standby-s1-'));
@@ -320,6 +285,41 @@ test('Scenario 1: computeStandbyRefreshStatus, plain-language OAuth patterns, IP
   const projectedActive = projectAccountForIpc(activeErrAcc, { isActive: true, hasLocalOAuthClient: false, nowMs });
   assert.equal(projectedActive.standbyRefreshStatus.mode, 'live_active');
   assert.equal(projectedActive.quota_refresh_error, bt('account_cloud.err.missing_oauth_client_active_live'));
+
+  // Remote SSH active standby account must treat standbyRefreshStatus as live_active (can refresh anytime)
+  const remoteActiveStatus = computeStandbyRefreshStatus(coolingAcc, {
+    isActive: false,
+    isRemoteActive: true,
+    hasLocalOAuthClient: false,
+    nowMs,
+  });
+  assert.equal(remoteActiveStatus.mode, 'live_active');
+  assert.equal(remoteActiveStatus.canBackgroundRefresh, true);
+  assert.deepEqual(remoteActiveStatus.cooldownElapsedFamilies, []);
+
+  const normalizedRemoteActive = projectAccountForIpcNormalized(elapsedAcc, mgr, {
+    isActive: false,
+    hasLocalOAuthClient: false,
+    nowMs,
+    activeRemoteEnvIds: ['ssh:remote-ssh-node'],
+    quotaSourceEnvironmentId: 'ssh:remote-ssh-node',
+    revisionWithReadiness: true,
+  });
+  assert.equal(normalizedRemoteActive.standbyRefreshStatus.mode, 'live_active');
+  assert.equal(normalizedRemoteActive.standbyRefreshStatus.canBackgroundRefresh, true);
+  assert.ok(normalizedRemoteActive.revision.endsWith(':needs_refresh:live_active'));
+
+  // Offline standby without SSH stays snapshot_cooling / snapshot_cooldown_elapsed
+  const normalizedOfflineElapsed = projectAccountForIpcNormalized(elapsedAcc, mgr, {
+    isActive: false,
+    hasLocalOAuthClient: false,
+    nowMs,
+    activeRemoteEnvIds: [],
+    quotaSourceEnvironmentId: 'local',
+    revisionWithReadiness: true,
+  });
+  assert.equal(normalizedOfflineElapsed.standbyRefreshStatus.mode, 'snapshot_cooldown_elapsed');
+  assert.equal(normalizedOfflineElapsed.standbyRefreshStatus.canBackgroundRefresh, false);
 });
 
 test('Scenario 2: refreshAllQuotas skips expired standby without OAuth client and clears stale missing_oauth_client error', async t => {
@@ -790,7 +790,7 @@ AccountsManager.prototype.probeLiveLanguageServer = async () => ({
   const child = spawn(
     process.execPath,
     [
-      '--import', preload,
+      '--import', pathToFileURL(preload).href,
       fileURLToPath(new URL('../dist/main.js', import.meta.url)),
       '--state-dir', dir,
       '--app', '/nonexistent',
@@ -942,7 +942,7 @@ AccountsManager.prototype.refreshQuota = async function(id) {
   const child = spawn(
     process.execPath,
     [
-      '--import', preload,
+      '--import', pathToFileURL(preload).href,
       fileURLToPath(new URL('../dist/main.js', import.meta.url)),
       '--state-dir', dir,
       '--app', '/nonexistent',
@@ -965,4 +965,84 @@ AccountsManager.prototype.refreshQuota = async function(id) {
   const calls = (await readFile(logFile, 'utf8')).trim().split('\n').filter(Boolean);
   assert.equal(calls.includes('refreshAllQuotas'), false, 'expired standby must not trigger refreshAllQuotas');
   assert.deepEqual(calls.filter(c => c.startsWith('refreshQuota:')), [`refreshQuota:${snapStandby.id}`], 'last-mile snap must fire exactly once');
+});
+
+test('P1-10: daily 窗口参与冷却时间与约束计算（不混入 5h/weekly），且未匹配 other 模型不回退 gemini/claude', () => {
+  const nowSec = Math.floor(Date.UTC(2026, 10, 22, 12, 0, 0) / 1000);
+  const nowMs = nowSec * 1000;
+  const reset5hIso = new Date((nowSec + 4 * 3600) * 1000).toISOString();
+  const resetDailyIso = new Date((nowSec + 2 * 3600) * 1000).toISOString();
+  const resetDailyExpiredIso = new Date((nowSec - 60) * 1000).toISOString();
+  const resetWeeklyIso = new Date((nowSec + 6 * 86400) * 1000).toISOString();
+
+  const accWithDailyConstraint = {
+    id: 'acc-daily-1',
+    email: 'daily-constraint@example.invalid',
+    disabled: false,
+    token: {
+      access_token: 'expired',
+      refresh_token: '1//refresh',
+      expires_in: 0,
+      expiry_timestamp: nowSec - 600,
+      token_type: 'Bearer',
+      is_gcp_tos: false,
+    },
+    quota: {
+      last_updated: nowSec - 60,
+      is_forbidden: false,
+      subscription_tier: 'PRO',
+      model_forwarding_rules: {},
+      models: [
+        {
+          name: 'gemini-3.8-flash',
+          model_id: 'gemini-3.8-flash',
+          display_name: 'Gemini 3.8 Flash',
+          family: 'gemini',
+          percentage: 90,
+          percentage_known: true,
+          own_percentage: 90,
+          own_percentage_known: true,
+          reset_time: reset5hIso,
+        },
+      ],
+      quota_groups: [
+        {
+          group_id: 'gemini',
+          display_name: 'Gemini Models',
+          family: 'gemini',
+          observed_at: nowSec - 60,
+          buckets: [
+            { bucket_id: 'g-5h', window: '5h', remaining_fraction: 0.9, remaining_fraction_known: true, reset_time: reset5hIso, observed_at: nowSec - 60 },
+            { bucket_id: 'g-daily', window: 'daily', remaining_fraction: 0.15, remaining_fraction_known: true, reset_time: resetDailyIso, observed_at: nowSec - 60 },
+            { bucket_id: 'g-weekly', window: 'weekly', remaining_fraction: 0.8, remaining_fraction_known: true, reset_time: resetWeeklyIso, observed_at: nowSec - 60 },
+          ],
+        },
+      ],
+    },
+  };
+
+  const overview = buildAccountQuotaOverview(accWithDailyConstraint, { nowMs });
+  assert.equal(overview.familyWindows.gemini.fiveHour?.remaining, 0.9, '5h 窗口必须保持纯 5h 语义');
+  assert.equal(overview.familyWindows.gemini.weekly?.remaining, 0.8, 'weekly 窗口必须保持纯 weekly 语义');
+  assert.equal(overview.familyWindows.gemini.daily?.remaining, 0.15, 'daily 窗口应独立保留');
+  assert.equal(computeAccountRemaining(accWithDailyConstraint, 'gemini', { nowMs }), 15, 'daily 约束应拉低账号有效剩余');
+
+  const refreshCooling = computeStandbyRefreshStatus(accWithDailyConstraint, { hasLocalOAuthClient: false, nowMs, overview });
+  assert.equal(refreshCooling.mode, 'snapshot_cooling');
+  assert.equal(refreshCooling.nextResetAt, resetDailyIso, 'nextResetAt 应识别更早重置的 daily 窗口');
+
+  // daily 窗口已过重置点 -> 触发 cooldown_elapsed
+  const accDailyElapsed = structuredClone(accWithDailyConstraint);
+  accDailyElapsed.quota.quota_groups[0].buckets[1].reset_time = resetDailyExpiredIso;
+  const elapsedOverview = buildAccountQuotaOverview(accDailyElapsed, { nowMs });
+  const refreshElapsed = computeStandbyRefreshStatus(accDailyElapsed, { hasLocalOAuthClient: false, nowMs, overview: elapsedOverview });
+  assert.equal(refreshElapsed.mode, 'snapshot_cooldown_elapsed');
+  assert.deepEqual(refreshElapsed.cooldownElapsedFamilies, ['gemini']);
+
+  // 未匹配的 other 模型（账号目录中不存在 acme-nova-1）必须返回 null，不得回退到 gemini/claude
+  assert.equal(
+    evaluateStandbyCandidate(accWithDailyConstraint, 'acme-nova-1', { nowMs, minPercentage: 10 }),
+    null,
+    '无法匹配的 other 模型不得借用 gemini/claude 窗口误判为可用候选'
+  );
 });

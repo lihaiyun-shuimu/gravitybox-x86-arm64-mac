@@ -1602,3 +1602,165 @@ test('Argon/Carbon 独立池遵循动态 staleAfterSeconds 阈值，30 分钟刷
   assert.equal((overview.quotaWarningCodes ?? []).includes('ARGON_STALE'), false, '不得误报 ARGON_STALE 警告');
   assert.equal(computeAccountRemaining(acc, 'argon', nowMs, 1920), 72, 'Argon 监控范围应返回有效剩余百分比 72');
 });
+
+test('P1-8 & P1-9: 独立配额桶移除 argon/carbon 硬编码过滤，未知订阅层级保留清洗后官方原名并确定性排序', async () => {
+  const { normalizeIndependentArgonQuota } = await import('../dist/quota.js');
+  const { resolveProbeSubscriptionTier } = await import('../dist/account-probe.js');
+  const { normalizeCatalogTierLabel, compareCatalogTiers } = await import('../dist/pricing.js');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const reset = new Date((nowSec + 3600) * 1000).toISOString();
+
+  // P1-8: 非 argon/carbon 独立桶（other）自动保留；显式 allowedModelIds 可补充未来独立 Gemini 代号；编排器与默认核心共享桶仍拒绝
+  const defaultRows = normalizeIndependentArgonQuota({
+    buckets: [
+      { modelId: 'gemini-pro-orchestrator-xenon', displayName: 'Orchestrator (Xenon)', remainingFraction: 1, resetTime: reset },
+      { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon', remainingFraction: 0.9, resetTime: reset },
+      { modelId: 'claude-sonnet-5-5', displayName: 'Claude Sonnet 5.5', remainingFraction: 0.8, resetTime: reset },
+      { modelId: 'qwen-3-max', displayName: 'Qwen 3 Max', remainingFraction: 0.55, resetTime: reset },
+      { modelId: 'gemini-4-argon', displayName: 'Gemini 4 Argon', remainingFraction: 0.4, resetTime: reset },
+    ],
+  }, nowSec);
+  assert.deepEqual(defaultRows.map(r => r.model_id).sort(), ['gemini-4-argon', 'qwen-3-max']);
+
+  const targetedRows = normalizeIndependentArgonQuota(
+    {
+      buckets: [
+        { modelId: 'gemini-5-xenon', displayName: 'Gemini 5 Xenon', remainingFraction: 0.65, resetTime: reset },
+        { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon', remainingFraction: 0.9, resetTime: reset },
+      ],
+    },
+    nowSec,
+    { allowedModelIds: new Set(['gemini-5-xenon']) },
+  );
+  assert.deepEqual(targetedRows.map(r => r.model_id), ['gemini-5-xenon']);
+  assert.equal(targetedRows[0].own_percentage, 65);
+
+  // P1-9: 未知官方层级剥离 g1-/-tier 前后缀保留清洗原名；哨兵/内部词继续返回空串；排序确定性兜底
+  assert.equal(normalizeCatalogTierLabel('g1-max-tier'), 'MAX');
+  assert.equal(normalizeCatalogTierLabel('Google AI Education'), 'EDUCATION');
+  assert.equal(normalizeCatalogTierLabel('unknown-tier'), '');
+  assert.equal(normalizeCatalogTierLabel('Prototype Internal'), '');
+  assert.equal(
+    resolveProbeSubscriptionTier({ userTier: { id: 'g1-max-tier', name: 'Google AI Max' } }),
+    'MAX'
+  );
+  assert.equal(
+    resolveProbeSubscriptionTier({ userTier: { id: 'g1-student-plan', description: 'Includes full access to Gemini models for personal projects' } }),
+    'STUDENT'
+  );
+  assert.deepEqual(
+    ['ZETA', 'FREE', 'MAX', 'ULTRA', 'ALPHA'].sort(compareCatalogTiers),
+    ['ULTRA', 'FREE', 'ALPHA', 'MAX', 'ZETA']
+  );
+});
+
+test('P2-8, P2-9 & P2-17: Live 探针缺独立 other 桶计入 missingFamilies；Ultra 官方独立组不被吞并；daily_known 走双语词条', async () => {
+  const { buildLiveProbeResultFromRpc } = await import('../dist/account-probe.js');
+  const { buildArgonStatus, familyWindowsFromGroups, normalizeStoredGroups } = await import('../dist/quota.js');
+  const { getActiveLocale, setActiveLocale } = await import('../dist/i18n.js');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const nowMs = nowSec * 1000;
+  const resetIso = new Date((nowSec + 3600) * 1000).toISOString();
+
+  // P2-8: 带显式 quotaBucketName 的 other 独立模型缺少配额时，Live 探针 missingFamilies 包含 'other'
+  const liveProbe = buildLiveProbeResultFromRpc(
+    {
+      userStatus: {
+        email: 'probe-other@example.invalid',
+        userTier: { id: 'g1-pro-tier', name: 'Google AI Pro' },
+        cascadeModelConfigData: {
+          clientModelConfigs: [
+            {
+              modelId: 'gemini-3.8-flash',
+              label: 'Gemini 3.8 Flash',
+              modelOrAlias: { model: 'gemini-3.8-flash' },
+              quotaInfo: { remainingFraction: 0.9, resetTime: resetIso },
+            },
+            {
+              modelId: 'qwen-3-max',
+              label: 'Qwen 3 Max',
+              modelOrAlias: { model: 'qwen-3-max' },
+              quotaBucketName: 'Qwen Independent Pool',
+              quotaInfo: {},
+            },
+          ],
+        },
+      },
+    },
+    {
+      groups: [
+        {
+          displayName: 'Gemini Models',
+          buckets: [{ bucketId: 'g-5h', window: '5h', remainingFraction: 0.9, resetTime: resetIso }],
+        },
+      ],
+    },
+  );
+  assert.ok(liveProbe);
+  assert.equal(liveProbe.quota.refresh_state.missingFamilies.includes('other'), true, '带显式独立桶且缺额度的 other 模型应计入 missingFamilies');
+  assert.equal(liveProbe.quota.refresh_state.complete, false);
+
+  // P2-9: Ultra 账号若官方 groups[] 显式返回了独立 Argon 分组，不得被兜底吞并入 Gemini 共享池
+  const ultraWithStandaloneArgonGroups = normalizeStoredGroups(
+    [
+      {
+        display_name: 'Gemini Models',
+        family: 'gemini',
+        buckets: [{ bucket_id: 'g-5h', window: '5h', remaining_fraction: 0.9, remaining_fraction_known: true, reset_time: resetIso, observed_at: nowSec }],
+      },
+      {
+        display_name: 'Gemini 4 Argon',
+        family: 'argon',
+        buckets: [{ bucket_id: 'argon-daily', window: 'daily', remaining_fraction: 0.45, remaining_fraction_known: true, reset_time: resetIso, observed_at: nowSec }],
+      },
+    ],
+    nowSec,
+    'live',
+  );
+  const fw = familyWindowsFromGroups(ultraWithStandaloneArgonGroups, nowMs);
+  const argonModels = [
+    {
+      name: 'gemini-4-argon',
+      model_id: 'gemini-4-argon',
+      display_name: 'Gemini 4 Argon',
+      family: 'argon',
+      is_argon: true,
+      disabled: false,
+      model_or_alias: null,
+      own_percentage: null,
+      own_percentage_known: false,
+      own_reset_time: null,
+      own_observed_at: null,
+      own_stale: false,
+      family_5h: null,
+      family_weekly: null,
+      percentage: 0,
+      percentage_known: false,
+      effective_percentage: null,
+      effective_known: false,
+      reset_time: '',
+      quota_source: 'live',
+      stale: false,
+    },
+  ];
+  const origLocale = getActiveLocale();
+  try {
+    setActiveLocale('zh-Hans');
+    const zhStatus = buildArgonStatus(argonModels, ultraWithStandaloneArgonGroups, fw, nowMs, 'ULTRA');
+    assert.equal(zhStatus.mode, 'standalone', 'Ultra 存在官方独立 Argon 分组时不得被 Gemini 共享池吞并');
+    assert.equal(zhStatus.period, 'daily');
+    assert.match(zhStatus.message, /每日配额已取得（剩余 45%）/);
+
+    setActiveLocale('en');
+    const enStatus = buildArgonStatus(argonModels, ultraWithStandaloneArgonGroups, fw, nowMs, 'ULTRA');
+    assert.match(enStatus.message, /daily quota retrieved \(45% remaining\)/);
+  } finally {
+    setActiveLocale(origLocale);
+  }
+});
+
+
+
+
+
+

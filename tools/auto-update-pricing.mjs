@@ -32,7 +32,7 @@ const VENDOR_CONTENT_ANCHORS = [
 const INTERNAL_DERIVATIVE_RE = /(?:^|[-_])(?:trial|control|tiered|safety[-_]le|exp[-_][a-z0-9]+|n|a|default)(?:$|[-_])/i;
 
 // 仅作为新模型雷达候选的现代主流对话模型族，过滤老旧历史模型与非文本模态条目
-const MODERN_RADAR_MODEL_RE = /^(?:gemini-(?:3\.[5-9]|[4-9](?:\.\d+)?)|claude-(?:(?:sonnet|opus|haiku)-[4-9]|[4-9](?:[-.]\d+)?-(?:sonnet|opus|haiku))|gpt-(?:4\.[5-9]|[5-9](?:\.\d+)?)|o[3-9](?:-|$))/i;
+const MODERN_RADAR_MODEL_RE = /^(?:gemini-(?:3\.[5-9]|(?:[4-9]|[1-9]\d+)(?:\.\d+)?)|claude-(?:(?:sonnet|opus|haiku|[a-z]{3,16})-(?:[4-9]|[1-9]\d+)|(?:[4-9]|[1-9]\d+)(?:[-.]\d+)?-(?:sonnet|opus|haiku|[a-z]{3,16}))|gpt-(?:4\.[5-9]|(?:[5-9]|[1-9]\d+)(?:\.\d+)?)|o(?:[3-9]|[1-9]\d+)(?:-|$))/i;
 const IGNORED_RADAR_SUFFIX_RE = /(?:batch|audio|realtime|image|video|tts|stt|transcribe|embed|moderation|search|deep-research|computer-use|cyber-permissive|free|:free|:extended)/i;
 
 // 常见目录 key 到官方/LiteLLM 常见别名的补充映射
@@ -639,6 +639,12 @@ export function parseLiteLlmRates(data) {
           }
         : undefined;
 
+    const maxInputRaw = Number(spec.max_input_tokens ?? spec.max_tokens);
+    const contextWindow =
+      Number.isSafeInteger(maxInputRaw) && maxInputRaw >= 4_096 && maxInputRaw <= 10_000_000
+        ? maxInputRaw
+        : undefined;
+
     const candidate = {
       rawKey,
       cleanKey,
@@ -647,6 +653,7 @@ export function parseLiteLlmRates(data) {
       output: roundRate(outPerM),
       ...(Number.isFinite(cachedRaw) && cachedRaw >= 0 ? { cached: roundRate(cachedRaw * 1_000_000) } : {}),
       ...(Number.isFinite(cacheWriteRaw) && cacheWriteRaw >= 0 ? { cacheWrite: roundRate(cacheWriteRaw * 1_000_000) } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
       hasContextTiers: hasAbove200k,
       ...(contextTier ? { contextTier } : {}),
       source: 'litellm',
@@ -670,12 +677,18 @@ export function parseOpenRouterRates(payload) {
     if (!Number.isFinite(inPerM) || inPerM <= 0 || !Number.isFinite(outPerM) || outPerM <= 0) continue;
     const cacheReadRaw = Number(item?.pricing?.input_cache_read);
     const cacheWriteRaw = Number(item?.pricing?.input_cache_write);
+    const ctxRaw = Number(item?.context_length ?? item?.top_provider?.context_length);
+    const contextWindow =
+      Number.isSafeInteger(ctxRaw) && ctxRaw >= 4_096 && ctxRaw <= 10_000_000
+        ? ctxRaw
+        : undefined;
     map.set(id, {
       cleanKey: id,
       input: roundRate(inPerM),
       output: roundRate(outPerM),
       ...(Number.isFinite(cacheReadRaw) && cacheReadRaw >= 0 ? { cached: roundRate(cacheReadRaw * 1_000_000) } : {}),
       ...(Number.isFinite(cacheWriteRaw) && cacheWriteRaw >= 0 ? { cacheWrite: roundRate(cacheWriteRaw * 1_000_000) } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
       source: 'openrouter',
     });
   }
@@ -736,8 +749,8 @@ function buildGeminiGenerationConfig(model) {
     responseMimeType: 'application/json',
     responseSchema: GEMINI_EXTRACTION_SCHEMA,
   };
-  // Gemini 3.6+ / 4.x 非 lite 文本模型支持 thinkingLevel='low'，避免默认 medium/high 思考拉高输出计费
-  if (/^gemini-(?:3\.(?:[6-9]|\d{2})|[4-9])/i.test(model) && !/(?:lite|tts|image|live)/i.test(model)) {
+  // Gemini 3.6+ / 4.x+ 非 lite 文本模型支持 thinkingLevel='low'，避免默认 medium/high 思考拉高输出计费
+  if (/^gemini-(?:3\.(?:[6-9]|\d{2})|[4-9]|[1-9]\d+)/i.test(model) && !/(?:lite|tts|image|live)/i.test(model)) {
     generationConfig.thinkingConfig = { thinkingLevel: 'low' };
   }
   return generationConfig;
@@ -1129,7 +1142,7 @@ export function canonicalCatalogKeyForNewModel(normId) {
 
 export function buildAutoStagedAliases(modelId) {
   const clean = String(modelId ?? '').trim().toLowerCase();
-  const match = clean.match(/^gemini-([4-9](?:\.\d+)?)-([a-z][a-z0-9]*)$/);
+  const match = clean.match(/^gemini-((?:[4-9]|[1-9]\d+)(?:\.\d+)?)-([a-z][a-z0-9]*)$/);
   if (!match) return {};
   const codename = match[2];
   const cap = codename.charAt(0).toUpperCase() + codename.slice(1);
@@ -1350,7 +1363,7 @@ export function evaluateVerifiedPromoSchedule({ baseInput, baseOutput, baseCache
   };
 }
 
-export function evaluateNewModelStagingCandidate({ id, vendor = 'Upstream', url = '', official, litellm, nowMs = Date.now() }) {
+export function evaluateNewModelStagingCandidate({ id, vendor = 'Upstream', url = '', official, litellm, openrouter = null, nowMs = Date.now() }) {
   const catalogKey = canonicalCatalogKeyForNewModel(id);
   const reasons = [];
   if (!official || official.confidence !== 'high') {
@@ -1446,6 +1459,11 @@ export function evaluateNewModelStagingCandidate({ id, vendor = 'Upstream', url 
   }
 
   const cachedVal = roundRate(offCached !== null ? offCached : ltCached);
+  const rawCtx = official?.contextWindow ?? litellm?.contextWindow ?? openrouter?.contextWindow;
+  const contextWindow =
+    Number.isSafeInteger(Number(rawCtx)) && Number(rawCtx) >= 4_096 && Number(rawCtx) <= 10_000_000
+      ? Number(rawCtx)
+      : undefined;
   return {
     stageable: true,
     catalogKey,
@@ -1453,6 +1471,7 @@ export function evaluateNewModelStagingCandidate({ id, vendor = 'Upstream', url 
     vendor,
     url,
     aliases: buildAutoStagedAliases(catalogKey),
+    ...(contextWindow ? { contextWindow } : {}),
     proposed: {
       input: baseIn,
       output: baseOut,
@@ -1486,7 +1505,11 @@ export function applyStagedNewModels(catalog, stagedModels, nowMs = Date.now(), 
     const { platform, platformEn } = inferPlatformLabels(candidate.vendor, candidate.url);
     catalog.names[key] = candidate.displayName;
     if (!Object.hasOwn(catalog.capacities, key)) {
-      catalog.capacities[key] = /^(?:gpt-|o[1-9](?:$|[-_]))/i.test(key) ? 128_000 : 200_000;
+      const candidateCtx = Number(candidate.contextWindow ?? candidate.proposed?.contextWindow);
+      catalog.capacities[key] =
+        Number.isSafeInteger(candidateCtx) && candidateCtx >= 4_096 && candidateCtx <= 10_000_000
+          ? candidateCtx
+          : (/^(?:gpt-|o(?:[1-9]|[1-9]\d+)(?:$|[-_]))/i.test(key) ? 128_000 : 200_000);
     }
 
     const promo = candidate.proposed.promoSchedule;
@@ -1622,35 +1645,55 @@ export function applyVerifiedPriceUpdate(catalog, key, proposed, nowMs = Date.no
     verification: 'confirmed',
   };
 
+  const todayStartMs = Date.parse(todayStartIso);
   if (!Array.isArray(entry.intervals) || entry.intervals.length === 0) {
-    const oldProv = {
-      ...baseProv,
-      validUntil: yesterdayEndIso,
-    };
-    entry.intervals = [
-      {
-        model: key,
-        validFrom: baseProv.validFrom ?? null,
+    const baseFromMs = baseProv.validFrom ? Date.parse(baseProv.validFrom) : NaN;
+    const isSameDayOrLaterBase =
+      Number.isFinite(baseFromMs) && Number.isFinite(todayStartMs) && baseFromMs >= todayStartMs;
+    if (isSameDayOrLaterBase) {
+      entry.intervals = [
+        {
+          model: key,
+          validFrom: baseProv.validFrom,
+          validUntil: null,
+          input: proposed.input,
+          output: proposed.output,
+          cached: proposed.cached,
+          ...(proposed.cacheWrite !== undefined ? { cacheWrite: proposed.cacheWrite } : {}),
+          ...(Array.isArray(proposed.contextTiers) ? { contextTiers: proposed.contextTiers } : {}),
+          provenance: { ...newProv, validFrom: baseProv.validFrom },
+        },
+      ];
+    } else {
+      const oldProv = {
+        ...baseProv,
         validUntil: yesterdayEndIso,
-        input: entry.input,
-        output: entry.output,
-        cached: entry.cached,
-        ...(entry.cacheWrite !== undefined ? { cacheWrite: entry.cacheWrite } : {}),
-        ...(Array.isArray(entry.contextTiers) ? { contextTiers: entry.contextTiers } : {}),
-        provenance: oldProv,
-      },
-      {
-        model: key,
-        validFrom: todayStartIso,
-        validUntil: null,
-        input: proposed.input,
-        output: proposed.output,
-        cached: proposed.cached,
-        ...(proposed.cacheWrite !== undefined ? { cacheWrite: proposed.cacheWrite } : {}),
-        ...(Array.isArray(proposed.contextTiers) ? { contextTiers: proposed.contextTiers } : {}),
-        provenance: { ...newProv },
-      },
-    ];
+      };
+      entry.intervals = [
+        {
+          model: key,
+          validFrom: baseProv.validFrom ?? null,
+          validUntil: yesterdayEndIso,
+          input: entry.input,
+          output: entry.output,
+          cached: entry.cached,
+          ...(entry.cacheWrite !== undefined ? { cacheWrite: entry.cacheWrite } : {}),
+          ...(Array.isArray(entry.contextTiers) ? { contextTiers: entry.contextTiers } : {}),
+          provenance: oldProv,
+        },
+        {
+          model: key,
+          validFrom: todayStartIso,
+          validUntil: null,
+          input: proposed.input,
+          output: proposed.output,
+          cached: proposed.cached,
+          ...(proposed.cacheWrite !== undefined ? { cacheWrite: proposed.cacheWrite } : {}),
+          ...(Array.isArray(proposed.contextTiers) ? { contextTiers: proposed.contextTiers } : {}),
+          provenance: { ...newProv },
+        },
+      ];
+    }
   } else {
     const activeIdx = entry.intervals.findIndex((iv) => {
       const f = iv?.validFrom ? Date.parse(iv.validFrom) : -Infinity;
@@ -1659,14 +1702,17 @@ export function applyVerifiedPriceUpdate(catalog, key, proposed, nowMs = Date.no
     });
     const targetIdx = activeIdx >= 0 ? activeIdx : entry.intervals.length - 1;
     const activeIv = entry.intervals[targetIdx];
+    const activeFromMs = activeIv?.validFrom ? Date.parse(activeIv.validFrom) : NaN;
+    const isSameDayOrLaterActive =
+      Number.isFinite(activeFromMs) && Number.isFinite(todayStartMs) && activeFromMs >= todayStartMs;
 
-    if (activeIv.validFrom === todayStartIso && !activeIv.validUntil) {
+    if (isSameDayOrLaterActive && !activeIv.validUntil) {
       activeIv.input = proposed.input;
       activeIv.output = proposed.output;
       activeIv.cached = proposed.cached;
       if (proposed.cacheWrite !== undefined) activeIv.cacheWrite = proposed.cacheWrite;
       if (Array.isArray(proposed.contextTiers)) activeIv.contextTiers = proposed.contextTiers;
-      activeIv.provenance = { ...newProv };
+      activeIv.provenance = { ...newProv, validFrom: activeIv.validFrom };
     } else {
       activeIv.validUntil = yesterdayEndIso;
       activeIv.provenance = { ...(activeIv.provenance ?? baseProv), validUntil: yesterdayEndIso };
@@ -1700,6 +1746,7 @@ export function applyVerifiedPriceUpdate(catalog, key, proposed, nowMs = Date.no
 
 function collectExpiringIntervals(catalog, nowMs = Date.now()) {
   const expiring = [];
+  const seen = new Set();
   for (const [key, entry] of Object.entries(catalog.prices ?? {})) {
     const items = Array.isArray(entry) ? entry : [entry, ...(entry.intervals ?? [])];
     for (const item of items) {
@@ -1714,6 +1761,9 @@ function collectExpiringIntervals(catalog, nowMs = Date.now()) {
           return Number.isFinite(fromMs) && fromMs >= untilMs - 1000 && !iv.validUntil;
         });
       if (!hasSuccessor && untilMs - nowMs <= WARN_HORIZON_MS) {
+        const dedupKey = `${key}\0${validUntil}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
         expiring.push({ key, validUntil });
       }
     }
@@ -1875,29 +1925,33 @@ export async function runAutoUpdatePricing(options = {}) {
       let cleanText = res.ok ? extractCleanPricingText(html) : '';
       let blockReason = res.ok ? detectBlockedOrEmptyPage(html, cleanText, rule) : `http_${res.status}`;
 
-      if (blockReason === 'empty_or_csr_shell') {
+      if (blockReason === 'empty_or_csr_shell' || blockReason === 'anchor_missing') {
         const mdUrl = buildMarkdownFallbackUrl(res.url || url);
         if (mdUrl) {
-          const mdRes = await fetchImpl(mdUrl, {
-            method: 'GET',
-            redirect: 'follow',
-            headers: {
-              'User-Agent': 'GravityBox-PricingWatch/1.2 (+https://github.com/Enzoo404/gravitybox)',
-              Accept: 'text/markdown,text/plain;q=0.9,*/*;q=0.8',
-            },
-            signal: AbortSignal.timeout(20_000),
-          });
-          if (mdRes.ok) {
-            const mdText = await mdRes.text();
-            const mdCleanText = extractCleanPricingText(mdText);
-            const mdBlockReason = detectBlockedOrEmptyPage(mdText, mdCleanText, rule);
-            if (!mdBlockReason) {
-              fetchUrl = mdUrl;
-              res = mdRes;
-              html = mdText;
-              cleanText = mdCleanText;
-              blockReason = null;
+          try {
+            const mdRes = await fetchImpl(mdUrl, {
+              method: 'GET',
+              redirect: 'follow',
+              headers: {
+                'User-Agent': 'GravityBox-PricingWatch/1.2 (+https://github.com/Enzoo404/gravitybox)',
+                Accept: 'text/markdown,text/plain;q=0.9,*/*;q=0.8',
+              },
+              signal: AbortSignal.timeout(20_000),
+            });
+            if (mdRes.ok) {
+              const mdText = await mdRes.text();
+              const mdCleanText = extractCleanPricingText(mdText);
+              const mdBlockReason = detectBlockedOrEmptyPage(mdText, mdCleanText, rule);
+              if (!mdBlockReason) {
+                fetchUrl = mdUrl;
+                res = mdRes;
+                html = mdText;
+                cleanText = mdCleanText;
+                blockReason = null;
+              }
             }
+          } catch {
+            // Markdown 回退失败时保留原始 blockReason 告警，不掩盖上游页面状态
           }
         }
       }
@@ -2039,6 +2093,7 @@ export async function runAutoUpdatePricing(options = {}) {
       url: entry.url,
       official: entry.item,
       litellm,
+      openrouter,
       nowMs,
     });
     if (staging.stageable) {

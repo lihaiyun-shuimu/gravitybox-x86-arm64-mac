@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { aggregateLedger, isUnpricedZeroSentinel, type AggregateOptions } from './usage-aggregate.js';
+import { aggregateLedger, isUnpricedZeroSentinel, safeRollback, type AggregateOptions } from './usage-aggregate.js';
 import { matchPricingKeys, resolveContextTierPricing, resolvePricingForTimestamp, type ApiPricing } from './pricing.js';
 import { resolveDatabaseModelFullName } from './usage-types.js';
 import { bt } from './i18n.js';
@@ -33,6 +33,7 @@ export function writeRateLocksJsonMirror(db: DatabaseSync, ratesPath: string): v
     chmodSync(tmpRates, 0o600);
     renameSync(tmpRates, ratesPath);
 }
+
 export function revalueLedger(db: DatabaseSync, path: string, options: AggregateOptions & {
     action: 'preview' | 'apply' | 'restore';
     mode?: 'force_all' | 'unpriced_only';
@@ -160,6 +161,7 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
         const after = aggregateLedger(db, {
             ...options,
             accountId: 'all',
+            environmentId: 'all',
             accounts: [],
             ignoreLegacyRates: true,
             dryRunRateLocks: candidateLocks,
@@ -181,7 +183,7 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
         const changes: {
             key: string;
             before: number | null;
-            after: number;
+            after: number | null;
         }[] = [];
         let changedCount = 0;
         for (const [key, row] of candidateLocks) {
@@ -190,6 +192,13 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
                 changedCount++;
                 if (changes.length < 100)
                     changes.push({ key, before: old ? Number(old.usd) : null, after: Number(row.usd) });
+            }
+        }
+        for (const [key, old] of backupLocks) {
+            if (!candidateLocks.has(key)) {
+                changedCount++;
+                if (changes.length < 100)
+                    changes.push({ key, before: Number(old.usd), after: null });
             }
         }
         if (revision(db) !== sourceRevision || feesDigest(db) !== sourceFeesDigest)
@@ -203,8 +212,7 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
     const receiptPath = join(reviews, options.previewId + '.json');
     const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
     const ratesPath = join(dirname(path), 'usage-rate-locks.json');
-    const currentRateDigest = existsSync(ratesPath) ? createHash('sha256').update(readFileSync(ratesPath)).digest('hex') : null;
-    if (receipt.schema !== 1 || receipt.sourceRevision !== revision(db) || options.action === 'apply' && (receipt.priceDigest !== digest(options.prices) || receipt.rateDigest !== currentRateDigest))
+    if (receipt.schema !== 1 || receipt.sourceRevision !== revision(db) || (options.action === 'apply' && receipt.priceDigest !== digest(options.prices)))
         throw Error(bt('revalue.err.changed_after_preview'));
     if (options.action === 'restore' && (receipt.phase !== 'applied' || receipt.appliedFeesDigest !== feesDigest(db)))
         throw Error(bt('revalue.err.rates_changed_after_confirm'));
@@ -218,11 +226,15 @@ export function revalueLedger(db: DatabaseSync, path: string, options: Aggregate
         db.exec('BEGIN IMMEDIATE; DELETE FROM rate_locks; INSERT INTO rate_locks SELECT * FROM reviewed.rate_locks; INSERT INTO rate_changes VALUES((SELECT COALESCE(MAX(version),0)+1 FROM rate_changes),0); COMMIT;');
     }
     catch (error) {
-        db.exec('ROLLBACK');
+        safeRollback(db);
         throw error;
     }
     finally {
-        db.exec('DETACH DATABASE reviewed');
+        try {
+            db.exec('DETACH DATABASE reviewed');
+        } catch {
+            // 忽略 DETACH 二次异常，避免掩盖原始事务错误
+        }
     }
     if (options.action === 'restore') {
         const beforeRatesPath = join(reviews, options.previewId + '-rates-before.json');

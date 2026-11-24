@@ -68,7 +68,35 @@
   }
 
   const KEY = '__GRAVITYBOX_ENGINE_V1__';
+  function reportWindowFocus() {
+    try {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (typeof globalThis.__gravityboxWindowFocus === 'function') {
+        globalThis.__gravityboxWindowFocus(String(Date.now()));
+      }
+    } catch {}
+  }
+  function handleVisibilityFocus() {
+    if (typeof document === 'undefined' || !document.hidden) reportWindowFocus();
+  }
+  function installFocusListeners() {
+    if (typeof window !== 'undefined') window.addEventListener('focus', reportWindowFocus, true);
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', handleVisibilityFocus, true);
+  }
+  function removeFocusListeners() {
+    if (typeof window !== 'undefined') window.removeEventListener('focus', reportWindowFocus, true);
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', handleVisibilityFocus, true);
+  }
   if (options.translationEnabled === false) {
+    if (globalThis[KEY]) {
+      if (globalThis[KEY].state?.()?.runtimeId === options.runtimeId && globalThis[KEY].getLanguageMode?.() === 'en') {
+        globalThis[KEY].update?.(options.dictionary);
+        globalThis.__GRAVITYBOX_ATTACH_HUD__?.();
+        return;
+      }
+      try { globalThis[KEY].dispose?.({ keepHud: true }); } catch {}
+    }
+    installFocusListeners();
     // HUD-only connection: expose the lifecycle contract without installing
     // translators, project markers, mutation observers or scan collectors.
     let dictionary = options.dictionary;
@@ -78,6 +106,7 @@
       state, getLanguageMode: () => 'en', refresh() {},
       update(next) { dictionary = next; }, setShortcutEnabled() {},
       dispose(opts) {
+        removeFocusListeners();
         if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
         delete globalThis[KEY];
         if (globalThis.__GRAVITYBOX_BOOT__ === options) delete globalThis.__GRAVITYBOX_BOOT__;
@@ -88,9 +117,10 @@
     return;
   }
   if (globalThis[KEY]) { globalThis[KEY].setShortcutEnabled?.(options.shortcutEnabled !== false); globalThis[KEY].update(options.dictionary); return; }
+  installFocusListeners();
   let shortcutEnabled = options.path === '/fixture' && options.shortcutEnabled !== false;
   const ownedProjectMarkers = new Set();
-  const UI = '[data-gravitybox-ui],button,a[href],h1,h2,h3,h4,[role="navigation"],[role="button"],[role="menuitem"],[role="tab"],[role="option"],[role="tooltip"],[role="dialog"],[role="status"],[role="alert"],[role="banner"],label,th,td,summary,figcaption,.monaco-menu-item,[data-sonner-toast],[role="listitem"],[role="region"],[data-testid*="settings"],[data-testid*="preferences"],[data-testid*="empty"],[data-testid*="notice"],[data-testid*="banner"],[data-testid*="card"],[data-testid*="header"],[data-testid*="sidecar"],[data-testid*="trigger"],[data-testid="agent-input-box"],[contenteditable="true"][role="combobox"]+p,[data-testid="cascade-system-message-toolbar"],[data-testid="turn-cards-container"],[data-testid="side-question-followup-thinking"],[data-select-popup],[role="menu"],[role="listbox"]';
+  const UI = '[data-gravitybox-ui],button,a[href],h1,h2,h3,h4,[role="navigation"],[role="button"],[role="menuitem"],[role="tab"],[role="option"],[role="tooltip"],[role="dialog"],[role="status"],[role="alert"],[role="banner"],label,th,td,summary,figcaption,.monaco-menu-item,[data-sonner-toast],[data-testid="toast-notification"],[data-testid="ssh-connect-progress"],[data-testid="ssh-connect-error"],[data-testid="ssh-config-file"],[data-testid="ssh-machine-switcher-status"],[role="listitem"],[role="region"],[data-testid*="settings"],[data-testid*="preferences"],[data-testid*="empty"],[data-testid*="notice"],[data-testid*="banner"],[data-testid*="card"],[data-testid*="header"],[data-testid*="sidecar"],[data-testid*="trigger"],[data-testid="agent-input-box"],[contenteditable="true"][role="combobox"]+p,[data-testid="cascade-system-message-toolbar"],[data-testid="turn-cards-container"],[data-testid="side-question-followup-thinking"],[data-select-popup],[role="menu"],[role="listbox"]';
   const UI_SELECTOR = 'button, [role="button"], [role="tab"], [role="menuitem"], [role="tooltip"], [role="option"], label, option, th, td, summary, figcaption, .monaco-menu-item, [data-sonner-toast], [role="listitem"], [role="region"], h1, h2, h3, h4, [data-select-popup], [role="menu"], [role="listbox"]';
   /* PROTECTED keeps user content, code and editors in English. `[data-testid="conversation-row-sidebar"]`
      is the container the app really uses for the conversation list: its title <span> is NOT inside
@@ -119,7 +149,7 @@
   }
   function userNamed(element) {
     if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
-    if (element.closest('[data-testid*="-toggle"],[data-testid*="-trigger"],[data-testid$="-button"],[data-testid$="-select"]')) return false;
+    if (element.closest('[data-testid*="-toggle"],[data-testid*="-trigger"],[data-testid$="-button"],[data-testid$="-select"],[data-testid="ssh-config-file"],[data-testid="ssh-connect-progress"],[data-testid="ssh-connect-error"]')) return false;
     if (element.closest(USER_CONTENT)) return true;
     const anchor = element.closest('a[href]');
     if (anchor && ENTITY_HREF.test(entityAnchorPath(anchor))) return true;
@@ -391,7 +421,7 @@
         compiled.push({
           key,
           pattern,
-          inlineOnly: item.inlineOnly === true || key.includes('{0}'),
+          inlineOnly: item.inlineOnly === true || /\{\d+\}/.test(key),
           replace: (...args) => {
             const groups = args.slice(1, -2);
             return replacement.replace(/\$([1-9]\d?|\$)/g, (_, token) => {
@@ -476,14 +506,25 @@
      can flip "translatable <-> protected" (protection-relevant classes, role, contenteditable,
      protection markers, data-testid) invalidates the element, and therefore its recorded subtree. */
   const protectionTokens = new WeakMap();
-  const PROTECTIVE_CLASSES = new Set(['chat-message', 'message-content', 'conversation-title', 'terminal', 'output-view', 'debug-console', 'code-view', 'artifact-container', 'model-item', 'markdown', 'markdown-frontmatter', 'markdown-alert-title', 'notebook-markdown-cell', 'prose', 'file-tree', 'gravitybox-project-name']);
-  const PROTECTION_ATTRS = ['class', 'role', 'contenteditable', 'data-testid', 'data-gravitybox-protect', 'data-gravitybox-user-content', 'data-gravitybox-user-name'];
+  const PROTECTIVE_CLASSES = new Set(['chat-message', 'message-content', 'conversation-title', 'terminal', 'output-view', 'debug-console', 'code-view', 'artifact-container', 'model-item', 'markdown', 'markdown-frontmatter', 'markdown-alert-title', 'notebook-markdown-cell', 'prose', 'file-tree', 'monaco-editor', 'xterm', 'gravitybox-project-name']);
+  const PROTECTION_ATTRS = ['class', 'role', 'contenteditable', 'data-testid', 'data-gravitybox-protect', 'data-gravitybox-user-content', 'data-gravitybox-user-name', 'data-message-id', 'data-message-author-role', 'href'];
+  const PROTECTION_ATTR_SET = new Set(PROTECTION_ATTRS);
+  const OBSERVER_ATTR_FILTER = [...TRANSLATABLE_ATTRS, ...PROTECTION_ATTRS];
+  function isProtectedHref(el) {
+    if (!el || el.tagName !== 'A') return '';
+    const href = el.getAttribute('href') || '';
+    if (!href) return '';
+    if (href.startsWith('/c/') || href.includes('/c/') || ENTITY_HREF.test(entityAnchorPath(el))) return '1';
+    return '';
+  }
   function protectionToken(el) {
     const raw = typeof el.className === 'string' ? el.className : '';
     let protective = '';
     for (const token of raw.split(/\s+/)) if (token && PROTECTIVE_CLASSES.has(token)) protective += token + ' ';
     return protective + '|' + (el.getAttribute('role') || '') + '|' + (el.getAttribute('contenteditable') || '') +
       '|' + (el.hasAttribute('data-gravitybox-protect') ? 'p' : '') + (el.hasAttribute('data-gravitybox-user-content') ? 'u' : '') + (el.hasAttribute('data-gravitybox-user-name') ? 'n' : '') +
+      '|' + (el.hasAttribute('data-message-id') ? 'm' : '') + (el.hasAttribute('data-message-author-role') ? 'a' : '') +
+      '|' + isProtectedHref(el) +
       '|' + (el.getAttribute('data-testid') || '');
   }
   function protectionChanged(el) {
@@ -569,8 +610,15 @@
     const next=headings.find(e=>e!==start&&(start.compareDocumentPosition(e)&Node.DOCUMENT_POSITION_FOLLOWING));
     return !next||!!(button.compareDocumentPosition(next)&Node.DOCUMENT_POSITION_FOLLOWING);
   }
+  function isDialogProjectButton(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE || !projectNames.size) return false;
+    if (!matches(el, 'button,[role="button"]')) return false;
+    if (!el.closest('[role="dialog"]')) return false;
+    return projectNames.has(normalize(originalText(el)));
+  }
   function isProtectedElement(el, scan = 0) {
     if (matches(el, PROTECTED_CORE)) return true;
+    if (isDialogProjectButton(el)) return true;
     if (matches(el, '[data-testid*="model"]:not([data-testid^="shortcut-row-"])')) {
       return !inSystemSettings(el, scan) || matches(el, SETTINGS_MODEL_PROTECTED);
     }
@@ -586,7 +634,9 @@
     if (userNamed(element) || settingsProjectName(element,scan)) return true;
     const cached = blockedCache.get(element);
     if (cached !== undefined && cached.scan === scan) return cached.val;
-    const isProt = ancestors(element).some(el => isProtectedElement(el, scan)) || (element.tagName === 'BUTTON' && Boolean(element.closest('[role="dialog"]')) && projectNames.has(normalize(element.textContent || '')));
+    const dialogProjectBtn = element.closest?.('[role="dialog"] button, [role="dialog"] [role="button"]');
+    const isDialogProject = Boolean(dialogProjectBtn && projectNames.has(normalize(originalText(dialogProjectBtn))));
+    const isProt = ancestors(element).some(el => isProtectedElement(el, scan)) || isDialogProject;
     blockedCache.set(element, { scan, val: isProt });
     return isProt;
   }
@@ -610,7 +660,7 @@
     if (isRelativeTimeBadge(element)) return true;
     if (modelUiLabel(element)) return true;
     if (isDialogPromptParagraph(element)) return !blocked(element, scan);
-    if(conservative&&(!element||!element.closest('button,[role="button"],[role="tab"],[role="menuitem"],[role="tooltip"],label,h1,h2,h3,h4,a[href],[role="navigation"],[data-testid*="card"],[data-testid="cascade-system-message-toolbar"],[contenteditable="true"][role="combobox"]+p,[data-select-popup],[role="menu"],[role="listbox"],[role="option"],[data-testid*="empty"],[data-testid*="sidecar"],[data-testid*="trigger"],[data-testid*="modal"]'))&&!pluginDescription(element)&&!inSystemSettings(element,scan))return false;
+    if(conservative&&(!element||!element.closest('button,[role="button"],[role="tab"],[role="menuitem"],[role="tooltip"],[role="alert"],[role="status"],label,h1,h2,h3,h4,a[href],[role="navigation"],[data-testid*="card"],[data-testid="cascade-system-message-toolbar"],[contenteditable="true"][role="combobox"]+p,[data-select-popup],[role="menu"],[role="listbox"],[role="option"],[data-testid*="empty"],[data-testid*="sidecar"],[data-testid*="trigger"],[data-testid*="modal"],[data-testid="toast-notification"],[data-testid="ssh-connect-progress"],[data-testid="ssh-connect-error"],[data-testid="ssh-config-file"],[data-testid="ssh-machine-switcher-status"]'))&&!pluginDescription(element)&&!inSystemSettings(element,scan))return false;
     const cached = eligibleCache.get(element);
     if (cached !== undefined && cached.scan === scan) return cached.val;
     const isElig = !blocked(element, scan) && (Boolean(element.closest(UI)) || pluginDescription(element) || inSystemSettings(element,scan));
@@ -641,6 +691,18 @@
       .replace(RE_DUR_S, '$1秒')
       .replace(RE_DUR_MS, '$1毫秒')
       .replace(RE_WHITESPACE, '');
+  }
+
+  const ENTITY_PROSE_STOP_WORDS = /^(?:a|an|the|your|our|my|this|that|these|those|what|when|where|how|why|which|who|all|any|some|each|every|more|most|allowed|denied|default|global|local|remote|external|workspace|editor|built-in|tab|link|hooks|new|other|in|on|at|to|for|from|with|by|of|as|if|or|and)\b/i;
+  function isEntityNameSlot(value, maxWords = 4) {
+    const v = String(value || '').trim();
+    if (!v || v.length > 80) return false;
+    if (/[.?!;:{}\n()]/.test(v)) return false;
+    if (v.includes(', ')) return false;
+    const words = v.split(/\s+/);
+    if (words.length > maxWords) return false;
+    if (words.length >= 2 && ENTITY_PROSE_STOP_WORDS.test(words[0])) return false;
+    return true;
   }
 
   const TEMPLATE_RULES = [
@@ -755,7 +817,7 @@
 
     // 3. 针对特定目标的动态操作 (如 More actions for Google Drive)
     {
-      key: "More actions for {name}", pattern: /^More actions for\s+(.+)$/i,
+      key: "More actions for {name}", pattern: /^More actions for\s+([^.?!{}\n]{1,80})$/i,
       replace: (_, name) => `${name} 的更多操作`
     },
 
@@ -860,6 +922,10 @@
     },
     {
       key: "{count}{timeUnit}", pattern: /^(\d+)(m|h|d|w|mo|y)$/,
+      guard: (el) =>
+        (isRelativeTimeBadge(el) || Boolean(el?.closest?.('[data-gravitybox-ui]'))) &&
+        !isElapsedDurationNode(el) &&
+        !el?.closest?.('[data-testid*="model"],[data-testid*="quota"],[role="menu"]'),
       replace: (_, n, u) => {
         const uMap = { m: '分钟前', h: '小时前', d: '天前', w: '周前', mo: '个月前', y: '年前' };
         return `${n}${uMap[u] || u}`;
@@ -914,7 +980,7 @@
     },
     {
       key: "{provider} models", pattern: /^(Gemini|Claude and GPT)\s+models$/i,
-      replace: (_, brand) => `${brand === 'Claude and GPT' ? 'Claude 与 GPT' : brand} 系列模型`
+      replace: (_, brand) => `${brand.toLowerCase() === 'claude and gpt' ? 'Claude 与 GPT' : brand} 系列模型`
     },
 
     // 9. 界面复合前缀与截断片段 (消除拼接断裂感)
@@ -1390,7 +1456,7 @@
       replace: (_, b) => `已将 ${b} 发布到远端 origin。`
     },
     {
-      key: "All changes since {ref}", pattern: /^All\s+changes\s+since\s+(.+)$/i,
+      key: "All changes since {ref}", pattern: /^All\s+changes\s+since\s+([^.?!{}\n]{1,80})$/i,
       replace: (_, r) => `自 ${r} 以来的所有更改`
     },
     {
@@ -1908,7 +1974,7 @@
     },
     {
       key: "Add bundle {name}",
-      pattern: /^Add\s+bundle\s+(.+)$/i,
+      pattern: /^Add\s+bundle\s+([^.?!{}\n]{1,80})$/i,
       replace: (_, name) => `添加扩展包 ${name}`
     },
     {
@@ -1971,6 +2037,319 @@
       pattern: /^Uses\s+standalone\s+Antigravity\s+chords\s+\(e\.g\.\s+(.+?)\)\.\s*Replaces\s+Go\s+to\s+Symbol\s+\(([^)]+)\)\s+and\s+Trigger\s+Suggest\s+\(([^)]+)\),\s*and\s+rebinds\s+VS\s+Code\s+Settings\s+to\s+(.+?)\.?$/i,
       replace: (_, s, sym, sug, cfg) =>
         `使用独立 Antigravity 组合快捷键（例如：${translateKeybindingExamples(s)}）。将替代转到符号 (${sym}) 与触发建议 (${sug})，并将 VS Code 设置重新绑定至 ${cfg}。`
+    },
+    // 14. 2.33.0 SSH 远程主机状态与连接进度动态模板（具体长句须先于泛化 Connecting to）
+    {
+      key: "Connected to {host}",
+      pattern: /^Connected\s+to\s+(.+)$/i,
+      replace: (_, h) => `已连接到 ${h}`
+    },
+    {
+      key: "SSH Config ({name})",
+      pattern: /^SSH\s+Config\s*\((.+)\)$/i,
+      replace: (_, n) => `SSH 配置（${n}）`
+    },
+    {
+      key: "{count} hidden hosts",
+      pattern: /^(\d+)\s+hidden\s+hosts?$/i,
+      replace: (_, n) => `${n} 个已隐藏主机`
+    },
+    {
+      key: "No hosts in {file} yet. Type one above.",
+      pattern: /^No\s+hosts\s+in\s+(.+?)\s+yet\.\s*Type\s+one\s+above\.?$/i,
+      replace: (_, f) => `${f} 中暂无主机，请在上方输入。`
+    },
+    {
+      key: "Remove {host} from Recent",
+      pattern: /^Remove\s+(.+?)\s+from\s+Recent$/i,
+      replace: (_, h) => `从最近项中移除 ${h}`
+    },
+    {
+      key: "Waiting for the sign-in callback on port {port}.",
+      pattern: /^Waiting\s+for\s+the\s+sign-in\s+callback\s+on\s+port\s+(\d+)\.?$/i,
+      replace: (_, p) => `正在等待端口 ${p} 上的登录回调。`
+    },
+    {
+      key: "Waiting for another window to finish installing on {host}…",
+      pattern: /^Waiting\s+for\s+another\s+window\s+to\s+finish\s+installing\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在等待另一窗口完成在 ${h} 上的安装…`
+    },
+    {
+      key: "Downloading the Antigravity server on {host}…",
+      pattern: /^Downloading\s+the\s+Antigravity\s+server\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在 ${h} 上下载 Antigravity 服务…`
+    },
+    {
+      key: "Uploading the Antigravity server to {host}…",
+      pattern: /^Uploading\s+the\s+Antigravity\s+server\s+to\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在向 ${h} 上传 Antigravity 服务…`
+    },
+    {
+      key: "Starting the Antigravity server on {host}…",
+      pattern: /^Starting\s+the\s+Antigravity\s+server\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在 ${h} 上启动 Antigravity 服务…`
+    },
+    {
+      key: "Connecting to the running server on {host}…",
+      pattern: /^Connecting\s+to\s+the\s+running\s+server\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在连接到 ${h} 上运行中的服务…`
+    },
+    {
+      key: "Restarting the Antigravity server on {host}…",
+      pattern: /^Restarting\s+the\s+Antigravity\s+server\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在重启 ${h} 上的 Antigravity 服务…`
+    },
+    {
+      key: "Connecting to the Antigravity server on {host}…",
+      pattern: /^Connecting\s+to\s+the\s+Antigravity\s+server\s+on\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在连接到 ${h} 上的 Antigravity 服务…`
+    },
+    {
+      key: "Checking {host}…",
+      pattern: /^Checking\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在检查 ${h}…`
+    },
+    {
+      key: "Connecting to {host}…",
+      pattern: /^Connecting\s+to\s+(.+?)(?:\u2026|\.\.\.)$/i,
+      replace: (_, h) => `正在连接到 ${h}…`
+    },
+    // 15. 2.34.0 新增动态模板与内联整句模板（Screen Recording、遥测、子智能体、自动换行、保存报错等）
+    {
+      key: "In System Settings, turn on {0}. If it isn't in the list, drag it in from the small window next to System Settings. Already on? Select {1}, click {2}, then drag it back in from the small window.",
+      pattern: /^In\s+System\s+Settings,\s*turn\s+on\s+\{(\d+)\}\.\s*If\s+it\s+isn['’]t\s+in\s+the\s+list,\s*drag\s+it\s+in\s+from\s+the\s+small\s+window\s+next\s+to\s+System\s+Settings\.\s*Already\s+on\?\s*Select\s+\{(\d+)\},\s*click\s+\{(\d+)\},\s*then\s+drag\s+it\s+back\s+in\s+from\s+the\s+small\s+window\.?$/i,
+      replace: (_, a, b, c) => `请在系统设置中开启 {${a}}。如果列表中没有它，请从系统设置旁的小窗口将其拖入。已开启？选中 {${b}}，点击 {${c}}，然后从小窗口将其重新拖入。`
+    },
+    {
+      key: "In System Settings, turn on {0}. If it isn't in the list, drag it in from the small window next to System Settings.",
+      pattern: /^In\s+System\s+Settings,\s*turn\s+on\s+\{(\d+)\}\.\s*If\s+it\s+isn['’]t\s+in\s+the\s+list,\s*drag\s+it\s+in\s+from\s+the\s+small\s+window\s+next\s+to\s+System\s+Settings\.?$/i,
+      replace: (_, a) => `请在系统设置中开启 {${a}}。如果列表中没有它，请从系统设置旁的小窗口将其拖入。`
+    },
+    {
+      key: "In System Settings, click {0}, choose {1}, then turn it on. Already on? Select {2}, click {3}, then click {4} and add it again.",
+      pattern: /^In\s+System\s+Settings,\s*click\s+\{(\d+)\},\s*choose\s+\{(\d+)\},\s*then\s+turn\s+it\s+on\.\s*Already\s+on\?\s*Select\s+\{(\d+)\},\s*click\s+\{(\d+)\},\s*then\s+click\s+\{(\d+)\}\s+and\s+add\s+it\s+again\.?$/i,
+      replace: (_, a, b, c, d, e) => `请在系统设置中点击 {${a}}，选择 {${b}}，然后开启它。已开启？选中 {${c}}，点击 {${d}}，然后点击 {${e}} 重新添加。`
+    },
+    {
+      key: "In System Settings, click {0}, choose {1}, then turn it on.",
+      pattern: /^In\s+System\s+Settings,\s*click\s+\{(\d+)\},\s*choose\s+\{(\d+)\},\s*then\s+turn\s+it\s+on\.?$/i,
+      replace: (_, a, b) => `请在系统设置中点击 {${a}}，选择 {${b}}，然后开启它。`
+    },
+    {
+      key: "Relaunch {app} to finish Screen Recording.",
+      pattern: /^Relaunch\s+(.+?)\s+to\s+finish\s+Screen\s+Recording\.?$/i,
+      replace: (_, app) => `重新启动 ${app} 以完成屏幕录制配置。`
+    },
+    {
+      key: "Telemetry is turned off for your account. {product} does not collect any of your prompts, content, or model responses but will still collect general usage patterns (e.g., feature adoption, active user counts).",
+      pattern: /^Telemetry\s+is\s+turned\s+off\s+for\s+your\s+account\.\s*(?:This\s+means\s+)?(.+?)\s+does\s+not\s+collect\s+any\s+of\s+your\s+prompts,\s*content,\s*or\s+model\s+responses,?\s*but\s+will\s+still\s+collect\s+general\s+usage\s+patterns\s*\(e\.g\.,\s*feature\s+adoption,\s*active\s+user\s+counts\)\.?$/i,
+      replace: (_, product) => `您的账号已关闭遥测。${product} 不会收集您的任何提示词、内容或模型回复，但仍会收集常规使用模式（例如功能采用率、活跃用户数）。`
+    },
+    {
+      key: "{product} does not collect any of your prompts, content, or model responses but does collect general usage patterns such as feature adoption and active user counts (“product analytics”). Telemetry data will be handled in accordance with the Google Privacy Policy.",
+      pattern: /^(.+?)\s+does\s+not\s+collect\s+any\s+of\s+your\s+prompts,\s*content,\s*or\s+model\s+responses\s+but\s+does\s+collect\s+general\s+usage\s+patterns\s+such\s+as\s+feature\s+adoption\s+and\s+active\s+user\s+counts\s*\([“"]product\s+analytics[”"]\)\.\s*Telemetry\s+data\s+will\s+be\s+handled\s+in\s+accordance\s+with\s+the\s+Google\s+Privacy\s+Policy\.?$/i,
+      replace: (_, product) => `${product} 不会收集您的任何提示词、内容或模型回复，但会收集常规使用模式，例如功能采用率与活跃用户数（“产品分析”）。遥测数据将按照 Google 隐私政策处理。`
+    },
+    {
+      key: "When toggled on, {product} collects usage data to help Google enhance performance and features.",
+      pattern: /^When\s+toggled\s+on,\s*(.+?)\s+collects\s+usage\s+data\s+to\s+help\s+Google\s+enhance\s+performance\s+and\s+features\.?$/i,
+      replace: (_, product) => `开启后，${product} 将收集使用数据，以帮助 Google 提升性能与功能体验。`
+    },
+    {
+      key: "Receive product updates, tips, and promotions from Google {product} via email.",
+      pattern: /^Receive\s+product\s+updates,\s*tips,\s*and\s+promotions\s+from\s+Google\s+(.+?)\s+via\s+email\.?$/i,
+      replace: (_, product) => `通过电子邮件接收来自 Google ${product} 的产品动态、使用技巧与推广通知。`
+    },
+    {
+      key: "Show {count} more subagents",
+      pattern: /^Show\s+(\d+)\s+more\s+subagents?$/i,
+      replace: (_, n) => `显示另外 ${n} 个子智能体`
+    },
+    {
+      key: "Enable Word Wrap ({shortcut})",
+      pattern: /^Enable\s+Word\s+Wrap(?:\s+(\([^)]+\)))?$/i,
+      replace: (_, s) => `开启自动换行${s ? ' ' + s : ''}`
+    },
+    {
+      key: "Disable Word Wrap ({shortcut})",
+      pattern: /^Disable\s+Word\s+Wrap(?:\s+(\([^)]+\)))?$/i,
+      replace: (_, s) => `关闭自动换行${s ? ' ' + s : ''}`
+    },
+    {
+      key: "Toggle Word Wrap ({shortcut})",
+      pattern: /^Toggle\s+Word\s+Wrap(?:\s+(\([^)]+\)))?$/i,
+      replace: (_, s) => `切换自动换行${s ? ' ' + s : ''}`
+    },
+    {
+      key: "Failed to save cloud permission settings: {reason}",
+      pattern: /^Failed\s+to\s+save\s+cloud\s+permission\s+settings:\s*(.+)$/i,
+      replace: (_, r) => `保存云端权限设置失败：${r}`
+    },
+    {
+      key: "Failed to save project Google3 configuration: {reason}",
+      pattern: /^Failed\s+to\s+save\s+project\s+Google3\s+configuration:\s*(.+)$/i,
+      replace: (_, r) => `保存项目 Google3 配置失败：${r}`
+    },
+    {
+      key: "Failed to save project permissions: {reason}",
+      pattern: /^Failed\s+to\s+save\s+project\s+permissions:\s*(.+)$/i,
+      replace: (_, r) => `保存项目权限失败：${r}`
+    },
+    {
+      key: "Failed to save project settings: {reason}",
+      pattern: /^Failed\s+to\s+save\s+project\s+settings:\s*(.+)$/i,
+      replace: (_, r) => `保存项目设置失败：${r}`
+    },
+    {
+      key: "Failed to save project: {reason}",
+      pattern: /^Failed\s+to\s+save\s+project:\s*(.+)$/i,
+      replace: (_, r) => `保存项目失败：${r}`
+    },
+    {
+      key: "Failed to save settings: {reason}",
+      pattern: /^Failed\s+to\s+save\s+settings:\s*(.+)$/i,
+      replace: (_, r) => `保存设置失败：${r}`
+    },
+    {
+      key: "Failed to create project: {reason}",
+      pattern: /^Failed\s+to\s+create\s+project:\s*(.+)$/i,
+      replace: (_, r) => `创建项目失败：${r}`
+    },
+    {
+      key: "Failed to unarchive project: {reason}",
+      pattern: /^Failed\s+to\s+unarchive\s+project:\s*(.+)$/i,
+      replace: (_, r) => `取消归档项目失败：${r}`
+    },
+    {
+      key: "Failed to delete recordings: {reason}",
+      pattern: /^Failed\s+to\s+delete\s+recordings:\s*(.+)$/i,
+      replace: (_, r) => `删除录制文件失败：${r}`
+    },
+    {
+      key: "Failed to resolve folder: {path} ({reason})",
+      pattern: /^Failed\s+to\s+resolve\s+folder:\s*(.+?)\s+\((.+)\)$/i,
+      replace: (_, p, r) => `无法解析文件夹：${p}（${r}）`
+    },
+    {
+      key: "Failed to load page {page}: {reason}",
+      pattern: /^Failed\s+to\s+load\s+page\s+(\d+):\s*(.+)$/i,
+      replace: (_, p, r) => `加载第 ${p} 页失败：${r}`
+    },
+    {
+      key: 'Cannot add folder: "{path}" is not a valid folder location.',
+      pattern: /^Cannot\s+add\s+folder:\s*[“"](.+?)[”"]\s+is\s+not\s+a\s+valid\s+folder\s+location\.?$/i,
+      replace: (_, p) => `无法添加文件夹：“${p}”不是有效的文件夹位置。`
+    },
+    {
+      key: "A file already exists at {path}.",
+      pattern: /^A\s+file\s+already\s+exists\s+at\s+(.+?)\.?$/i,
+      replace: (_, p) => `${p} 处已存在同名文件。`
+    },
+    {
+      key: "Couldn't disconnect {target}: {reason}",
+      pattern: /^Couldn['’]t\s+disconnect\s+(.+?):\s*(.+)$/i,
+      replace: (_, t, r) => `无法断开 ${t}：${r}`
+    },
+    {
+      key: "Configure {server}",
+      pattern: /^Configure\s+([^.!?;:{}\n()]{1,80})$/i,
+      guard: (_el, m) => isEntityNameSlot(m[1], 4),
+      replace: (_, s) => `配置 ${s}`
+    },
+    {
+      key: "More options for {title}",
+      pattern: /^More\s+options\s+for\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, t) => `${t} 的更多选项`
+    },
+    {
+      key: "Forked from {source}",
+      pattern: /^Forked\s+from\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, s) => `复刻自 ${s}`
+    },
+    {
+      key: "Make {account} the default {provider} account",
+      pattern: /^Make\s+(.+?)\s+the\s+default\s+(.+?)\s+account$/i,
+      replace: (_, a, p) => `将 ${a} 设为默认 ${p} 账号`
+    },
+    {
+      key: "Secret for a new {provider} account",
+      pattern: /^Secret\s+for\s+a\s+new\s+(.+?)\s+account$/i,
+      replace: (_, p) => `新 ${p} 账号的密钥`
+    },
+    {
+      key: "Secret for {provider}",
+      pattern: /^Secret\s+for\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, p) => `${p} 的密钥`
+    },
+    {
+      key: "New secret for {account}",
+      pattern: /^New\s+secret\s+for\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, a) => `${a} 的新密钥`
+    },
+    {
+      key: "See more in {name}",
+      pattern: /^See\s+more\s+in\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, n) => `在 ${nestedLabel(n)} 中查看更多`
+    },
+    {
+      key: "See less in {name}",
+      pattern: /^See\s+less\s+in\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, n) => `在 ${nestedLabel(n)} 中收起部分内容`
+    },
+    {
+      key: "Sign in from the {panel} panel.",
+      pattern: /^Sign\s+in\s+from\s+the\s+(.+?)\s+panel\.?$/i,
+      replace: (_, p) => `请从 ${p} 面板登录。`
+    },
+    {
+      key: "Sign in to use {name}!",
+      pattern: /^Sign\s+in\s+to\s+use\s+(.+?)!$/i,
+      replace: (_, n) => `登录以使用 ${n}！`
+    },
+    {
+      key: "{label}, error",
+      pattern: /^(.+?),\s*error$/i,
+      replace: (_, label) => `${nestedLabel(label)}（出错）`
+    },
+    {
+      key: "{name}, voice {current} of {total}",
+      pattern: /^(.+?),\s*voice\s+(\d+)\s+of\s+(\d+)$/i,
+      replace: (_, n, c, t) => `${n}，第 ${c} / ${t} 个语音`
+    },
+    {
+      key: "Line {from} → {to}",
+      pattern: /^Line\s+(\d+)\s*→\s*(\d+)$/i,
+      replace: (_, a, b) => `第 ${a} → ${b} 行`
+    },
+    {
+      key: "Image: {name}",
+      pattern: /^Image:\s*(.+)$/i,
+      replace: (_, n) => `图片：${n}`
+    },
+    {
+      key: "Pin Entire {target}",
+      pattern: /^Pin\s+Entire\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, t) => `固定整个 ${nestedLabel(t)}`
+    },
+    {
+      key: "Unpin {target}",
+      pattern: /^Unpin\s+([^.?!{}\n]{1,80})$/i,
+      replace: (_, t) => `取消固定 ${nestedLabel(t)}`
+    },
+    {
+      key: "Opens the New Conversation screen for this {target}",
+      pattern: /^Opens\s+the\s+New\s+Conversation\s+screen\s+for\s+this\s+(.+)$/i,
+      replace: (_, t) => `打开此${nestedLabel(t)}的新建对话界面`
+    },
+    {
+      key: "{count} days",
+      pattern: /^(\d+)\s+days?$/i,
+      replace: (_, n) => `${n} 天`
+    },
+    {
+      key: "{count} CEL values",
+      pattern: /^(\d+)\s+CEL\s+values?$/i,
+      replace: (_, n) => `${n} 个 CEL 值`
     }
   ];
 
@@ -1986,36 +2365,83 @@
   }
 
   for (const rule of TEMPLATE_RULES) {
-    rule.inlineOnly = rule.key.includes('{0}');
+    rule.inlineOnly = /\{\d+\}/.test(rule.key);
   }
   function matchTemplate(key, el) {
     if (isElapsedDurationNode(el) && /^\d+\s*(?:d|h|m|s|ms)(?:\s+\d+\s*(?:h|m|s|ms))*$/i.test(key)) {
       lastMatchedKeys = ['{duration}'];
       return formatDuration(key);
     }
-    const hasInlineSlot = key.includes('{0}');
+    const hasInlineSlot = /\{\d+\}/.test(key);
     for (let i = 0; i < customTemplateRules.length; i++) {
       const rule = customTemplateRules[i];
-      if (rule.inlineOnly && !hasInlineSlot) continue;
-      if (rule.pattern.test(key)) {
-        lastMatchedKeys = [rule.key];
-        return key.replace(rule.pattern, rule.replace);
-      }
+      if (Boolean(rule.inlineOnly) !== hasInlineSlot) continue;
+      if (!rule.pattern.test(key)) continue;
+      const replaced = key.replace(rule.pattern, rule.replace);
+      if (!hasInlineSlot && /\{\d+\}/.test(replaced)) continue;
+      lastMatchedKeys = [rule.key];
+      return replaced;
     }
     for (let i = 0; i < TEMPLATE_RULES.length; i++) {
       const rule = TEMPLATE_RULES[i];
-      if (rule.inlineOnly && !hasInlineSlot) continue;
-      if (rule.pattern.test(key)) {
-        lastMatchedKeys = [rule.key];
-        return key.replace(rule.pattern, rule.replace);
-      }
+      if (Boolean(rule.inlineOnly) !== hasInlineSlot) continue;
+      const match = key.match(rule.pattern);
+      if (!match) continue;
+      if (rule.guard && !rule.guard(el, match)) continue;
+      const replaced = key.replace(rule.pattern, rule.replace);
+      if (!hasInlineSlot && /\{\d+\}/.test(replaced)) continue;
+      lastMatchedKeys = [rule.key];
+      return replaced;
     }
     return undefined;
+  }
+
+  function translateSshErrorText(original, el) {
+    lastMatchedKeys = [];
+    const lines = String(original).split('\n');
+    let changed = false;
+    const out = lines.map((rawLine) => {
+      const lead = rawLine.match(/^\s*/)[0];
+      const tail = rawLine.match(/\s*$/)[0];
+      const trimmed = rawLine.trim();
+      if (!trimmed || /^Logs:\s+\S+/i.test(trimmed)) return rawLine;
+      const codeMatch = trimmed.match(/^([A-Z][A-Z0-9_]{2,}:\s+)([\s\S]+)$/);
+      const codePrefix = codeMatch ? codeMatch[1] : '';
+      const body = codeMatch ? codeMatch[2] : trimmed;
+      const reportedMatch = body.match(/^(.+?)\s+reported:\s*([\s\S]*)$/);
+      if (reportedMatch) {
+        lastMatchedKeys.push('{host} reported: {detail}');
+        changed = true;
+        return `${lead}${codePrefix}${reportedMatch[1]} 返回：${reportedMatch[2]}${tail}`;
+      }
+      const normBody = normalize(body);
+      if (!normBody || /(?:https?:\/\/|^(?:\/|~\/|[A-Za-z]:\\))/.test(normBody)) return rawLine;
+      let val = entryFor(normBody);
+      if (val !== undefined) {
+        lastMatchedKeys.push(normBody);
+      } else {
+        val = matchTemplate(normBody, el);
+      }
+      if (val !== undefined && val !== body) {
+        changed = true;
+        return `${lead}${codePrefix}${val}${tail}`;
+      }
+      return rawLine;
+    });
+    return changed ? out.join('\n') : original;
   }
 
   function translation(original,el,kind) {
     lastMatchedKeys=[];
     const key = normalize(original);
+    if (el?.closest?.('[data-testid="ssh-config-file-name"],[data-testid="ssh-config-file"]') && /\s+\(default\)$/i.test(key)) {
+      const localized = original.replace(/\s+\(default\)(\s*)$/i, '（默认）$1');
+      if (localized !== original) { lastMatchedKeys = ['{name} (Default)']; return localized; }
+    }
+    if (el?.closest?.('[data-testid="ssh-connect-error"],[data-testid="toast-notification"][data-notification-tag="ssh-connect-failed"]')
+        && (original.includes('\n') || /^.+\s+reported:\s*/i.test(key) || /^[A-Z][A-Z0-9_]{2,}:\s+/.test(key))) {
+      return translateSshErrorText(original, el);
+    }
     if (!key || /(?:https?:\/\/|^(?:\/|~\/|[A-Za-z]:\\))/.test(key)) return original;
     if (/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(key)) {
       const templated = matchTemplate(key, el);
@@ -2174,6 +2600,10 @@
   function isInlineGroupContainer(el, scan = 0) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
     if (!eligible(el, scan) || blocked(el, scan)) return false;
+    if (el.closest?.('[data-testid="ssh-connect-error"],[data-testid="toast-notification"][data-notification-tag="ssh-connect-failed"]')
+        && ((el.textContent || '').includes('\n') || el.querySelector?.('.font-mono'))) {
+      return false;
+    }
     const children = el.childNodes;
     if (children.length < 2 || children.length > 20) return false;
     let hasText = false;
@@ -2394,6 +2824,69 @@
       return !slot || slot.group !== el || slot.groupParent !== node.parentElement || (getValue(node, '') !== slot.last && getValue(node, '') !== slot.original);
     })) invalidateInlineGroup(el);
   }
+  function mapZhTerminalPunct(ch) {
+    if (ch === '.') return '。';
+    if (ch === '?') return '？';
+    if (ch === '!') return '！';
+    return '';
+  }
+  function translateInlineGroupText(norm, el) {
+    const direct = translation(norm, el);
+    if (direct !== norm && /[\u3400-\u9fff]/.test(direct)) {
+      return { zh: direct, keys: [...lastMatchedKeys] };
+    }
+    // Trailing standalone placeholder(s) after a complete sentence (e.g. "Main sentence. {0}.")
+    const trailingMatch = norm.match(/^([\s\S]+?[.?!])(\s*)((?:\{\d+\})+)([.?!])?$/);
+    if (trailingMatch) {
+      const [, prefix, sep, tailPh, tailPunct] = trailingMatch;
+      const prefixZh = translation(prefix, el);
+      const prefixKeys = [...lastMatchedKeys];
+      if (
+        prefixZh !== prefix &&
+        /[\u3400-\u9fff]/.test(prefixZh) &&
+        placeholderTokens(prefixZh).join(',') === placeholderTokens(prefix).join(',')
+      ) {
+        const mappedPunct = tailPunct ? mapZhTerminalPunct(tailPunct) : '';
+        return { zh: `${prefixZh}${sep ? ' ' : ''}${tailPh}${mappedPunct}`, keys: prefixKeys };
+      }
+    }
+    // Atomic sentence-level split: only accept if every sentence translates cleanly with preserved placeholders.
+    const sentences = norm.split(/(?<=[.?!])\s+/);
+    if (sentences.length < 2) return null;
+    const translatedParts = [];
+    const collectedKeys = [];
+    let hasTranslatedProse = false;
+    for (const rawSentence of sentences) {
+      const sentence = normalize(rawSentence);
+      if (!sentence) continue;
+      const purePh = sentence.match(/^((?:\{\d+\})+)([.?!])?$/);
+      if (purePh) {
+        translatedParts.push(`${purePh[1]}${purePh[2] ? mapZhTerminalPunct(purePh[2]) : ''}`);
+        continue;
+      }
+      const partZh = translation(sentence, el);
+      const partKeys = [...lastMatchedKeys];
+      if (
+        partZh === sentence ||
+        !/[\u3400-\u9fff]/.test(partZh) ||
+        placeholderTokens(partZh).join(',') !== placeholderTokens(sentence).join(',')
+      ) {
+        return null;
+      }
+      hasTranslatedProse = true;
+      translatedParts.push(partZh);
+      for (const k of partKeys) if (!collectedKeys.includes(k)) collectedKeys.push(k);
+    }
+    if (!hasTranslatedProse || !translatedParts.length) return null;
+    let combined = translatedParts[0];
+    for (let i = 1; i < translatedParts.length; i++) {
+      const prev = combined;
+      const next = translatedParts[i];
+      const needSpace = /\{\d+\}$/.test(prev) || /^\{\d+\}/.test(next);
+      combined += (needSpace ? ' ' : '') + next;
+    }
+    return { zh: combined, keys: collectedKeys };
+  }
   function tryTranslateInlineGroup(el, scan = 0, queue = waiting) {
     if (conservative && !inSystemSettings(el, scan) && !el.closest('[data-testid*="empty"],[data-testid*="sidecar"],[data-testid*="modal"],[data-testid*="card"],[role="region"]')) return false;
     const standard = isInlineGroupContainer(el, scan);
@@ -2407,13 +2900,13 @@
       invalidateRecordedGroupIfStale(el);
       const norm = normalize(composite.rawTemplate);
       if (!norm) return false;
-      const zh = translation(norm, el);
-      const groupKeys = [...lastMatchedKeys];
-      if (zh === norm || !/[\u3400-\u9fff]/.test(zh)) {
+      const resolved = translateInlineGroupText(norm, el);
+      if (!resolved) {
         if (inlineGroups.has(el)) invalidateInlineGroup(el);
         clearInlineGroupUnsupported(el);
         return true;
       }
+      const { zh, keys: groupKeys } = resolved;
       const segments = validateInlineSegments(norm, zh, composite.slotsMap);
       if (!segments) {
         if (inlineGroups.has(el)) invalidateInlineGroup(el);
@@ -2425,9 +2918,9 @@
     const { rawTemplate, inlineElements, slotsMap } = groupTemplate(el);
     const norm = normalize(rawTemplate);
     if (!norm) return false;
-    const zh = translation(norm, el);
-    const groupKeys = [...lastMatchedKeys];
-    if (zh === norm || !/[\u3400-\u9fff]/.test(zh)) { clearInlineGroupUnsupported(el); return false; }
+    const resolved = translateInlineGroupText(norm, el);
+    if (!resolved) { clearInlineGroupUnsupported(el); return false; }
+    const { zh, keys: groupKeys } = resolved;
     if (!inlineElements.length) {
       const items = slotsMap.get(0) || [];
       if (items.length <= 1) return false;
@@ -2496,6 +2989,13 @@
     if (!reconcileQueue) { reconcilePasses++; reconcileQueue = { nodes: [...activeNodes], index: 0 }; }
     const queue = reconcileQueue;
     const scan = ++scanCount;
+    if (queue.index === 0 && inlineGroupContainers.size) {
+      refreshProjectNames(scan);
+      for (const groupEl of [...inlineGroupContainers]) {
+        if (!groupEl.isConnected) { inlineGroupContainers.delete(groupEl); continue; }
+        if (!eligible(groupEl, scan)) invalidateInlineGroup(groupEl);
+      }
+    }
     const started = performance.now();
     while (queue.index < queue.nodes.length && performance.now() - started < RECONCILE_BUDGET_MS) {
       const node = queue.nodes[queue.index++];
@@ -2589,23 +3089,24 @@
     }
     maxSliceMs = Math.max(maxSliceMs, performance.now() - flushStarted);
   }
-  const observerOptions = { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['title', 'aria-label', 'data-tooltip', 'placeholder', 'class', 'role', 'contenteditable', 'data-testid', 'data-gravitybox-protect', 'data-gravitybox-user-content', 'data-gravitybox-user-name'] };
+  const observerOptions = { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: OBSERVER_ATTR_FILTER };
   function observe(root) { if (!observed.has(root)) { observed.add(root); observer.observe(root, observerOptions); } }
-  /* Any mutation of class / role / contenteditable / data-gravitybox-protect can switch a node between
-     "translatable" and "protected", so a reconcile pass is requested; the reconcile walks only the
-     recorded nodes instead of re-scanning the changed node's whole subtree. */
+  /* Any mutation of class / role / contenteditable / protection / message / link attributes can switch
+     a node between "translatable" and "protected", so a reconcile pass is requested; the reconcile
+     walks only the recorded nodes instead of re-scanning the changed node's whole subtree. */
   observer = new MutationObserver(mutations => {
     if (!scanning) checkRoute();
     let hasAdded = false;
     for (const mutation of mutations) {
       const targetEl = mutation.target.nodeType === Node.ELEMENT_NODE ? mutation.target : mutation.target.parentElement;
       const inStaticProtected = Boolean(
-        targetEl?.closest?.('[data-gravitybox-protect],.monaco-editor,.xterm') &&
+        targetEl?.closest?.('[data-gravitybox-protect],.monaco-editor,.xterm,[data-message-id],[data-message-author-role],[data-testid="planner-response-text"],.markdown,.prose,pre,code') &&
         !targetEl.closest?.('[data-testid="conversation-row-sidebar"],[data-testid*="model"]')
       );
       if (mutation.type === 'childList') {
         if (inStaticProtected) {
           if (mutation.removedNodes.length && [...mutation.removedNodes].some(n => activeNodes.has(n))) reconcileRequested = true;
+          if (mutation.addedNodes.length && activeNodes.size > 0 && [...mutation.addedNodes].some(n => activeNodes.has(n) || (n.nodeType === Node.ELEMENT_NODE && (n.hasAttribute('data-gravitybox-loc') || n.querySelector?.('[data-gravitybox-loc="1"]'))))) reconcileRequested = true;
           continue;
         }
         for (const node of mutation.addedNodes) {
@@ -2628,7 +3129,8 @@
         const attr = mutation.attributeName || '';
         const slot = nodeSlots.get(mutation.target)?.get(attr);
         if (slot && getValue(mutation.target, attr) === slot.last) continue;
-        if (PROTECTION_ATTRS.includes(attr)) {
+        if (attr === 'href' && mutation.target.tagName !== 'A') continue;
+        if (PROTECTION_ATTR_SET.has(attr)) {
           if (!protectionChanged(mutation.target)) continue;
           reconcileRequested = true;
         }
@@ -2650,6 +3152,8 @@
       timer = setTimeout(flush, 0);
     }
   });
+  let updateGeneration = 0;
+  let updateTimer = null;
   const api = {
     refresh() {
       if (!active) return api.state();
@@ -2670,10 +3174,13 @@
       if (!changed) return api.refresh();
       rebuildIndex(next);
       dictionaryToastPending = true;
+      const generation = ++updateGeneration;
+      if (updateTimer !== null) { clearTimeout(updateTimer); updateTimer = null; }
       const groups = [...inlineGroupContainers], nodes = [...activeNodes];
       let groupIndex = 0, nodeIndex = 0;
       const updateSlice = () => {
-        if (!active) return;
+        if (!active || generation !== updateGeneration) return;
+        updateTimer = null;
         const started = performance.now();
         const scan = ++scanCount;
         while (groupIndex < groups.length && performance.now()-started < 4) refreshInlineGroup(groups[groupIndex++], scan);
@@ -2684,7 +3191,8 @@
           for (const attr of [...slots.keys()]) updateValue(node,attr,scan);
         }
         maxSliceMs = Math.max(maxSliceMs,performance.now()-started);
-        if(groupIndex<groups.length||nodeIndex<nodes.length)setTimeout(updateSlice,0);
+        if (generation !== updateGeneration) return;
+        if(groupIndex<groups.length||nodeIndex<nodes.length) updateTimer = setTimeout(updateSlice,0);
         else {requeueDocument=true;schedule(document);}
       };
       updateSlice();
@@ -2695,13 +3203,31 @@
     toggleLanguage(mode) {
       const next = mode || (languageMode === 'zh' ? 'en' : 'zh');
       languageMode = next;
-      for (const node of activeNodes) {
+      const scan = ++scanCount;
+      refreshProjectNames(scan);
+      for (const groupEl of [...inlineGroupContainers]) {
+        if (!groupEl.isConnected) { inlineGroupContainers.delete(groupEl); continue; }
+        if (!eligible(groupEl, scan)) invalidateInlineGroup(groupEl);
+      }
+      for (const node of [...activeNodes]) {
         if (!node.isConnected) { activeNodes.delete(node); continue; }
         const slots = nodeSlots.get(node);
-        if (!slots) continue;
-        for (const [attr, slot] of slots) {
-          const targetVal = languageMode === 'en' ? slot.original : slot.last;
-          setValue(node, attr, targetVal);
+        if (!slots) { activeNodes.delete(node); continue; }
+        for (const [attr, slot] of [...slots]) {
+          const current = getValue(node, attr);
+          if (!translatable(node, attr, scan)) {
+            if (current === slot.last) setValue(node, attr, slot.original);
+            slots.delete(attr);
+            if (!slots.size) activeNodes.delete(node);
+            syncElementLocFlag(attr ? node : node.parentElement);
+            if (slot.group) syncElementLocFlag(slot.group);
+            continue;
+          }
+          if (languageMode === 'en') {
+            if (current === slot.last) setValue(node, attr, slot.original);
+          } else {
+            if (current === slot.original) setValue(node, attr, slot.last);
+          }
           syncElementLocFlag(attr ? node : node.parentElement);
           if (slot.group) syncElementLocFlag(slot.group);
         }
@@ -2859,9 +3385,11 @@
       if (!opts?.keepHud) { try { globalThis.__GRAVITYBOX_HUD_V1__?.dispose?.(); } catch {} }
       auditKeys = null; auditTrail.clear();
       active = false; observer.disconnect(); clearTimeout(timer); timer = null; reconcileQueue = null;
+      ++updateGeneration; if (updateTimer !== null) { clearTimeout(updateTimer); updateTimer = null; }
       if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
       try { window.removeEventListener('popstate', checkRoute); window.removeEventListener('hashchange', checkRoute); } catch {}
       pending.clear(); waiting.clear(); settingsWaiting.clear();
+      removeFocusListeners();
       if (typeof window !== 'undefined') {
         window.removeEventListener('keydown', handleKeydown, true);
       }

@@ -3,6 +3,7 @@ import Cocoa
 private final class SourceLinkButton: NSButton {
     let sourceURL: URL
     private var hoverTracking: NSTrackingArea?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     private var hovered = false {
         didSet {
             if oldValue != hovered { updateAppearance() }
@@ -60,6 +61,7 @@ private final class SourceLinkButton: NSButton {
 
 private final class RetiredToggleButton: NSButton {
     override var allowsVibrancy: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     private let labelFont = NSFont.systemFont(ofSize: 11.5, weight: .medium)
     private var hoverTracking: NSTrackingArea?
     private var hovered = false {
@@ -480,6 +482,8 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
         return [modelTitle]
     }
 
+    private static let cardBoxFillColor = Design.dynamicAlpha(Design.color(0x000000, 0xFFFFFF), 0.022, 0.035)
+
     private func makeCardBox(body: NSView, alpha: CGFloat = 1.0) -> DesignCardBox {
         let card = DesignCardBox()
         card.boxType = .custom
@@ -487,11 +491,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
         card.borderWidth = 0.5
         card.borderColor = Design.border
         card.enablesHoverHighlight = false
-        card.fillColor = NSColor(name: nil) { app in
-            app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-                ? NSColor.white.withAlphaComponent(0.035)
-                : NSColor.black.withAlphaComponent(0.022)
-        }
+        card.fillColor = Self.cardBoxFillColor
         card.contentViewMargins = .zero
         card.alphaValue = alpha
         card.addSubview(body)
@@ -956,7 +956,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             return badgeTint.withAlphaComponent(isDark ? 0.34 : 0.20)
         }
         if synced {
-            statusIconView.image = NSImage(systemSymbolName: "checkmark.seal.fill", accessibilityDescription: nil)
+            statusIconView.image = NSImage(systemSymbolName: "dollarsign.arrow.circlepath", accessibilityDescription: nil)
             statusIconView.contentTintColor = .systemGreen
             titleLabel.stringValue = healedCount > 0 ? L10n.t("pricing_sheet.synced_healed") : L10n.t("pricing_sheet.synced")
             if healedCount > 0 {
@@ -1011,7 +1011,7 @@ final class PricingSyncSheetController: NSObject, NSWindowDelegate {
             bannerBox.enablesHoverHighlight = false
             bannerBox.contentViewMargins = .zero
 
-            let bannerIcon = symbol("sparkles", size: 12.5, color: accessibleWarningColor())
+            let bannerIcon = symbol("tag.slash", size: 12.5, color: accessibleWarningColor())
             bannerIcon.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
                 bannerIcon.widthAnchor.constraint(equalToConstant: 14),

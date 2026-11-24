@@ -1,12 +1,15 @@
 import test from 'node:test';import assert from 'node:assert/strict';import{mkdtemp,rm}from'node:fs/promises';import{tmpdir}from'node:os';import{join}from'node:path';
 import{AccountsManager,cloudProviderContextFromCommand,validCachedCloudProviderContext}from'../dist/accounts.js';
-const origin='https://daily-cloudcode-pa.googleapis.com',version='2.25.0',exe='/Applications/Antigravity.app/Contents/Resources/bin/language_server';
+import{applicationTarget,resolveBundleLayout}from'../dist/application-target.js';
+const origin='https://daily-cloudcode-pa.googleapis.com',version='2.25.0';
+const rawExe=resolveBundleLayout(applicationTarget('stable').appPath).languageServerPath;
+const exe=/\s/.test(rawExe)?`"${rawExe}"`:rawExe;
 test('官方 hub 客户端身份随进程参数提取，支持空格及等号，版本不跨安装源',()=>{
  const space=cloudProviderContextFromCommand(`${exe} --cloud_code_endpoint ${origin} --subclient_type hub --override_ide_version ${version}`,version);
  const equal=cloudProviderContextFromCommand(`${exe} --cloud_code_endpoint=${origin} --subclient_type=hub --override_user_agent_name=antigravity`,version);
  assert.deepEqual(space,equal);assert.equal(space.userAgent,'antigravity/hub/2.25.0');assert.equal(space.identityVersion,2);
  assert.equal(cloudProviderContextFromCommand(`${exe} --cloud_code_endpoint ${origin}`,version).userAgent,'antigravity/2.25.0');
- for(const command of[`${exe} --cloud_code_endpoint ${origin} --subclient_type hub/other`,`${exe} --cloud_code_endpoint ${origin} --override_ide_version 2.24.0`,`${exe} --cloud_code_endpoint ${origin} --override_user_agent_name other`,`${exe.replace('/Applications','/tmp')} --cloud_code_endpoint ${origin}`])assert.equal(cloudProviderContextFromCommand(command,version),null);
+ for(const command of[`${exe} --cloud_code_endpoint ${origin} --subclient_type hub/other`,`${exe} --cloud_code_endpoint ${origin} --override_ide_version 2.24.0`,`${exe} --cloud_code_endpoint ${origin} --override_user_agent_name other`,`/tmp/fake/language_server --cloud_code_endpoint ${origin}`])assert.equal(cloudProviderContextFromCommand(command,version),null);
 });
 test('旧版缺少客户端类型的配额源缓存失效，合法新版缓存才可离线沿用',()=>{
  const ctx=cloudProviderContextFromCommand(`${exe} --cloud_code_endpoint ${origin} --subclient_type hub`,version);

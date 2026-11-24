@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { AccountsManager } from '../dist/accounts.js';
@@ -17,7 +18,7 @@ function account(id, email) {
 }
 
 test('崩溃窗口：账号文件已写、索引未写时，启动会自愈索引', async () => {
-  const directory = await mkdtemp('/tmp/gb-reconcile-');
+  const directory = await mkdtemp(join(tmpdir(), 'gb-reconcile-'));
   await mkdir(join(directory, 'accounts'), { recursive: true });
   const id = randomUUID();
   await writeFile(join(directory, 'accounts', `${id}.json`), JSON.stringify(account(id, 'crash-window@example.test')));
@@ -36,7 +37,7 @@ test('崩溃窗口：账号文件已写、索引未写时，启动会自愈索�
 });
 
 test('崩溃窗口：索引里残留幽灵条目时，启动会剔除', async () => {
-  const directory = await mkdtemp('/tmp/gb-reconcile-ghost-');
+  const directory = await mkdtemp(join(tmpdir(), 'gb-reconcile-ghost-'));
   await mkdir(join(directory, 'accounts'), { recursive: true });
   const ghost = randomUUID();
   await writeFile(join(directory, 'accounts.json'), JSON.stringify({
@@ -54,7 +55,7 @@ test('崩溃窗口：索引里残留幽灵条目时，启动会剔除', async ()
 });
 
 test('索引与目录一致时不会无谓重写索引', async () => {
-  const directory = await mkdtemp('/tmp/gb-reconcile-stable-');
+  const directory = await mkdtemp(join(tmpdir(), 'gb-reconcile-stable-'));
   await mkdir(join(directory, 'accounts'), { recursive: true });
   const id = randomUUID();
   await writeFile(join(directory, 'accounts', `${id}.json`), JSON.stringify(account(id, 'stable@example.test')));

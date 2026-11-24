@@ -3,9 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { withProcessLease } from './process-lock.js';
-import type { GenerationEvent } from './usage.js';
+import type { GenerationEvent, SyncReceipt, TokenUsageSummary } from './usage-types.js';
+import type { ApiPricingEntry } from './pricing.js';
 import type { AggregateOptions, LedgerSnapshot } from './usage-aggregate.js';
-import type { TokenUsageSummary } from './usage.js';
 import { bt, getActiveLocale } from './i18n.js';
 export type LedgerEvent = GenerationEvent & {
     db_file?: string;
@@ -107,7 +107,7 @@ export class UsageLedger {
             }
         };
         const execute = async (): Promise<T> => {
-            if (!['load', 'review', 'locks', 'version'].includes(operation)) {
+            if (!['load', 'review', 'locks', 'receipts', 'version'].includes(operation)) {
                 await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
                 return withProcessLease(this.path + '.lock', runWithTerminateBarrier);
             }
@@ -128,7 +128,7 @@ export class UsageLedger {
                 return;
             }
             const id = randomUUID();
-            const timeoutMs = ['save', 'aggregate', 'revalue'].includes(operation) ? 90000 : 30000;
+            const timeoutMs = ['save', 'aggregate', 'revalue', 'purge-forked-clones'].includes(operation) ? 90000 : 30000;
             const timer = setTimeout(() => {
                 if (this.inflight?.id === id) {
                     this.destroyWorker(new Error(bt('ledger.err.timeout')));
@@ -153,6 +153,7 @@ export class UsageLedger {
         usd: number;
         price: any;
     }>> { return this.request('locks'); }
+    receipts(): Promise<Record<string, SyncReceipt>> { return this.request('receipts'); }
     async saveLocks(entries: Record<string, {
         usd: number;
         price: unknown;
@@ -176,12 +177,41 @@ export class UsageLedger {
         offset: number;
         limit: number;
         targetEmail?: string;
+        accountId?: string;
+        environmentId?: string;
     }): Promise<{
         rows: any[];
         total: number;
         offset: number;
         limit: number;
     }> { return this.request('events', undefined, options); }
-    async save(events: LedgerEvent[]): Promise<void> { if (events.length)
-        await this.request('save', events); }
+    async purgeForkedClones(
+        targets: Array<{ dbFile: string; excludedGenIndices: number[] }>
+    ): Promise<{ deleted: number }> {
+        const normalized = Array.isArray(targets)
+            ? targets
+                .map(t => ({
+                    dbFile: typeof t?.dbFile === 'string' ? t.dbFile.trim() : '',
+                    excludedGenIndices: Array.isArray(t?.excludedGenIndices)
+                        ? [...new Set(t.excludedGenIndices.filter(n => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0))]
+                        : [],
+                }))
+                .filter(t => t.dbFile.length > 0 && t.excludedGenIndices.length > 0)
+            : [];
+        if (normalized.length === 0) {
+            return { deleted: 0 };
+        }
+        return this.request('purge-forked-clones', undefined, { targets: normalized });
+    }
+    async save(
+        events: LedgerEvent[],
+        options?: { billingPrices?: Record<string, ApiPricingEntry>; receipts?: SyncReceipt[] }
+    ): Promise<{ saved: number; locksWritten?: number; receiptsWritten?: number }> {
+        const eventList = Array.isArray(events) ? events : [];
+        const receiptList = Array.isArray(options?.receipts) ? options.receipts : [];
+        if (eventList.length === 0 && receiptList.length === 0) {
+            return { saved: 0, locksWritten: 0, receiptsWritten: 0 };
+        }
+        return this.request('save', eventList, options);
+    }
 }

@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
-import { extname, join, relative } from 'node:path';
+import { extname, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -60,10 +60,11 @@ const BINARY_EXTENSIONS = new Set([
   '.png', '.jpg', '.jpeg', '.gif', '.webp', '.icns', '.ico',
   '.dmg', '.zip', '.tar', '.gz', '.pdf', '.woff', '.woff2',
   '.ttf', '.otf', '.node', '.sqlite', '.db', '.bin',
+  '.exe', '.dll', '.pdb', '.rlib', '.rmeta', '.lib',
 ]);
 
 const SKIPPED_DIRS = new Set([
-  '.git', '.agents', 'node_modules', 'dist', 'build', '.cache',
+  '.git', '.agents', 'node_modules', 'dist', 'build', 'target', '.cache',
   'vendor', '质检报告', '成品', 'reports', 'artifacts',
 ]);
 
@@ -75,13 +76,56 @@ const LOCAL_HOME_PATH_PATTERNS = [
   { label: 'C:\\Users', re: /(?:^|[^A-Za-z0-9_])[A-Za-z]:(?:\\{1,2}|\/)Users(?:\\{1,2}|\/)([A-Za-z0-9._-]+)(?=\\|\/|[^A-Za-z0-9._-]|$)/gi, marker: 'Users' },
 ];
 const SECRET_SYNTHETIC_EXEMPT_RE = /(?:abcde|secret|dummy|fake|example|test|placeholder|fixture)/i;
+const EXAMPLE_CONTEXT_EXEMPT_RE = /(?:示例|样例|演示|demo|sample|mock|rfc\s*1918)/i;
+const SSH_PLACEHOLDER_PATH_RE = /(?:demo|example|test|fixture|placeholder|dummy|fake|sample)/i;
+const SSH_SAFE_HOST_SUFFIXES = [
+  '.example',
+  '.example.com',
+  '.example.org',
+  '.example.net',
+  '.example.invalid',
+  '.example.test',
+  '.invalid',
+  '.test',
+  '.localhost',
+];
+const SSH_SAFE_HOST_EXACT = new Set([
+  '127.0.0.1',
+  'localhost',
+  '::1',
+  '[::1]',
+  'example.com',
+  'example.org',
+  'example.net',
+  'example.invalid',
+  'example.test',
+  'ssh-host',
+  'demo-ssh-host',
+]);
+const SSH_HOSTNAME_STOPWORDS = new Set([
+  'is', 'was', 'are', 'be', 'to', 'for', 'of', 'in', 'on', 'at', 'by', 'as',
+  'or', 'and', 'not', 'if', 'that', 'which', 'with', 'from', 'into', 'only',
+  'must', 'should', 'can', 'will', 'may', 'true', 'false', 'null', 'undefined',
+  'string', 'number', 'object', 'unknown', 'empty', 'check', 'match', 'mismatch',
+]);
 const SECRET_PATTERNS = [
   { name: '私钥头', re: /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/g, allowSynthetic: false },
+  { name: 'SSH 公钥', re: /\b(?:ssh-rsa|ssh-ed25519|ssh-ecdsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[ \t]+[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/=])/g, allowSynthetic: true },
   { name: 'Google API Key', re: /\bAIza[0-9A-Za-z\-_]{35}\b/g, allowSynthetic: true },
   { name: 'Google OAuth Token', re: /\bya29\.[0-9A-Za-z\-_.]{24,}\b/g, allowSynthetic: true },
+  { name: 'Google OAuth Client Secret', re: /\bGOCSPX-[0-9A-Za-z\-_]{20,}\b/g, allowSynthetic: true },
+  { name: 'Google OAuth Client ID', re: /\b\d{10,}-[0-9a-z]{20,}\.apps\.googleusercontent\.com\b/gi, allowSynthetic: true },
   { name: 'GitHub Token', re: /\b(?:gh[pousr]_[0-9A-Za-z]{20,}|github_pat_[0-9A-Za-z_]{30,})\b/g, allowSynthetic: true },
   { name: 'API/Webhook Token', re: /\b(?:(?:sk-proj-|sk-ant-|sk-live-)[0-9A-Za-z\-_]{16,}|xox[baprs]-[0-9A-Za-z-]{16,}|AKIA[0-9A-Z]{16})\b/g, allowSynthetic: true },
+  { name: 'SSH Session CSRF Token', re: /(?:agy_session_csrf_token|x-codeium-csrf-token)["'`]?\s*[:=]\s*["'`]([A-Za-z0-9._+\/=-]{16,})["'`]/gi, allowSynthetic: true },
+  { name: 'Bearer Token', re: /\bBearer\s+[A-Za-z0-9._~+\/=-]{24,}\b/g, allowSynthetic: true },
 ];
+const SSH_KEY_PATH_RE = /(?:~|[A-Za-z]:|\/[^\s"'`<>|]*)?\.ssh(?:\/|\\)id_[A-Za-z0-9._-]+/gi;
+const SSH_HOSTNAME_DIRECTIVE_RE = /(?:^|[\r\n;]|(?:\bHost[ \t]+\S+[ \t]+))[ \t]*(HostName)(?:[ \t]*=[ \t]*|[ \t]+)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s#;"'`\r\n]+))/gim;
+const SSH_IDENTITY_FILE_DIRECTIVE_RE = /(?:^|[\r\n;]|(?:\bHost[ \t]+\S+[ \t]+))[ \t]*IdentityFile(?:[ \t]*=[ \t]*|[ \t]+)(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s#;"'`\r\n]+))/gim;
+const PRIVATE_IPV4_RE = /(?<![A-Za-z0-9_.])((?:10\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d))(?![0-9.])/g;
+const VERSION_CONTEXT_BEFORE_RE = /(?:\b(?:version|ver|semver|release|sdk|build|bundle|electron|chromium|chrome|node|macos|darwin|ios|swift|antigravity|gravitybox|api|protocol|schema|driver|kernel|os)\b|版本号?)[ \t]*[:=]?[ \t]*["'`]?$/i;
+const TIMESTAMP_CONTEXT_BEFORE_RE = /(?:(?:\b(?:timestamp|datetime|date|timecode|oid|mib|asn)\b|时间戳|日期)[ \t]*[:=]?[ \t]*["'`]?|\d{4}[-/]\d{1,2}[-/]\d{1,2}[T\s]+)$/i;
 const ASCII_TOKEN_RE = /[A-Za-z0-9]+/g;
 const CJK_RUN_RE = /[\u4e00-\u9fff]{2,}/g;
 const QUOTED_LITERAL_RE = /(["'`])([^"'`\r\n]{1,64})\1/g;
@@ -111,6 +155,33 @@ function lineNumberAt(content, index) {
 function redactLocalPart(localPart) {
   if (localPart.length <= 2) return '*'.repeat(localPart.length);
   return `${localPart[0]}***${localPart[localPart.length - 1]}`;
+}
+
+function isAllowedHomeUserPath(rawPath, allowedHomeUsers) {
+  const norm = rawPath.replaceAll('\\', '/');
+  const m = norm.match(/^(?:\/Users|\/home|[A-Za-z]:\/Users)\/([A-Za-z0-9._-]+)(?:\/|$)/i);
+  return Boolean(m && allowedHomeUsers.has(m[1].toLowerCase()));
+}
+
+function isSafeSshKeyPath(rawPath, allowedHomeUsers) {
+  if (isAllowedHomeUserPath(rawPath, allowedHomeUsers)) return true;
+  const norm = rawPath.replaceAll('\\', '/');
+  return SSH_PLACEHOLDER_PATH_RE.test(norm);
+}
+
+function isSafeSshHostValue(rawHost) {
+  const lower = rawHost.trim().toLowerCase();
+  if (!lower || lower === 'none' || /%[a-z]/i.test(lower)) return true;
+  if (SSH_SAFE_HOST_EXACT.has(lower)) return true;
+  if (SSH_SAFE_HOST_SUFFIXES.some(suffix => lower.endsWith(suffix))) return true;
+  if (/^(?:192\.0\.2|198\.51\.100|203\.0\.113)\.\d+$/.test(lower)) return true;
+  return SSH_PLACEHOLDER_PATH_RE.test(lower);
+}
+
+function redactPrivateIp(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return '*.*.*.*';
+  return `${parts[0]}.${parts[1]}.*.*`;
 }
 
 /**
@@ -168,6 +239,74 @@ export function scanContentForPrivacy(content, filePath, options = {}) {
         detail: `发现疑似明文 ${name} 凭据（请改用环境变量或显式测试占位串）`,
       });
     }
+  }
+
+  for (const match of content.matchAll(SSH_KEY_PATH_RE)) {
+    const rawPath = match[0];
+    if (isSafeSshKeyPath(rawPath, allowedHomeUsers)) continue;
+    issues.push({
+      code: 'DISALLOWED_SSH_CONFIG',
+      file: rel,
+      line: lineNumberAt(content, match.index ?? 0),
+      detail: '发现疑似非占位路径下的 SSH 私钥文件名（请改用 /Users/demo 或 example 占位路径）',
+    });
+  }
+
+  for (const match of content.matchAll(SSH_HOSTNAME_DIRECTIVE_RE)) {
+    const keyword = match[1] ?? 'HostName';
+    const quoted = match[2] ?? match[3];
+    const unquoted = match[4];
+    const value = (quoted ?? unquoted ?? '').trim();
+    if (!value) continue;
+    if (unquoted && keyword === keyword.toLowerCase() && SSH_HOSTNAME_STOPWORDS.has(value.toLowerCase())) continue;
+    if (isSafeSshHostValue(value)) continue;
+    const directiveOffset = match[0].toLowerCase().indexOf('hostname');
+    const pos = (match.index ?? 0) + Math.max(0, directiveOffset);
+    issues.push({
+      code: 'DISALLOWED_SSH_CONFIG',
+      file: rel,
+      line: lineNumberAt(content, pos),
+      detail: '发现疑似 SSH HostName 指令指向非示例主机（请改用 demo-ssh-host 或 *.example.invalid）',
+    });
+  }
+
+  for (const match of content.matchAll(SSH_IDENTITY_FILE_DIRECTIVE_RE)) {
+    const value = (match[1] ?? match[2] ?? match[3] ?? '').trim();
+    if (!value || value.toLowerCase() === 'none' || /%[a-z]/i.test(value)) continue;
+    if (isSafeSshKeyPath(value, allowedHomeUsers)) continue;
+    const directiveOffset = match[0].toLowerCase().indexOf('identityfile');
+    const pos = (match.index ?? 0) + Math.max(0, directiveOffset);
+    issues.push({
+      code: 'DISALLOWED_SSH_CONFIG',
+      file: rel,
+      line: lineNumberAt(content, pos),
+      detail: '发现疑似 SSH IdentityFile 指令指向非占位私钥路径（请改用 /Users/demo 或 example 占位路径）',
+    });
+  }
+
+  for (const match of content.matchAll(PRIVATE_IPV4_RE)) {
+    const rawIp = match[1];
+    const idx = match.index ?? 0;
+    const lineStart = content.lastIndexOf('\n', idx - 1) + 1;
+    const rawLineEnd = content.indexOf('\n', idx);
+    const lineEnd = rawLineEnd === -1 ? content.length : rawLineEnd;
+    const lineText = content.slice(lineStart, lineEnd);
+    const beforeOnLine = content.slice(lineStart, idx);
+    const afterOnLine = content.slice(idx + rawIp.length, lineEnd);
+
+    if (/^[-+][A-Za-z0-9._-]+/.test(afterOnLine)) continue;
+    if (VERSION_CONTEXT_BEFORE_RE.test(beforeOnLine) || TIMESTAMP_CONTEXT_BEFORE_RE.test(beforeOnLine)) continue;
+    if (/^(?:10\.0\.0\.0\/8|172\.16\.0\.0\/12|192\.168\.0\.0\/16)(?:[^0-9]|$)/.test(`${rawIp}${afterOnLine}`)) {
+      continue;
+    }
+    if (SECRET_SYNTHETIC_EXEMPT_RE.test(lineText) || EXAMPLE_CONTEXT_EXEMPT_RE.test(lineText)) continue;
+
+    issues.push({
+      code: 'DISALLOWED_PRIVATE_IP',
+      file: rel,
+      line: lineNumberAt(content, idx),
+      detail: `发现疑似非保留私网 IPv4 地址 ${redactPrivateIp(rawIp)}（请改用 127.0.0.1 或显式示例占位上下文）`,
+    });
   }
 
   const asciiTokens = [];
@@ -334,7 +473,13 @@ async function main() {
   process.stdout.write(`✅ [privacy-gate] 隐私检查通过（已扫描 ${result.scannedCount} 个${staged ? '暂存' : '仓库'}文件，未发现真实邮箱或敏感标识）\n`);
 }
 
-if (typeof process.argv[1] === 'string' && import.meta.url === pathToFileURL(process.argv[1]).href) {
+const isDirectPrivacyEntry =
+  typeof process.argv[1] === 'string' &&
+  (process.platform === 'win32'
+    ? resolve(process.argv[1]).toLowerCase() === resolve(fileURLToPath(import.meta.url)).toLowerCase()
+    : import.meta.url === pathToFileURL(process.argv[1]).href);
+
+if (isDirectPrivacyEntry) {
   main().catch(error => {
     process.stderr.write(`[privacy-gate] 检查异常: ${error?.message || String(error)}\n`);
     process.exitCode = 1;

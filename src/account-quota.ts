@@ -236,6 +236,7 @@ export interface QuotaRefreshState {
   providerOrigin?: string;
   providerUserAgent?: string;
   requestScope?: 'account';
+  projectId?: string;
 }
 
 export interface QuotaData {
@@ -414,6 +415,9 @@ export type AccountErrorCode =
   | 'oauth_verify_failed'
   | 'oauth_unverified_email'
   | 'oauth_network'
+  | 'oauth_rate_limited'
+  | 'oauth_server_error'
+  | 'oauth_client_error'
   | 'missing_refresh_token'
   | 'missing_oauth_client'
   | 'refresh_failed'
@@ -438,7 +442,8 @@ export type AccountErrorCode =
 
 const ACCOUNT_ERROR_CODES = new Set<string>([
   'oauth_incomplete', 'oauth_no_credentials', 'oauth_verify_failed', 'oauth_unverified_email',
-  'oauth_network', 'missing_refresh_token', 'missing_oauth_client', 'refresh_failed',
+  'oauth_network', 'oauth_rate_limited', 'oauth_server_error', 'oauth_client_error',
+  'missing_refresh_token', 'missing_oauth_client', 'refresh_failed',
   'no_access_token', 'token_invalid', 'token_no_access', 'token_network', 'invalid_id',
   'corrupt_file', 'conflict_modified', 'credentials_updated', 'deleted_stop_refresh',
   'removed_stop_refresh', 'not_found', 'invalid_refresh_token', 'missing_email',
@@ -464,7 +469,10 @@ export function accountErrorCode(error: unknown): AccountErrorCode | null {
 }
 
 const AUTH_REQUIRED_CODES = new Set<AccountErrorCode>(['refresh_failed', 'missing_refresh_token', 'token_invalid']);
-const NON_AUTH_ERROR_CODES = new Set<AccountErrorCode>(['network', 'oauth_network', 'token_network', 'http_3501', 'missing_oauth_client']);
+const NON_AUTH_ERROR_CODES = new Set<AccountErrorCode>([
+  'network', 'oauth_network', 'token_network', 'http_3501', 'missing_oauth_client',
+  'oauth_rate_limited', 'oauth_server_error', 'oauth_client_error',
+]);
 
 const MISSING_OAUTH_CLIENT_STANDBY_BODY =
   'Google OAuth credentials are not configured, so standby accounts cannot refresh tokens in the background \\(optional credentials can be set in \\.env\\)'
@@ -514,6 +522,9 @@ const STORED_QUOTA_ERROR_PATTERNS: Array<[RegExp, string]> = [
   [MISSING_OAUTH_CLIENT_ACTIVE_LIVE_PATTERN, 'account_cloud.err.missing_oauth_client_active_live'],
   [MISSING_OAUTH_CLIENT_STANDBY_PATTERN, 'account_cloud.err.missing_oauth_client'],
   [/^(?:Unable to refresh login credentials; please add this account again|登录凭据无法刷新，请重新添加此账号)$/, 'account_cloud.err.refresh_failed'],
+  [/^(?:Token refresh rate limited; temporarily retaining last quota|Token 刷新触发限流，已暂留上次配额)$/, 'account_cloud.err.oauth_rate_limited'],
+  [/^(?:Sign-in service temporarily unavailable; temporarily retaining last quota|登录服务暂不可用，已暂留上次配额)$/, 'account_cloud.err.oauth_server_error'],
+  [/^(?:OAuth client configuration error; check client settings|OAuth 客户端配置有误，请核对客户端设置)$/, 'account_cloud.err.oauth_client_error'],
   [/^(?:Sign-in service did not return valid credentials|登录服务未返回有效凭据)$/, 'account_cloud.err.no_access_token'],
   [/^(?:Unable to reach the sign-in service; check your network and try again|无法连接登录服务，请检查网络后重试)$/, 'account_cloud.err.network'],
   [/^(?:Login credentials are invalid or expired; please obtain new ones|登录凭据无效或已失效，请重新获取)$/, 'accounts.err.token_invalid'],
@@ -852,10 +863,10 @@ export interface QuotaOverview {
   standaloneModels: StandaloneModelStatus[];
   projectedQuotaGroups?: ProjectedQuotaGroup[];
   familyWindows: {
-    gemini: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
-    claude: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
-    argon: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
-    carbon: { fiveHour: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
+    gemini: { fiveHour: QuotaOverviewWindowStatus | null; daily?: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
+    claude: { fiveHour: QuotaOverviewWindowStatus | null; daily?: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
+    argon: { fiveHour: QuotaOverviewWindowStatus | null; daily?: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
+    carbon: { fiveHour: QuotaOverviewWindowStatus | null; daily?: QuotaOverviewWindowStatus | null; weekly: QuotaOverviewWindowStatus | null };
   };
   familyModelQuota: Record<'gemini' | 'claude', QuotaOverviewWindowStatus | null>;
   nextResets: {
@@ -948,9 +959,11 @@ export function resolveEffectiveMonitoredModel(account: Account | { quota?: Quot
   const overview = buildAccountQuotaOverview(account);
   const hasGeminiCore = overview.models.some(m => m.family === 'gemini' && m.disabled !== true && !m.stale)
     || overview.familyWindows.gemini.fiveHour !== null
+    || Boolean(overview.familyWindows.gemini.daily)
     || overview.familyWindows.gemini.weekly !== null;
   const hasClaudeCore = overview.models.some(m => m.family === 'claude' && m.disabled !== true && !m.stale)
     || overview.familyWindows.claude.fiveHour !== null
+    || Boolean(overview.familyWindows.claude.daily)
     || overview.familyWindows.claude.weekly !== null;
   if (!hasGeminiCore && !hasClaudeCore) return monitoredModel;
 
@@ -1053,7 +1066,7 @@ export function computeAccountRemaining(
       && !(model.quota_bucket_name && classifyFamily({ groupName: model.quota_bucket_name, bucketId: model.quota_bucket_name }) === 'other')
       && model.stale !== true && model.own_stale !== true && model.own_percentage_known === true
       && typeof model.own_percentage === 'number').map(model => model.own_percentage! / 100);
-    return [freshFraction(windows.fiveHour), freshFraction(windows.weekly), ...own]
+    return [freshFraction(windows.fiveHour), freshFraction(windows.daily), freshFraction(windows.weekly), ...own]
       .filter((value): value is number => value !== null);
   };
   const bounded = (fraction: number): number => Math.max(0, Math.min(100, Math.round(fraction * 100)));
@@ -1673,10 +1686,26 @@ export function buildAccountQuotaOverview(
     standaloneModels,
     projectedQuotaGroups,
     familyWindows: {
-      gemini: { fiveHour: windowOut(familyWindows.gemini.fiveHour), weekly: windowOut(familyWindows.gemini.weekly) },
-      claude: { fiveHour: windowOut(familyWindows.claude.fiveHour), weekly: windowOut(familyWindows.claude.weekly) },
-      argon: { fiveHour: windowOut(familyWindows.argon.fiveHour), weekly: windowOut(familyWindows.argon.weekly) },
-      carbon: { fiveHour: windowOut(familyWindows.carbon.fiveHour), weekly: windowOut(familyWindows.carbon.weekly) },
+      gemini: {
+        fiveHour: windowOut(familyWindows.gemini.fiveHour),
+        ...(familyWindows.gemini.daily ? { daily: windowOut(familyWindows.gemini.daily) } : {}),
+        weekly: windowOut(familyWindows.gemini.weekly),
+      },
+      claude: {
+        fiveHour: windowOut(familyWindows.claude.fiveHour),
+        ...(familyWindows.claude.daily ? { daily: windowOut(familyWindows.claude.daily) } : {}),
+        weekly: windowOut(familyWindows.claude.weekly),
+      },
+      argon: {
+        fiveHour: windowOut(familyWindows.argon.fiveHour),
+        ...(familyWindows.argon.daily ? { daily: windowOut(familyWindows.argon.daily) } : {}),
+        weekly: windowOut(familyWindows.argon.weekly),
+      },
+      carbon: {
+        fiveHour: windowOut(familyWindows.carbon.fiveHour),
+        ...(familyWindows.carbon.daily ? { daily: windowOut(familyWindows.carbon.daily) } : {}),
+        weekly: windowOut(familyWindows.carbon.weekly),
+      },
     },
     familyModelQuota: { gemini: windowOut(modelQuota.gemini), claude: windowOut(modelQuota.claude) },
     nextResets: {
@@ -1774,6 +1803,9 @@ function collectQuotaWindowTiming(
       if (pair.fiveHour?.known && pair.fiveHour.resetTime) {
         consider(family, pair.fiveHour.resetTime);
       }
+      if (pair.daily?.known && pair.daily.resetTime) {
+        consider(family, pair.daily.resetTime);
+      }
       if (pair.weekly?.known && pair.weekly.resetTime) {
         consider(family, pair.weekly.resetTime);
       }
@@ -1791,7 +1823,7 @@ function collectQuotaWindowTiming(
       for (const bucket of group.buckets) {
         if (!bucket || bucket.disabled === true || bucket.remaining_fraction_known === false) continue;
         const win = classifyWindow(bucket.window, bucket.bucket_id, bucket.display_name);
-        if (win !== '5h' && win !== 'weekly') continue;
+        if (win !== '5h' && win !== 'daily' && win !== 'weekly') continue;
         consider(family, bucket.reset_time);
       }
     }
@@ -1823,6 +1855,7 @@ export function computeStandbyRefreshStatus(
   account: Account | AccountSummary | { quota?: QuotaData | null; quota_last_updated?: number | null; token?: Partial<TokenData> | null } | null | undefined,
   options: {
     isActive?: boolean;
+    isRemoteActive?: boolean;
     hasLocalOAuthClient: boolean;
     nowMs?: number;
     overview?: QuotaOverview;
@@ -1837,7 +1870,7 @@ export function computeStandbyRefreshStatus(
     : null;
   const { cooldownElapsedFamilies, nextResetAt } = collectQuotaWindowTiming(account?.quota, options.overview, nowMs);
 
-  if (options.isActive === true) {
+  if (options.isActive === true || options.isRemoteActive === true) {
     return {
       mode: 'live_active',
       hasLocalOAuthClient,
@@ -1914,8 +1947,10 @@ function resolveTargetFamiliesForCandidate(
   if (!trimmed || trimmed === 'all') {
     const hasCore = overview.models.some(m => (m.family === 'gemini' || m.family === 'claude') && m.disabled !== true)
       || overview.familyWindows.gemini.fiveHour !== null
+      || Boolean(overview.familyWindows.gemini.daily)
       || overview.familyWindows.gemini.weekly !== null
       || overview.familyWindows.claude.fiveHour !== null
+      || Boolean(overview.familyWindows.claude.daily)
       || overview.familyWindows.claude.weekly !== null;
     return {
       families: new Set<Family>(hasCore ? ['gemini', 'claude'] : ['argon', 'carbon']),
@@ -1940,7 +1975,7 @@ function resolveTargetFamiliesForCandidate(
   if (trimmed === 'gemini-4-carbon') return { families: new Set<Family>(['carbon']), matchedModel: null };
   const classified = classifyFamily({ modelId: trimmed, displayName: trimmed });
   return {
-    families: new Set<Family>(classified === 'other' ? ['gemini', 'claude'] : [classified]),
+    families: new Set<Family>(classified === 'other' ? [] : [classified]),
     matchedModel: null,
   };
 }
@@ -1969,6 +2004,7 @@ export function evaluateStandbyCandidate(
   });
   const { families: targetFamilies, matchedModel } = resolveTargetFamiliesForCandidate(account, overview, monitoredModel);
   if (matchedModel?.disabled === true) return null;
+  if (targetFamilies.size === 0 && !matchedModel) return null;
 
   const expiredResetMs: number[] = [];
   const unexpiredFractions: number[] = [];
@@ -1988,6 +2024,7 @@ export function evaluateStandbyCandidate(
     if (family === 'gemini' || family === 'claude' || family === 'argon' || family === 'carbon') {
       const fw = overview.familyWindows[family];
       if (fw.fiveHour) inspectWindow(fw.fiveHour.known, fw.fiveHour.remaining, fw.fiveHour.resetTime);
+      if (fw.daily) inspectWindow(fw.daily.known, fw.daily.remaining, fw.daily.resetTime);
       if (fw.weekly) inspectWindow(fw.weekly.known, fw.weekly.remaining, fw.weekly.resetTime);
     }
   }
@@ -2053,6 +2090,7 @@ export function projectAccountForIpc(
   account: Account | AccountSummary | null | undefined,
   options?: {
     isActive?: boolean;
+    isRemoteActive?: boolean;
     hasLocalOAuthClient?: boolean;
     nowMs?: number;
     overview?: QuotaOverview;
@@ -2081,6 +2119,7 @@ export function projectAccountForIpc(
         }, nowSec));
   const standbyRefreshStatus = computeStandbyRefreshStatus(account, {
     isActive: options?.isActive,
+    isRemoteActive: options?.isRemoteActive,
     hasLocalOAuthClient: options?.hasLocalOAuthClient ?? false,
     nowMs: options?.nowMs,
     overview: options?.overview,

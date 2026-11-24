@@ -1,5 +1,6 @@
 import { applicationTarget, type ApplicationTarget } from './application-target.js';
 import { bt } from './i18n.js';
+import { resolveOutboundFetch } from './proxy.js';
 import { inspectBundle } from './discovery.js';
 import { readFileSync, statSync } from 'node:fs';
 import { lstat, mkdir, readFile, readdir, unlink } from 'node:fs/promises';
@@ -17,10 +18,23 @@ import { decodeTopicRow } from './account-state.js';
 import {
   MockKeychainAdapter,
   SystemKeychainAdapter,
+  WindowsCredentialManagerAdapter,
   buildGoOauthPayload,
+  decodeKeychainOauthPayload,
+  encodeKeychainOauthPayload,
   syncAccountToKeychain,
   type KeychainAdapter,
+  type KeychainPayloadEncoding,
 } from './account-keychain.js';
+import {
+  defaultAntigravityProfileDir,
+  defaultAppSupportDir,
+  defaultGravityBoxStateDir,
+  isOwnedByCurrentUser,
+  isWindows,
+  lsInspect,
+  pathsEqual,
+} from './platform/index.js';
 import {
   CloudQuotaAuthorityError,
   clearLiveEndpointCache,
@@ -103,9 +117,13 @@ import {
 export {
   MockKeychainAdapter,
   SystemKeychainAdapter,
+  WindowsCredentialManagerAdapter,
   buildGoOauthPayload,
+  decodeKeychainOauthPayload,
+  encodeKeychainOauthPayload,
   syncAccountToKeychain,
   type KeychainAdapter,
+  type KeychainPayloadEncoding,
   CloudQuotaAuthorityError,
   cloudOriginFromCommand,
   cloudProviderContextFromCommand,
@@ -268,12 +286,23 @@ export class AccountsManager {
     if(this.inFlightProviderContext)return await this.inFlightProviderContext;
     const task=(async():Promise<CloudProviderContext>=>{
       const candidate = this.target;
-      const text=(await execFileAsync('/bin/ps',['-ax','-ww','-o','args='],{timeout:3000})).stdout;
+      let lines: string[] = [];
+      if (isWindows()) {
+        try {
+          const procs = await lsInspect();
+          lines = procs.map((p) => p.cmdLine.trim()).filter(Boolean);
+        } catch {
+          lines = [];
+        }
+      } else {
+        const text=(await execFileAsync('/bin/ps',['-ax','-ww','-o','args='],{timeout:3000})).stdout;
+        lines = text.split('\n').map(line => line.trim());
+      }
       let version = '';
       try {
         version = (await inspectBundle(candidate.appPath)).version;
       } catch {}
-      const context = text.split('\n').map(line => cloudProviderContextFromCommand(line.trim(), version, candidate)).find(Boolean);
+      const context = lines.map(line => cloudProviderContextFromCommand(line, version, candidate)).find(Boolean);
       const providerCachePath = join(this.stateDir, 'quota-provider-stable.json');
       if (context) {
         await atomicJson(providerCachePath, context);
@@ -646,6 +675,126 @@ export class AccountsManager {
   }
 
   /**
+   * 从在线 SSH 会话只读探测结果安全回写本机已保存账号的配额展示快照与订阅等级：
+   * 绝不触碰 token、备注、排序等字段；仅当远端配额模型非空且时间更新鲜（或存在陈旧报错需清除）时落盘。
+   */
+  async syncRemoteObservedQuota(
+    accountId: string,
+    remoteQuota: QuotaData | null | undefined,
+    tier?: string | null
+  ): Promise<Account | null> {
+    const id = String(accountId || '').trim();
+    if (!id || !/^[a-zA-Z0-9_-]+$/.test(id) || !remoteQuota || !Array.isArray(remoteQuota.models) || remoteQuota.models.length === 0) {
+      return null;
+    }
+    await this.init();
+    return this.withWriteLock(async () => {
+      const diskAccount = await this.getAccount(id);
+      if (!diskAccount) return null;
+      const diskStamp = Number(diskAccount.quota?.last_updated ?? 0);
+      const remoteStamp = Number(remoteQuota.last_updated ?? 0);
+      const remoteProjectId = typeof remoteQuota.refresh_state?.projectId === 'string' ? remoteQuota.refresh_state.projectId.trim() : '';
+      const diskProjectId = typeof diskAccount.token?.project_id === 'string' ? diskAccount.token.project_id.trim() : '';
+      if (remoteProjectId && diskProjectId && remoteProjectId !== diskProjectId) {
+        return diskAccount;
+      }
+      const hasDiskQuota = Boolean(
+        diskAccount.quota && Array.isArray(diskAccount.quota.models) && diskAccount.quota.models.length > 0
+      );
+      if (hasDiskQuota && remoteStamp > 0 && remoteStamp < diskStamp) {
+        return diskAccount;
+      }
+      const hasErrorToClear = Boolean(diskAccount.quota_refresh_error || diskAccount.quota_refresh_error_code);
+      if (hasDiskQuota && remoteStamp > 0 && remoteStamp === diskStamp && !hasErrorToClear) {
+        return diskAccount;
+      }
+
+      const oldQuota = diskAccount.quota;
+      const remoteSummaryFailed = remoteQuota.refresh_state?.complete === false || (remoteQuota.quota_groups?.length ?? 0) === 0;
+      const nextTier = mergeSubscriptionTier(
+        typeof tier === 'string' && tier.trim() ? tier.trim() : remoteQuota.subscription_tier,
+        oldQuota?.subscription_tier,
+        { allowFreeDowngrade: !remoteSummaryFailed }
+      );
+      const nowMs = Date.now();
+      const staleSeconds = this.getConfiguredQuotaStaleSeconds();
+      const freshGroups = normalizeStoredGroups(remoteQuota.quota_groups, remoteQuota.last_updated, 'live');
+      const prevGroups = normalizeStoredGroups(oldQuota?.quota_groups, oldQuota?.last_updated ?? remoteQuota.last_updated);
+      const { groups, staleGroups } = mergeGroupsWithPrevious(freshGroups, prevGroups, nowMs);
+      const { models, carriedCount } = mergeModelsWithPrevious(
+        remoteQuota.models.map(model => normalizedModelFromStored(model, 'live')),
+        (oldQuota?.models ?? []).map(model => normalizedModelFromStored(model))
+      );
+      const missingWindows = groups.flatMap(group =>
+        group.buckets.filter(bucket => bucket.stale).map(bucket => ({ family: group.family, window: bucket.window }))
+      );
+      const baseRefreshState = remoteQuota.refresh_state ?? this.getAccountQuotaOverview({ quota: remoteQuota }).refreshState;
+      const completeNow = Boolean(
+        baseRefreshState.complete !== false &&
+        staleGroups.length === 0 &&
+        groups.length > 0 &&
+        missingWindows.length === 0
+      );
+      const effectiveLastUpdated =
+        freshGroups.length === 0 && typeof oldQuota?.last_updated === 'number' && oldQuota.last_updated > 0
+          ? oldQuota.last_updated
+          : remoteQuota.last_updated;
+      const mergedQuota: QuotaData = {
+        ...remoteQuota,
+        last_updated: effectiveLastUpdated,
+        ...(nextTier ? { subscription_tier: nextTier } : {}),
+        models: applyFamilyWindows(models, familyWindowsFromGroups(groups, nowMs, staleSeconds)).map(modelQuotaFromNormalized),
+        quota_groups: groups.map(groupToQuotaGroup),
+        ...(staleGroups.length ? { stale_groups: staleGroups } : {}),
+        refresh_state: {
+          ...baseRefreshState,
+          complete: completeNow,
+          missingWindows,
+          carriedGroups: staleGroups.length,
+          carriedModels: carriedCount,
+        },
+      };
+      const toSave: Account = {
+        ...diskAccount,
+        quota: mergedQuota,
+        quota_refresh_error: completeNow ? null : (diskAccount.quota_refresh_error ?? null),
+        quota_refresh_error_code: completeNow ? null : (diskAccount.quota_refresh_error_code ?? null),
+      };
+      const accountPath = join(this.accountsDir, `${id}.json`);
+      const index = await this.loadIndex();
+      const summary: AccountSummary = {
+        id: toSave.id,
+        email: toSave.email,
+        name: toSave.name,
+        disabled: toSave.disabled,
+        disabled_reason: toSave.disabled_reason,
+        disabled_at: toSave.disabled_at,
+        protected_models: toSave.protected_models ?? [],
+        created_at: toSave.created_at,
+        last_used: toSave.last_used,
+        custom_label: toSave.custom_label,
+        quota: toSave.quota,
+        quota_refresh_error: toSave.quota_refresh_error,
+        quota_refresh_error_code: toSave.quota_refresh_error_code,
+        revision: computeAccountRevision(toSave),
+        quota_last_updated: toSave.quota?.last_updated ?? 0,
+      };
+      const existingIdx = index.accounts.findIndex(a => a.id === id);
+      if (existingIdx >= 0) {
+        index.accounts[existingIdx] = summary;
+      } else {
+        index.accounts.unshift(summary);
+      }
+      await commitAccountAndIndex(accountPath, toSave, this.indexPath, index);
+      this.indexCache = null;
+      this.accountCache.delete(id);
+      const nextDigest = createHash('sha256').update(await readFile(accountPath)).digest('hex');
+      this.accountFileDigests.set(toSave, nextDigest);
+      return toSave;
+    });
+  }
+
+  /**
    * 原子读-改-写：在锁内读取最新账号数据，执行 mutator，然后落盘更新，
    * 彻底杜绝先读出旧快照、再覆盖期间并发更新（如配额刷新）的 Lost Update 问题。
    */
@@ -864,7 +1013,6 @@ export class AccountsManager {
 
     const MAX_FILE_BYTES = 2 * 1024 * 1024;
     const MAX_ACCOUNTS_PER_IMPORT = 200;
-    const uid = process.getuid?.();
     const skipped: Array<{ source: string; reason: string }> = [];
     const candidateFiles: string[] = [];
     const seenFiles = new Set<string>();
@@ -875,7 +1023,7 @@ export class AccountsManager {
         skipped.push({ source: inputPath, reason: bt('accounts.import.err.not_found') });
         continue;
       }
-      if (st.isSymbolicLink() || (uid !== undefined && st.uid !== uid)) {
+      if (st.isSymbolicLink() || !isOwnedByCurrentUser(st)) {
         skipped.push({ source: inputPath, reason: bt('accounts.import.err.unsafe_file') });
         continue;
       }
@@ -892,7 +1040,7 @@ export class AccountsManager {
           const childPath = join(inputPath, entry.name);
           if (seenFiles.has(childPath)) continue;
           const childSt = await lstat(childPath).catch(() => null);
-          if (!childSt || !childSt.isFile() || childSt.isSymbolicLink() || (uid !== undefined && childSt.uid !== uid)) {
+          if (!childSt || !childSt.isFile() || childSt.isSymbolicLink() || !isOwnedByCurrentUser(childSt)) {
             skipped.push({ source: childPath, reason: bt('accounts.import.err.unsafe_file') });
             continue;
           }
@@ -1199,21 +1347,20 @@ export class AccountsManager {
       relToState === '' ||
       (!relToState.startsWith('..') &&
         !isAbsolute(relToState) &&
-        /^(?:accounts\.json|accounts(?:\/|\\|$)|config\.json|account-switch-|usage-|usage\.|rate-locks|remote_pricing\.json|api_pricing\.json|pricing_sync_state\.json|live-ide-models\.json)/i.test(relToState))
+        /^(?:accounts\.json|accounts(?:\/|\\|$)|config\.json|account-switch-|usage-|usage\.|remote[-_]|rate-locks|api_pricing\.json|pricing_sync_state\.json|live-ide-models\.json)/i.test(relToState))
     ) {
       throw new Error(bt('accounts.export.err.invalid_path'));
     }
-    const uid = process.getuid?.();
     const parentDir = dirname(resolvedPath);
     const parentInfo = await lstat(parentDir).catch(() => null);
-    if (!parentInfo || !parentInfo.isDirectory() || parentInfo.isSymbolicLink() || (uid !== undefined && parentInfo.uid !== uid)) {
+    if (!parentInfo || !parentInfo.isDirectory() || parentInfo.isSymbolicLink() || !isOwnedByCurrentUser(parentInfo)) {
       throw new Error(bt('accounts.export.err.invalid_parent'));
     }
     const existingInfo = await lstat(resolvedPath).catch((err: NodeJS.ErrnoException) => {
       if (err?.code === 'ENOENT') return null;
       throw err;
     });
-    if (existingInfo && (!existingInfo.isFile() || existingInfo.isSymbolicLink() || (uid !== undefined && existingInfo.uid !== uid))) {
+    if (existingInfo && (!existingInfo.isFile() || existingInfo.isSymbolicLink() || !isOwnedByCurrentUser(existingInfo))) {
       throw new Error(bt('files.refuse_non_user_file'));
     }
 
@@ -1268,14 +1415,15 @@ export class AccountsManager {
     if (fetchImpl === globalThis.fetch && (!clientId || !clientSecret)) {
       throw new CodedAccountError('missing_oauth_client', bt('oauth.err.missing_client'));
     }
-    const tokenReply = await fetchImpl('https://oauth2.googleapis.com/token', {
+    const outboundFetch = resolveOutboundFetch(fetchImpl);
+    const tokenReply = await outboundFetch('https://oauth2.googleapis.com/token', {
       method: 'POST', signal: AbortSignal.timeout(6000), headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' }).toString(),
     }).catch(() => { throw new CodedAccountError('token_network', bt('accounts.err.token_network')); });
     if (!tokenReply.ok) throw new CodedAccountError('token_invalid', bt('accounts.err.token_invalid'));
     const token: any = await tokenReply.json();
     if (typeof token.access_token !== 'string' || !token.access_token) throw new CodedAccountError('token_no_access', bt('accounts.err.token_no_access'));
-    const identityReply = await fetchImpl('https://www.googleapis.com/oauth2/v2/userinfo', {
+    const identityReply = await outboundFetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${token.access_token}` }, signal: AbortSignal.timeout(6000),
     }).catch(() => { throw new CodedAccountError('identity_verify_failed', bt('accounts.err.identity_verify_failed')); });
     if (!identityReply.ok) throw new CodedAccountError('identity_verify_failed', bt('accounts.err.identity_verify_failed'));
@@ -1286,7 +1434,8 @@ export class AccountsManager {
   }
 
   async addAccountFromOAuth(token: { access_token: string; refresh_token: string; expires_in?: number; id_token?: string }, signal: AbortSignal, fetchImpl: typeof fetch = globalThis.fetch): Promise<void> {
-    const reply = await fetchImpl('https://www.googleapis.com/oauth2/v2/userinfo', {
+    const outboundFetch = resolveOutboundFetch(fetchImpl);
+    const reply = await outboundFetch('https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${token.access_token}` }, signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
     });
     if (!reply.ok) throw new CodedAccountError('oauth_verify_failed', bt('accounts.err.oauth_verify_failed'));
@@ -1303,10 +1452,10 @@ export class AccountsManager {
     return this.withWriteLock(async () => {
       const index = await this.loadIndex();
       const summary = index.accounts.find(item => item.id === id);
-      const existing = await this.getAccount(id);
+      const existing = await this.getAccount(id).catch(() => null);
       const email = existing?.email ?? summary?.email ?? '';
       const accountPath = join(this.accountsDir, `${id}.json`);
-      const tombstones = (await this.loadTombstones()).filter(item => item.id !== id && item.email.toLowerCase() !== email.toLowerCase());
+      const tombstones = (await this.loadTombstones()).filter(item => item.id !== id && (!email || item.email.toLowerCase() !== email.toLowerCase()));
       if (summary || existing) tombstones.push({ id, email, at: Math.floor(Date.now()/1000) });
       index.accounts = index.accounts.filter(a => a.id !== id);
       if (index.current_account_id === id) index.current_account_id = null;
@@ -1314,20 +1463,25 @@ export class AccountsManager {
       if (original !== null) {
         const removedDir = join(this.stateDir, 'accounts-removed');
         await mkdir(removedDir, { recursive: true, mode: 0o700 });
-        const parsedOriginal = JSON.parse(original);
-        const redactedAccount = parsedOriginal && typeof parsedOriginal === 'object'
-          ? {
-              ...parsedOriginal,
-              token: parsedOriginal.token && typeof parsedOriginal.token === 'object'
-                ? {
-                    redacted: true,
-                    email: parsedOriginal.token.email ?? null,
-                    project_id: parsedOriginal.token.project_id ?? null,
-                    token_type: parsedOriginal.token.token_type ?? null,
-                  }
-                : undefined,
-            }
-          : null;
+        let redactedAccount: Record<string, unknown> | null = null;
+        try {
+          const parsedOriginal = JSON.parse(sanitizeJsonString(Buffer.from(original, 'utf8')));
+          redactedAccount = parsedOriginal && typeof parsedOriginal === 'object'
+            ? {
+                ...parsedOriginal,
+                token: parsedOriginal.token && typeof parsedOriginal.token === 'object'
+                  ? {
+                      redacted: true,
+                      email: parsedOriginal.token.email ?? null,
+                      project_id: parsedOriginal.token.project_id ?? null,
+                      token_type: parsedOriginal.token.token_type ?? null,
+                    }
+                  : undefined,
+              }
+            : null;
+        } catch {
+          redactedAccount = { parseError: true, redacted: true };
+        }
         await atomicJson(join(removedDir, `${id}-${Date.now()}.json`), {
           schema: 1, removedAt: new Date().toISOString(), account: redactedAccount,
         });
@@ -1767,10 +1921,10 @@ export class AccountsManager {
     expectedEmail?: string;
     strictSandboxGuard?: boolean;
   }): Promise<{ token: TokenData | null; email: string | null }> {
-    const defaultStateDir = join(homedir(), 'Library', 'Application Support', 'GravityBox');
-    const isDefaultStateDir = this.stateDir === defaultStateDir;
-    const defaultProfileDir = join(homedir(), 'Library', 'Application Support', this.target.name);
-    const hasCustomTargetProfile = resolve(this.target.profile) !== resolve(defaultProfileDir);
+    const defaultStateDir = defaultGravityBoxStateDir();
+    const isDefaultStateDir = pathsEqual(this.stateDir, defaultStateDir);
+    const defaultProfileDir = defaultAntigravityProfileDir(homedir(), process.env, process.platform, this.target.name);
+    const hasCustomTargetProfile = !pathsEqual(resolve(this.target.profile), resolve(defaultProfileDir));
     if (
       options?.strictSandboxGuard
       && options.homeDir === undefined
@@ -1784,8 +1938,8 @@ export class AccountsManager {
     }
 
     const homeDir = options?.homeDir ?? homedir();
-    const appSupportDir = options?.appSupportDir ?? join(homedir(), 'Library', 'Application Support');
-    const isSandboxHome = homeDir !== homedir();
+    const appSupportDir = options?.appSupportDir ?? defaultAppSupportDir();
+    const isSandboxHome = !pathsEqual(homeDir, homedir());
     const allowHostSessionFiles = options?.homeDir !== undefined || isDefaultStateDir;
     const allowHostKeychain = Boolean(options?.keychain) || (!isSandboxHome && isDefaultStateDir);
     const expectedLower = options?.expectedEmail?.trim().toLowerCase() ?? null;
@@ -1824,8 +1978,8 @@ export class AccountsManager {
       const keychain = options?.keychain ?? new SystemKeychainAdapter();
       try {
         const pass = await keychain.readPassword('gemini', 'antigravity');
-        if (pass && pass.startsWith('go-keyring-base64:')) {
-          const raw = Buffer.from(pass.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
+        const raw = decodeKeychainOauthPayload(pass);
+        if (raw) {
           const parsed = JSON.parse(raw);
           if (parsed?.token?.refresh_token) {
             const extracted = AccountsManager.buildExtractedOAuthToken(parsed.token, parsed.id_token_email || null);
@@ -2527,7 +2681,7 @@ export class AccountsManager {
       const ls = await this.probeLiveLanguageServer().catch(() => null);
       if (ls?.email) return ls.email;
     }
-    const isDefaultStateDir = this.stateDir === join(homedir(), 'Library', 'Application Support', 'GravityBox');
+    const isDefaultStateDir = pathsEqual(this.stateDir, defaultGravityBoxStateDir());
     if (!isDefaultStateDir) return null;
     const now = Date.now();
     if (this.desktopEmailCache && now < this.desktopEmailCache.expiresAt) {
@@ -2551,9 +2705,11 @@ export class AccountsManager {
         : new Map<string, string>();
       const userStatusB64 = extractTopicDataString(stateRows.get('antigravityUnifiedStateSync.userStatus'));
       if (userStatusB64) {
-        const buf = decodeTopicRow(userStatusB64, 'userStatusSentinelKey');
-        const email = buf ? ProtobufReader.findString(buf, 7) : null;
-        if (email && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
+        try {
+          const buf = decodeTopicRow(userStatusB64, 'userStatusSentinelKey');
+          const email = buf ? ProtobufReader.findString(buf, 7) : null;
+          if (email && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;
+        } catch {}
       }
       if (!detected) {
         const authStatusRaw = stateRows.get('antigravityAuthStatus');
@@ -2571,8 +2727,8 @@ export class AccountsManager {
     if (!detected) {
       try {
         const pass = await new SystemKeychainAdapter().readPassword('gemini', 'antigravity');
-        if (pass && pass.startsWith('go-keyring-base64:')) {
-          const raw = Buffer.from(pass.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
+        const raw = decodeKeychainOauthPayload(pass);
+        if (raw) {
           const parsed = JSON.parse(raw);
           const email = parsed?.token?.email || parsed?.id_token_email;
           if (typeof email === 'string' && /^[^\s@]+@[^\s@]+$/.test(email)) detected = email;

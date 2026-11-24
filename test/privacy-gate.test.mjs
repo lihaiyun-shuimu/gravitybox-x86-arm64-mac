@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { SshRemoteRpcClient } from '../dist/ssh-remote-rpc.js';
+import { RemoteAccountObservationStore, syncRemoteSessionUsage } from '../dist/remote-usage-sync.js';
 import { runPrivacyCheck, scanContentForPrivacy, scanDirectoryForPrivacy } from '../tools/check-privacy.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -76,6 +79,24 @@ test('隐私门禁扫描器：拦截真实私钥与密钥前缀，豁免显式�
   const issues = scanContentForPrivacy(`${fakePem}\n${fakeGoogleKey}\n${fakeGhToken}\n`, 'src/leaked.ts');
   assert.equal(issues.length, 3);
   assert.deepEqual(issues.map(i => i.code), ['DISALLOWED_SECRET_LITERAL', 'DISALLOWED_SECRET_LITERAL', 'DISALLOWED_SECRET_LITERAL']);
+
+  const safeGoogleOAuth = [
+    "GRAVITYBOX_GOOGLE_CLIENT_ID='your-client-id.apps.googleusercontent.com'",
+    "GRAVITYBOX_GOOGLE_CLIENT_ID='mock-id.apps.googleusercontent.com'",
+    `const placeholderSecret = '${'GOCSPX-' + 'examplePlaceholderSecretValue99'}';`,
+    `const placeholderClientId = '${'1071006060591-' + 'exampleplaceholderclientid99.apps.googleusercontent.com'}';`,
+  ].join('\n');
+  assert.deepEqual(scanContentForPrivacy(safeGoogleOAuth, 'test/sample.test.mjs'), []);
+
+  const fakeOAuthSecret = 'GOCSPX-' + 'K9mPqR2xT4vW8zY1nB3cD6fG7hJ8';
+  const fakeOAuthClientId = '1071006060591-' + 'k9mpqr2xt4vw8zy1nb3cd6fg7hj8' + '.apps.googleusercontent.com';
+  const oauthIssues = scanContentForPrivacy(
+    `GRAVITYBOX_GOOGLE_CLIENT_ID=${fakeOAuthClientId}\nGRAVITYBOX_GOOGLE_CLIENT_SECRET=${fakeOAuthSecret}\n`,
+    'src/leaked-oauth.ts'
+  );
+  assert.equal(oauthIssues.length, 2);
+  assert.deepEqual(oauthIssues.map(i => i.code), ['DISALLOWED_SECRET_LITERAL', 'DISALLOWED_SECRET_LITERAL']);
+  assert.deepEqual(oauthIssues.map(i => i.line), [1, 2]);
 
   const tempDir = await mkdtemp(join(tmpdir(), 'gb-privacy-dir-'));
   try {
@@ -152,6 +173,288 @@ test('隐私门禁 --staged 模式：仅检查暂存区快照，不误检未暂�
     assert.equal(blockedStaged.issues[0].code, 'DISALLOWED_EMAIL_DOMAIN');
   } finally {
     await rm(tempRepo, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('隐私门禁扫描器：拦截硬编码 SSH CSRF / 长 Bearer 凭据，放行 localStorage 只读键名与测试占位串', () => {
+  const safeContent = `
+    const csrf = localStorage.getItem('${'agy_session_csrf' + '_token'}');
+    const hdr = { '${'x-codeium-csrf' + '-token'}': 'test-csrf-token-placeholder' };
+    const auth = '${'Bear' + 'er'} sample-test-placeholder-token-1234';
+  `;
+  assert.deepEqual(scanContentForPrivacy(safeContent, 'src/ssh-remote-rpc.ts'), []);
+
+  const unsafeCsrfAssign = `${'agy_session_csrf' + '_token'} = '${'K9mPqR2xT4vW8zY1nB3cD6fG'}'`;
+  const unsafeCsrfHeader = `'${'x-codeium-csrf' + '-token'}': '${'M7nQpR9xT2vW4zY6bC8dE1fH'}'`;
+  const unsafeBearerLine = `Authorization: ${'Bear' + 'er'} ${'K8vP3mQx9RtY2wZ5nB7cF4hJ6dL'}`;
+  const issues = scanContentForPrivacy(
+    `${unsafeCsrfAssign}\n${unsafeCsrfHeader}\n${unsafeBearerLine}\n`,
+    'src/leaked-ssh.ts'
+  );
+  assert.equal(issues.length, 3);
+  assert.deepEqual(issues.map(i => i.code), [
+    'DISALLOWED_SECRET_LITERAL',
+    'DISALLOWED_SECRET_LITERAL',
+    'DISALLOWED_SECRET_LITERAL',
+  ]);
+});
+
+test('SSH RPC 源码静态隐私契约：仅页内消耗会话 CSRF 令牌，严格白名单投影不转发提示词与消息体', async () => {
+  const rpcSource = await readFile(join(repoRoot, 'src/ssh-remote-rpc.ts'), 'utf8');
+  assert.ok(rpcSource.includes(`localStorage.getItem('${'agy_session_csrf' + '_token'}')`));
+  assert.ok(rpcSource.includes('includeMessages: false'));
+  assert.equal(/\b(?:token|csrfToken)\s*:/m.test(rpcSource), false);
+  assert.equal(/return\s+\{[^}]*\btoken\b/m.test(rpcSource), false);
+  for (const forbidden of [
+    'promptSections',
+    'systemPrompt',
+    'tools',
+    'responseHeader',
+    'customMetadata',
+    'messagePrompts',
+    'messages',
+  ]) {
+    assert.equal(new RegExp(`\\b${forbidden}\\b`).test(rpcSource), false, `禁止在 ssh-remote-rpc.ts 投影或转发 ${forbidden}`);
+  }
+});
+
+test('隐私门禁扫描器：拦截 SSH 公钥与敏感 SSH 配置指令，放行示例占位配置', () => {
+  const safeSsh = [
+    "const kind = 'ssh-ed25519';",
+    `const placeholderKey = 'ssh-ed25519 ' + 'AAAAC3NzaC1lZDI1NTE5AAAAIexampleplaceholderkey1234';`,
+    "const samplePath = '/Users/alice/.ssh/' + 'id_ed25519';",
+    "const demoKeyPath = '~/.ssh/' + 'id_example';",
+    'Host demo-box',
+    '  HostName demo-ssh-host',
+    '  HostName api.example.invalid',
+    '  HostName 127.0.0.1',
+    '  IdentityFile /Users/demo/.ssh/example_key',
+    '  IdentityFile ~/.ssh/example_identity',
+  ].join('\n');
+  assert.deepEqual(scanContentForPrivacy(safeSsh, 'docs/ssh-guide.md'), []);
+
+  const sshRsaKey = ['ssh-' + 'rsa', 'AAAAB3NzaC1yc2EAAAADAQABAAABgQC9mPqR2xT4vW8zY1nB3cD6fG=='].join(' ');
+  const sshEdKey = ['ssh-' + 'ed25519', 'AAAAC3NzaC1lZDI1NTE5AAAAIK9mPqR2xT4vW8zY1nB3cD6fG7hJ8'].join(' ');
+  const sshEcdsaKey = ['ssh-' + 'ecdsa', 'AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTY='].join(' ');
+  const unsafeKeyPath = ['~/', '.ssh/', 'id_', 'ed25519'].join('');
+  const unsafeHostLine = ['  Host', 'Name prod-gpu-01.corp.internal'].join('');
+  const unsafeIdentLine = ['  Identity', 'File ~/.ssh/corp_bastion_key'].join('');
+
+  const issues = scanContentForPrivacy(
+    [
+      sshRsaKey,
+      sshEdKey,
+      sshEcdsaKey,
+      `const key = '${unsafeKeyPath}';`,
+      unsafeHostLine,
+      unsafeIdentLine,
+    ].join('\n'),
+    'src/leaked-ssh-config.ts'
+  );
+  assert.deepEqual(
+    issues.map(i => i.code),
+    [
+      'DISALLOWED_SECRET_LITERAL',
+      'DISALLOWED_SECRET_LITERAL',
+      'DISALLOWED_SECRET_LITERAL',
+      'DISALLOWED_SSH_CONFIG',
+      'DISALLOWED_SSH_CONFIG',
+      'DISALLOWED_SSH_CONFIG',
+    ]
+  );
+  assert.deepEqual(issues.map(i => i.line), [1, 2, 3, 4, 5, 6]);
+});
+
+test('隐私门禁扫描器：拦截非保留私网 IPv4，严谨豁免版本号、时间戳与示例上下文', () => {
+  const safeIpv4 = [
+    `const winVer = '${['10', '0', '19045', '1'].join('.')}';`,
+    `const vPrefixed = 'v${['10', '2', '3', '4'].join('.')}';`,
+    `const prerelease = '${['172', '16', '0', '1'].join('.')}-rc1';`,
+    `const versionObj = { version: '${['192', '168', '1', '2'].join('.')}' };`,
+    `const stamped = '2026-11-20 ${['10', '12', '30', '40'].join('.')}';`,
+    `// example private host: ${['192', '168', '1', '50'].join('.')}`,
+    `const placeholderAddr = '${['10', '0', '0', '9'].join('.')}';`,
+    `const cidr10 = '${['10', '0', '0', '0'].join('.')}/8';`,
+    `const cidr172 = '${['172', '16', '0', '0'].join('.')}/12';`,
+    `const cidr192 = '${['192', '168', '0', '0'].join('.')}/16';`,
+    `const nonPrivate172 = '${['172', '15', '0', '1'].join('.')}';`,
+    `const nonPrivate172High = '${['172', '32', '0', '1'].join('.')}';`,
+    "const loopback = '127.0.0.1';",
+  ].join('\n');
+  assert.deepEqual(scanContentForPrivacy(safeIpv4, 'test/network.test.mjs'), []);
+
+  const priv10 = ['10', '24', '8', '12'].join('.');
+  const priv172 = ['172', '16', '5', '9'].join('.');
+  const priv192 = ['192', '168', '50', '21'].join('.');
+  const issues = scanContentForPrivacy(
+    [
+      `const dbHost = '${priv10}';`,
+      `const vpcHost = '${priv172}';`,
+      `const lanHost = '${priv192}';`,
+    ].join('\n'),
+    'src/leaked-ip.ts'
+  );
+  assert.equal(issues.length, 3);
+  assert.deepEqual(issues.map(i => i.code), [
+    'DISALLOWED_PRIVATE_IP',
+    'DISALLOWED_PRIVATE_IP',
+    'DISALLOWED_PRIVATE_IP',
+  ]);
+  assert.equal(issues.every(i => !i.detail.includes(priv10) && !i.detail.includes(priv172) && !i.detail.includes(priv192)), true);
+});
+
+test('syncRemoteSessionUsage 产物零令牌/零 Prompt 脱敏与 0o600 落盘契约', async () => {
+  const tempStateDir = await mkdtemp(join(tmpdir(), 'gb-remote-privacy-'));
+  const csrfSecret = 'csrf-remote-sync-secret-99887766';
+  const secretWorkspace = ['/Users', 'privateuser', 'secret-repo'].join('/');
+  const fakeWindow = {
+    localStorage: {
+      getItem: key => (key === `${'agy_session_csrf'}_token` ? csrfSecret : null),
+    },
+    fetch: async url => {
+      const method = String(url).split('/').pop();
+      const routes = {
+        GetAllCascadeTrajectories: {
+          trajectorySummaries: {
+            'conv-priv-1': {
+              trajectoryId: 'traj-priv-1',
+              stepCount: 2,
+              summary: 'PRIVATE_CHAT_TITLE_LEAK',
+              lastModifiedTime: '2026-11-20T06:00:00Z',
+              trajectoryMetadata: { workspaceUris: [secretWorkspace] },
+            },
+          },
+        },
+        GetCascadeTrajectoryGeneratorMetadata: {
+          generatorMetadata: [
+            {
+              stepIndices: [1],
+              executionId: 'exec-priv-1',
+              chatModel: {
+                responseModel: 'gemini-3.8-flash-n',
+                promptSections: [{ text: 'SECRET_SYSTEM_PROMPT_LEAK' }],
+                systemPrompt: 'SECRET_SYSTEM_PROMPT_LEAK',
+                tools: [{ name: 'bash', schema: 'SECRET_TOOL_SCHEMA' }],
+                customMetadata: { privateNote: 'SECRET_NOTE' },
+                usage: {
+                  inputTokens: '400',
+                  outputTokens: '120',
+                  cacheReadTokens: '200',
+                  responseHeader: { authorization: 'SECRET_HEADER' },
+                },
+              },
+            },
+          ],
+        },
+        GetCascadeTrajectorySteps: {
+          steps: [
+            {
+              idx: 0,
+              type: 'CORTEX_STEP_TYPE_USER_INPUT',
+              status: 'CORTEX_STEP_STATUS_DONE',
+              metadata: { createdAt: '2026-11-20T05:59:50Z' },
+              userInput: { items: [{ text: 'SECRET_USER_PROMPT_LEAK' }] },
+            },
+            {
+              idx: 1,
+              type: 'CORTEX_STEP_TYPE_PLANNER_RESPONSE',
+              status: 'CORTEX_STEP_STATUS_DONE',
+              metadata: { createdAt: '2026-11-20T05:59:55Z', executionId: 'exec-priv-1' },
+              plannerResponse: { response: 'SECRET_MODEL_REPLY_LEAK' },
+            },
+          ],
+        },
+      };
+      const body = routes[method];
+      return {
+        ok: Boolean(body),
+        status: body ? 200 : 404,
+        async json() {
+          return body ?? {};
+        },
+      };
+    },
+    AbortController,
+    Date,
+    Object,
+    Array,
+    Number,
+    String,
+    Boolean,
+    JSON,
+    Math,
+    setTimeout,
+    clearTimeout,
+  };
+
+  try {
+    const rpcClient = new SshRemoteRpcClient({
+      cdp: {
+        async evaluate(expr, contextId) {
+          assert.equal(contextId, 7);
+          return vm.runInNewContext(expr, fakeWindow);
+        },
+      },
+      getContextId: () => 7,
+    });
+    const observationStore = new RemoteAccountObservationStore({ stateDir: tempStateDir });
+    const nowMs = Date.UTC(2026, 10, 20, 6, 0, 5);
+    observationStore.recordObservation({
+      environmentId: 'ssh:demo',
+      hostLabel: 'demo-ssh-host',
+      email: 'remote-dev@example.invalid',
+      matchedLocalAccountId: 'acc-remote-1',
+      accountType: 'consumer',
+      observedAtSec: Math.floor(nowMs / 1000) - 60,
+    });
+
+    const result = await syncRemoteSessionUsage({
+      target: {
+        remoteKey: 'rk-priv',
+        hostLabel: 'demo-ssh-host',
+        environmentId: 'ssh:demo',
+        origin: 'https://127.0.0.1:44139',
+        rpcClient,
+        email: 'remote-dev@example.invalid',
+        name: 'Remote Dev',
+        accountType: 'consumer',
+        matchedLocalAccountId: 'acc-remote-1',
+        state: 'connected',
+      },
+      observationStore,
+      nowMs,
+    });
+    await observationStore.flush();
+
+    assert.equal(result.ok, true);
+    assert.equal(result.events.length, 1);
+
+    const obsPath = join(tempStateDir, 'usage-remote-observations.json');
+    const obsStat = await stat(obsPath);
+    if (process.platform !== 'win32') {
+      assert.equal(obsStat.mode & 0o777, 0o600);
+    }
+    const obsDiskContent = await readFile(obsPath, 'utf8');
+    const serialized = `${JSON.stringify(result)}\n${obsDiskContent}`;
+
+    for (const forbidden of [
+      csrfSecret,
+      'SECRET_SYSTEM_PROMPT_LEAK',
+      'SECRET_TOOL_SCHEMA',
+      'SECRET_NOTE',
+      'SECRET_HEADER',
+      'PRIVATE_CHAT_TITLE_LEAK',
+      'SECRET_USER_PROMPT_LEAK',
+      'SECRET_MODEL_REPLY_LEAK',
+      secretWorkspace,
+      'promptSections',
+      'systemPrompt',
+    ]) {
+      assert.equal(serialized.includes(forbidden), false, `同步产物与观测落盘不得包含 ${forbidden}`);
+    }
+    assert.deepEqual(scanContentForPrivacy(serialized, 'state/usage-remote-observations.json'), []);
+  } finally {
+    await rm(tempStateDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 

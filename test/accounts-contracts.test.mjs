@@ -81,7 +81,11 @@ async function accountFile(dir, id) {
 
 // ---------- D02 删除复活 ----------
 
-test('D02: 账号删除受阻保留原文件与恢复日志，权限恢复后完整对账', async () => {
+test('D02: 账号删除受阻保留原文件与恢复日志，权限恢复后完整对账', async t => {
+  if (process.platform === 'win32') {
+    t.skip('Windows NTFS ignores POSIX chmod(0o500) directory unlink blocking');
+    return;
+  }
   const dir = await sandbox('gb-p2-delete-fail-');
   const accountsDir = join(dir, 'accounts');
   try {
@@ -299,6 +303,45 @@ test('读取损坏账号明确失败，原件及索引不被当作不存在清�
   await assert.rejects(manager.getAccount(account.id),/格式损坏/);
   assert.equal(await readFile(file,'utf8'),'{broken');
   assert.equal((await manager.loadIndex()).accounts[0].id,account.id);
+});
+
+test('P1-39 & P1-41: 损坏账号文件可正常删除并归档；decodeTopicRow 遇到前置非 field 1 字段仍能前向兼容解码', async t => {
+  const dir = await fixture(t);
+  const manager = new AccountsManager(dir);
+  const account = await manager.upsertAccount({ email: 'corrupt-del@example.invalid', refreshToken: 'synthetic-refresh' });
+  const file = join(dir, 'accounts', `${account.id}.json`);
+  await writeFile(file, '{broken-json');
+
+  // 损坏的账号文件删除时不得因 JSON.parse 抛 SyntaxError 而卡死
+  const deleted = await manager.deleteAccount(account.id);
+  assert.equal(deleted, true);
+  assert.equal((await manager.loadIndex()).accounts.length, 0);
+  const { readdir } = await import('node:fs/promises');
+  const removedCopies = await readdir(join(dir, 'accounts-removed'));
+  assert.equal(removedCopies.length, 1);
+  const archived = JSON.parse(await readFile(join(dir, 'accounts-removed', removedCopies[0]), 'utf8'));
+  assert.deepEqual(archived.account, { parseError: true, redacted: true });
+
+  // P1-41: decodeTopicRow 面对前置 wire type 0 / 1 / 5 / 2 (非 field 1) 字段仍能跳过并提取目标 sentinel
+  const { decodeTopicRow } = await import('../dist/account-state.js');
+  const { ProtobufWriter } = await import('../dist/protobuf.js');
+  const targetPayload = Buffer.from('forward-compat-payload', 'utf8');
+  const rowMsg = ProtobufWriter.encodeString(1, targetPayload.toString('base64'));
+  const targetEntry = ProtobufWriter.encodeLengthDelimited(
+    1,
+    Buffer.concat([ProtobufWriter.encodeString(1, 'oauthTokenInfoSentinelKey'), ProtobufWriter.encodeLengthDelimited(2, rowMsg)])
+  );
+  // 构造前置未知字段：field 2 varint (tag 16), field 3 fixed64 (tag 25), field 4 fixed32 (tag 37), field 5 length-delimited (tag 42)
+  const leadingUnknown = Buffer.concat([
+    ProtobufWriter.encodeVarintField(2, 42),
+    Buffer.from([25, 1, 2, 3, 4, 5, 6, 7, 8]),
+    Buffer.from([37, 1, 2, 3, 4]),
+    ProtobufWriter.encodeString(5, 'ignored-other-field'),
+  ]);
+  const combinedB64 = Buffer.concat([leadingUnknown, targetEntry]).toString('base64');
+  const decoded = decodeTopicRow(combinedB64, 'oauthTokenInfoSentinelKey');
+  assert.ok(decoded, 'decodeTopicRow 必须跳过前置非 field 1 字段并解出目标载荷');
+  assert.equal(decoded.toString('utf8'), 'forward-compat-payload');
 });
 });
 
@@ -950,15 +993,22 @@ test('v1.1.3 Issue #20: JSON 批量导入、嵌套 token 解析、过期时间�
     current_account_id: 'idx-1',
   }));
 
-  // 3. 构造符号链接（必须被安全护栏跳过）
+  // 3. 构造符号链接（必须被安全护栏跳过；Windows 非提权无法创建文件 symlink 时不中断后续闭环验证）
   const symlinkPath = join(srcDir, 'symlink-account.json');
-  await fs.promises.symlink(externalCollisionFile, symlinkPath);
+  let createdSymlink = false;
+  try {
+    await fs.promises.symlink(externalCollisionFile, symlinkPath);
+    createdSymlink = true;
+  } catch (err) {
+    if (process.platform !== 'win32' || err?.code !== 'EPERM') throw err;
+  }
 
-  const importRes = await mgr.importAccountsFromJson([externalCollisionFile, batchFolder, symlinkPath]);
+  const importTargets = createdSymlink ? [externalCollisionFile, batchFolder, symlinkPath] : [externalCollisionFile, batchFolder];
+  const importRes = await mgr.importAccountsFromJson(importTargets);
   assert.equal(importRes.imported, 2, '应成功导入 2 个新账号');
   assert.equal(importRes.updated, 0, '外部 ID 碰撞不得覆盖已有不同邮箱账号');
   assert.equal(importRes.expiredWithoutRefreshConfig, 1, '应准确统计已过期且未配置后台刷新凭据的账号数量');
-  assert.ok(importRes.skipped.length >= 3, '损坏文件、缺 refresh_token 记录与符号链接均应计入 skipped');
+  assert.ok(importRes.skipped.length >= (createdSymlink ? 3 : 2), '损坏文件、缺 refresh_token 记录与符号链接均应计入 skipped');
   const importResText = JSON.stringify(importRes);
   assert.ok(!importResText.includes('1//refresh-'), '导入汇总结果严禁包含任何 refresh_token');
   assert.ok(!importResText.includes('ya29.'), '导入汇总结果严禁包含任何 access_token');
@@ -1001,7 +1051,9 @@ test('v1.1.3 Issue #20: JSON 批量导入、嵌套 token 解析、过期时间�
   assert.ok(!JSON.stringify(exportRes).includes('1//refresh-'), '导出 IPC 返回值不得包含凭据');
 
   const st = await fs.promises.lstat(backupPath);
-  assert.equal(st.mode & 0o777, 0o600, '导出的备份文件权限必须严格为 0600');
+  if (process.platform !== 'win32') {
+    assert.equal(st.mode & 0o777, 0o600, '导出的备份文件权限必须严格为 0600');
+  }
   const rawBackup = JSON.parse(await readFile(backupPath, 'utf8'));
   assert.equal(rawBackup.schema, 'gravitybox.accounts.backup');
   assert.equal(rawBackup.version, '1.0');

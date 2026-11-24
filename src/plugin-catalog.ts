@@ -1,7 +1,7 @@
-import { constants } from 'node:fs';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 import { bt } from './i18n.js';
+import { safeOpenFlagsNoFollow } from './platform/index.js';
 
 export type PluginText = { id: string; name: string; description: string; source: 'installed-manifest' | 'marketplace-view' | 'installed-view'; truncated: boolean; onlineEligible: false };
 export type PluginCatalog = { entries: PluginText[]; inspectedFiles: number; skipped: number; limited: boolean; notes: string[] };
@@ -39,7 +39,7 @@ export async function readPluginCatalog(root: string, signal: AbortSignal): Prom
       const parent=await realpath(join(base,entry.name)),rel=relative(base,parent);
       if(!rel||rel.startsWith('..'+sep)||rel==='..')throw new Error();
       const info=await lstat(path);if(info.isSymbolicLink()||!info.isFile()||info.size>262144)throw new Error();
-      handle=await open(path,constants.O_RDONLY|constants.O_NOFOLLOW);const stat=await handle.stat();
+      handle=await open(path,safeOpenFlagsNoFollow());const stat=await handle.stat();
       if(stat.ino!==info.ino||stat.dev!==info.dev||stat.size>262144)throw new Error();
       const buffer=Buffer.alloc(stat.size+1);const {bytesRead}=await handle.read(buffer,0,buffer.length,0);if(bytesRead>262144)throw new Error();signal.throwIfAborted();
       catalog.inspectedFiles++;const value=pluginDisplay(JSON.parse(buffer.subarray(0,bytesRead).toString()),entry.name);if(value)catalog.entries.push(value);else catalog.skipped++;

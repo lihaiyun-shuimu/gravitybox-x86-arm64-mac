@@ -299,10 +299,10 @@ enum QuotaPresentation {
         }
 
         func iconName(for window: GroupWindow) -> String {
-            if isStandalone { return "sparkles" }
+            if isStandalone { return "hexagon" }
             if window.period == "weekly" || window.id == "weekly" { return "calendar" }
             if window.period == "daily" || window.id == "daily" { return "clock" }
-            if key == "claude" { return "cpu" }
+            if key == "claude" { return "hourglass" }
             return "bolt.fill"
         }
     }
@@ -776,7 +776,10 @@ enum QuotaPresentation {
     static func contract(_ raw: [String: Any]) -> Contract {
         var result = Contract()
         let rawStandbyMode = text(dict(raw["standbyRefreshStatus"])?["mode"])
-        let standbyMode: String? = rawStandbyMode.isEmpty ? nil : rawStandbyMode
+        let activeRemoteIds = (raw["activeRemoteEnvIds"] as? [String]) ?? []
+        let sourceEnvId = text(raw["quotaSourceEnvironmentId"])
+        let hasRemoteSource = !activeRemoteIds.isEmpty || (!sourceEnvId.isEmpty && sourceEnvId != "local")
+        let standbyMode: String? = (rawStandbyMode.isEmpty || hasRemoteSource) ? nil : rawStandbyMode
         result.standbyMode = standbyMode
         let nested = dict(raw["quota"])
         let quotaGroupsRaw = (raw["quotaGroups"] as? [[String: Any]]) ?? nested.flatMap { $0["quotaGroups"] as? [[String: Any]] }
@@ -1350,8 +1353,8 @@ enum QuotaPresentation {
         // 2. Fall back to visible non-orchestrator models belonging to the Gemini group
         let nested = dict(activeAccount["quota"])
         let rawModels = (activeAccount["models"] as? [[String: Any]]) ?? (nested?["models"] as? [[String: Any]]) ?? []
-        var names: [String] = ["Argon", "Carbon"].filter { !isStandaloneCandidate($0) }
-        var seen = Set(names.map { $0.lowercased() })
+        var names: [String] = []
+        var seen = Set<String>()
         for m in rawModels {
             let rawId = (m["model_id"] as? String ?? (m["name"] as? String ?? "")).trimmingCharacters(in: .whitespacesAndNewlines)
             let displayName = (m["display_name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1381,7 +1384,7 @@ enum QuotaPresentation {
             seen.insert(lower)
             names.append(label)
         }
-        return names.isEmpty ? ["Argon", "Carbon"] : names
+        return names
     }
 
     private static func formatJoinedModelList(_ names: [String]) -> String {
@@ -1407,6 +1410,9 @@ enum QuotaPresentation {
             }
             if profile.isUltra {
                 let pooledNames = pooledUltraGeminiModelNames(activeAccount)
+                if pooledNames.isEmpty {
+                    return L10n.t("policy.row.monitored.sub.ultra_all_generic", fallback: "同时监测当前 Ultra 账号的 Gemini 与 Claude/GPT 配额池")
+                }
                 if pooledNames == ["Argon", "Carbon"] {
                     return L10n.t("policy.row.monitored.sub.ultra_all", fallback: "同时监测 Gemini（已含 Argon / Carbon）与 Claude/GPT 配额池")
                 }
@@ -1431,6 +1437,9 @@ enum QuotaPresentation {
             }
             if profile.isUltra {
                 let pooledNames = pooledUltraGeminiModelNames(activeAccount)
+                if pooledNames.isEmpty {
+                    return L10n.t("policy.row.monitored.sub.ultra_gemini_generic", fallback: "仅监测当前 Ultra 账号的 Gemini 共享配额池")
+                }
                 if pooledNames == ["Argon", "Carbon"] {
                     return L10n.t("policy.row.monitored.sub.ultra_gemini", fallback: "Ultra 套餐已将 Argon 与 Carbon 并入此共享池，一并监测")
                 }

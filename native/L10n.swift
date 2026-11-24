@@ -51,6 +51,7 @@ final class L10n {
                 let hasDict = (metaObj["hasTargetDictionary"] as? Bool) ?? false
                 let backendStrings = (root["backend"] as? [String: String]) ?? [:]
                 let appStrings = (root["app"] as? [String: String]) ?? [:]
+                // 命名空间合并优先级：以 `backend` 为基底，`app` 中的同名 key 覆盖 `backend`，确保原生前端文案优先。
                 let mergedStrings = backendStrings.merging(appStrings) { _, appVal in appVal }
                 loaded[code] = AppLocalePack(
                     meta: AppLocaleMeta(code: code, nativeName: nativeName, fallback: fallback, hasTargetDictionary: hasDict),

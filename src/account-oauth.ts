@@ -3,6 +3,7 @@ import { randomBytes, randomUUID, createHash, timingSafeEqual } from 'node:crypt
 import { getGoogleClientId, getGoogleClientSecret } from './accounts.js';
 import { accountErrorCode, CodedAccountError } from './account-quota.js';
 import { bt } from './i18n.js';
+import { resolveOutboundFetch } from './proxy.js';
 
 type LoginPhase = 'waiting' | 'exchanging' | 'saving' | 'succeeded' | 'failed' | 'cancelled' | 'expired';
 type Tokens = { access_token: string; refresh_token: string; expires_in?: number; id_token?: string };
@@ -63,7 +64,8 @@ export class GoogleAccountLogin {
   }
   private async exchange(s: Session, code: string) {
     try {
-      const reply = await this.fetchImpl('https://oauth2.googleapis.com/token', { method: 'POST', signal: AbortSignal.any([s.controller.signal, AbortSignal.timeout(15000)]), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: getGoogleClientId(), client_secret: getGoogleClientSecret(), code, code_verifier: s.verifier, redirect_uri: s.redirect, grant_type: 'authorization_code' }).toString() });
+      const outboundFetch = resolveOutboundFetch(this.fetchImpl);
+      const reply = await outboundFetch('https://oauth2.googleapis.com/token', { method: 'POST', signal: AbortSignal.any([s.controller.signal, AbortSignal.timeout(15000)]), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: getGoogleClientId(), client_secret: getGoogleClientSecret(), code, code_verifier: s.verifier, redirect_uri: s.redirect, grant_type: 'authorization_code' }).toString() });
       if (!reply.ok) throw new CodedAccountError('oauth_incomplete', bt('oauth.err.incomplete'));
       const token = await reply.json() as Tokens;
       if (!token.access_token || !token.refresh_token || typeof token.access_token !== 'string' || typeof token.refresh_token !== 'string') throw new CodedAccountError('oauth_no_credentials', bt('oauth.err.no_credentials'));

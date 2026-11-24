@@ -31,30 +31,12 @@ import {
   readValidLiveIdeModelsSnapshot,
   sanitizeLiveIdeModelsSnapshot,
 } from '../dist/main.js';
+import { sendBackendRpc, stopBackendChild } from './test-ipc.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function rpc(directory, payload, timeoutMs = 8000) {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
-    let value = '';
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error('IPC 超时'));
-    }, timeoutMs);
-    const finish = (err) => {
-      clearTimeout(timer);
-      socket.destroy();
-      if (err) reject(err);
-      else resolve(JSON.parse(value.split('\n')[0]));
-    };
-    socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'));
-    socket.on('data', (chunk) => {
-      value += chunk;
-      if (value.includes('\n')) finish();
-    });
-    socket.on('error', finish);
-  });
+  return sendBackendRpc(directory, payload, { timeoutMs });
 }
 
 async function startBackend(directory, appPath) {
@@ -97,12 +79,13 @@ test('资产与别名映射：ACTIVE_MODEL_KEYS / FEED_MODEL_KEYS 结构不变�
     'gemini-3.8-flash',
     'claude-opus-5-5',
     'claude-sonnet-5-5',
-    'gpt-oss-120b',
   ];
   assert.ok(ACTIVE_MODEL_KEYS.length >= BASELINE_ACTIVE_MODELS.length);
   assert.equal(new Set(ACTIVE_MODEL_KEYS).size, ACTIVE_MODEL_KEYS.length, 'ACTIVE_MODEL_KEYS 不得包含重复项');
   assert.equal(new Set(FEED_MODEL_KEYS).size, FEED_MODEL_KEYS.length, 'FEED_MODEL_KEYS 不得包含重复项');
-  assert.ok(FEED_MODEL_KEYS.length >= ACTIVE_MODEL_KEYS.length && FEED_MODEL_KEYS.length >= 21);
+  assert.ok(FEED_MODEL_KEYS.length >= ACTIVE_MODEL_KEYS.length && FEED_MODEL_KEYS.length >= 20);
+  assert.equal(ACTIVE_MODEL_KEYS.includes('gpt-oss-120b'), false, '无官方统一来源的 gpt-oss-120b 不得作为默认已定价活跃模型');
+  assert.equal(DEFAULT_API_PRICES['gpt-oss-120b'], undefined, 'DEFAULT_API_PRICES 不得包含无来源的 gpt-oss-120b 默认费率');
   for (const baseKey of BASELINE_ACTIVE_MODELS) {
     assert.ok(ACTIVE_MODEL_KEYS.includes(baseKey), `ACTIVE_MODEL_KEYS 必须包含基线模型 ${baseKey}`);
   }
@@ -159,7 +142,6 @@ test('Live ULTRA：活跃模型与已下架模型随目录不变式归类 + orch
     'gemini-3.8-flash',
     'claude-opus-5-5',
     'claude-sonnet-5-5',
-    'gpt-oss-120b',
   ]);
   const extraActiveModels = ACTIVE_MODEL_KEYS.filter((k) => !baselineCovered.has(k)).map((id) => ({
     model_id: id,
@@ -196,7 +178,9 @@ test('Live ULTRA：活跃模型与已下架模型随目录不变式归类 + orch
 
   assert.equal(Object.keys(snap.prices).length, ACTIVE_MODEL_KEYS.length);
   assert.equal(Object.keys(snap.retiredPrices).length, FEED_MODEL_KEYS.length - ACTIVE_MODEL_KEYS.length);
-  assert.deepEqual(snap.unpricedLiveModels, []);
+  assert.equal(snap.prices['gpt-oss-120b'], undefined, '无来源 gpt-oss-120b 不得进入已定价集合');
+  assert.deepEqual(snap.unpricedLiveModels.map(m => m.key), ['gpt-oss-120b']);
+  assert.equal(snap.unpricedLiveModels[0].displayName, 'GPT-OSS 120B');
   for (const activeKey of ACTIVE_MODEL_KEYS) {
     assert.ok(snap.prices[activeKey], `prices 应包含 ${activeKey}`);
     assert.equal(snap.retiredPrices[activeKey], undefined, `retiredPrices 不得重复包含 ${activeKey}`);
@@ -216,7 +200,9 @@ test('Live ULTRA：活跃模型与已下架模型随目录不变式归类 + orch
   }
   const allPriceKeys = [...Object.keys(snap.prices), ...Object.keys(snap.retiredPrices)];
   assert.equal(Object.keys(snap.pricingStatus).length, allPriceKeys.length);
-  assert.equal(Object.keys(snap.modelCatalogState).length, allPriceKeys.length);
+  assert.equal(Object.keys(snap.modelCatalogState).length, allPriceKeys.length + snap.unpricedLiveModels.length);
+  assert.equal(snap.pricingStatus['gpt-oss-120b'], undefined);
+  assert.equal(snap.modelCatalogState['gpt-oss-120b']?.availability, 'unpriced_live');
 });
 
 test('PRO 套餐：gemini-4-carbon-disabled 归类为 tier_locked；account_cloud 缺失活跃模型同样判定 tier_locked', () => {
@@ -239,7 +225,6 @@ test('PRO 套餐：gemini-4-carbon-disabled 归类为 tier_locked；account_clou
   assert.equal(livePro.modelCatalogState['gemini-4-argon']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gemini-4-argon'));
   assert.equal(livePro.modelCatalogState['gemini-4-neon']?.availability, 'available');
   assert.equal(livePro.modelCatalogState['gemini-4-neon']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gemini-4-neon'));
-  assert.equal(livePro.modelCatalogState['gpt-oss-120b']?.hostOrder, ACTIVE_MODEL_KEYS.indexOf('gpt-oss-120b'));
 
   const cloudPro = resolvePricingCatalogSnapshot({
     rawPricingTable: DEFAULT_API_PRICES,
@@ -592,7 +577,7 @@ test('live-ide-models.json 脱敏持久化、appVersion 失效判定与 main.js 
       else backend.child.once('exit', resolve);
     });
   } finally {
-    if (backend.child.exitCode === null) backend.child.kill('SIGTERM');
+    await stopBackendChild(backend.child);
     await new Promise((resolve) => feedServer.close(resolve));
   }
 });
@@ -1177,7 +1162,7 @@ test('main.js 后端启动预热 remote_pricing.json、默认关闭静默外联�
       else backend.child.once('exit', resolve);
     });
   } finally {
-    if (backend.child.exitCode === null) backend.child.kill('SIGTERM');
+    await stopBackendChild(backend.child);
     await new Promise((resolve) => feedServer.close(resolve));
   }
 });
@@ -1224,4 +1209,334 @@ test('autoHealUnpricedHistory 仅计入实际获得有效新定价的记录，�
   // 再次执行时无新定价落锁，应精确返回 0
   const healedAgain = await mgr.autoHealUnpricedHistory();
   assert.equal(healedAgain, 0, '仍未定价模型不得重复虚报补齐数量');
+});
+
+test('P1-7 #3: syncRemotePricing 在 unchanged: true 时按 force/首次检查触发历史自愈，有补齐才刷新 revision 与 hook', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-sync-unchanged-heal-'));
+  t.after(async () => {
+    resetAndRegisterRemoteModelMetadata({});
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  const convDir = join(dir, 'antigravity', 'conversations');
+  await mkdir(convDir, { recursive: true });
+  const nowSec = Math.floor(Date.now() / 1000) - 60;
+  const mkBlob = (modelId, inputTok, outputTok) => ProtobufWriter.encodeLengthDelimited(
+    1,
+    Buffer.concat([
+      ProtobufWriter.encodeString(19, modelId),
+      ProtobufWriter.encodeLengthDelimited(4, Buffer.concat([
+        ProtobufWriter.encodeVarintField(2, inputTok),
+        ProtobufWriter.encodeVarintField(3, outputTok),
+      ])),
+      ProtobufWriter.encodeLengthDelimited(9, ProtobufWriter.encodeLengthDelimited(4, ProtobufWriter.encodeVarintField(1, nowSec))),
+    ])
+  );
+  const db = new DatabaseSync(join(convDir, 'unchanged-heal.db'));
+  try {
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);');
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);');
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, mkBlob('unpriced-future-gamma', 1_000_000, 0));
+  } finally {
+    db.close();
+  }
+
+  const feedBody = {
+    version: '2026-11-22',
+    updatedAt: '2026-11-22T00:00:00Z',
+    prices: {
+      'unpriced-future-gamma': { model: 'unpriced-future-gamma', input: 4.0, output: 16.0, cached: 0.4 },
+    },
+  };
+  const srv = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"etag-gamma-1"' });
+    res.end(JSON.stringify(feedBody));
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  const feedUrl = `http://127.0.0.1:${srv.address().port}/feed.json`;
+  t.after(() => new Promise((resolve) => srv.close(resolve)));
+
+  // 1) 先在无远端定价时扫描历史 DB，使账本存在 1 条未定价历史记录
+  const mgrBeforeSync = new UsageStatsManager({ geminiDir: dir, stateDir: dir, remotePricingUrl: feedUrl, fallbackPricingUrls: [] });
+  const before = await mgrBeforeSync.getUsageSummary(true);
+  assert.equal(before.all_time.estimated_usd, 0);
+  assert.equal(before.all_time.unpriced_models, 1);
+
+  // 2) 在隔离目录完成一次远端同步，将 remote_pricing.json 与 pricing-sync-status.json 复制到 dir，
+  //    模拟“远端缓存与状态已同步、但历史账本尚未触发自愈”的边界场景（后续请求必命中 unchanged: true）
+  const syncSeedDir = join(dir, 'sync-seed');
+  await mkdir(syncSeedDir, { recursive: true });
+  const mgrSeed = new UsageStatsManager({ geminiDir: syncSeedDir, stateDir: syncSeedDir, remotePricingUrl: feedUrl, fallbackPricingUrls: [] });
+  const seedRes = await mgrSeed.syncRemotePricing(feedUrl, true);
+  assert.equal(seedRes.synced, true);
+  assert.equal(seedRes.unchanged, false);
+  const remoteCache = JSON.parse(await readFile(join(syncSeedDir, 'remote_pricing.json'), 'utf8'));
+  remoteCache.syncedAt = new Date(Date.now() - 86_400_001).toISOString();
+  await writeFile(join(dir, 'remote_pricing.json'), JSON.stringify(remoteCache));
+  const syncStatus = JSON.parse(await readFile(join(syncSeedDir, 'pricing-sync-status.json'), 'utf8'));
+  syncStatus.lastCheckAt = Date.now() - 86_400_001;
+  await writeFile(join(dir, 'pricing-sync-status.json'), JSON.stringify(syncStatus));
+
+  const mgr = new UsageStatsManager({ geminiDir: dir, stateDir: dir, remotePricingUrl: feedUrl, fallbackPricingUrls: [] });
+  const hookEvents = [];
+  mgr.setOnPricingUpdated((info) => hookEvents.push(info));
+  const revBefore = mgr.getPricingRevision();
+
+  // 3) 首次非强制检查命中 unchanged: true，应执行首次自愈并更新 revision 与 hook
+  const firstUnchanged = await mgr.syncRemotePricing(feedUrl, false);
+  assert.equal(firstUnchanged.synced, true);
+  assert.equal(firstUnchanged.unchanged, true);
+  assert.equal(firstUnchanged.healedCount, 1);
+  assert.notEqual(mgr.getPricingRevision(), revBefore);
+  assert.equal(hookEvents.length, 1);
+  assert.equal(hookEvents[0].healedCount, 1);
+  const summaryAfterFirst = await mgr.getUsageSummary(false);
+  assert.equal(summaryAfterFirst.all_time.estimated_usd, 4.0);
+  assert.equal(summaryAfterFirst.all_time.unpriced_models, 0);
+
+  // 4) 非首次且非强制检查即使恢复冷却窗口也直接跳过重复自愈（不递增 revision、不触发 hook）
+  const revAfterFirst = mgr.getPricingRevision();
+  const lockKeys = Object.keys(mgr.rateLocks);
+  assert.equal(lockKeys.length, 1);
+  mgr.nextAutoSyncAt = 0;
+  mgr.rateLocks[lockKeys[0]] = {
+    usd: 0,
+    price: { model: 'unpriced-future-gamma', input: 0, output: 0, cached: 0 },
+  };
+  const secondNonForced = await mgr.syncRemotePricing(feedUrl, false);
+  assert.equal(secondNonForced.synced, true);
+  assert.equal(secondNonForced.unchanged, true);
+  assert.equal(secondNonForced.healedCount, 0);
+  assert.equal(mgr.getPricingRevision(), revAfterFirst);
+  assert.equal(hookEvents.length, 1);
+
+  // 5) 同一实例在 unchangedHealChecked 已为 true 后，force === true 仍会执行自愈并更新 revision 与 hook
+  const forcedHealRes = await mgr.syncRemotePricing(feedUrl, true);
+  assert.equal(forcedHealRes.synced, true);
+  assert.equal(forcedHealRes.unchanged, true);
+  assert.equal(forcedHealRes.healedCount, 1);
+  assert.notEqual(mgr.getPricingRevision(), revAfterFirst);
+  assert.equal(hookEvents.length, 2);
+
+  // 6) 全部已落锁后再次 force === true 且 unchanged: true，healedCount 为 0 且 revision 不再变化
+  const revAfterForced = mgr.getPricingRevision();
+  const forcedNoop = await mgr.syncRemotePricing(feedUrl, true);
+  assert.equal(forcedNoop.synced, true);
+  assert.equal(forcedNoop.unchanged, true);
+  assert.equal(forcedNoop.healedCount, 0);
+  assert.equal(mgr.getPricingRevision(), revAfterForced);
+  assert.equal(hookEvents.length, 2);
+});
+
+test('P1-11 & P1-15: 损坏远端价格缓存自动跳过 ETag/SHA-256 自愈重写；2 位数 Claude 版本、10M 容量与非四大族变体折叠', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-p1-11-cache-heal-'));
+  t.after(async () => {
+    resetAndRegisterRemoteModelMetadata({});
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const feedBody = JSON.stringify({
+    version: '2026-11-22',
+    updatedAt: '2026-11-22T12:00:00Z',
+    prices: {
+      'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.2 },
+    },
+  });
+  const seenIfNoneMatch = [];
+  const srv = createServer((req, res) => {
+    seenIfNoneMatch.push(req.headers['if-none-match'] ?? null);
+    if (req.headers['if-none-match'] === '"v-heal"') {
+      res.writeHead(304, { etag: '"v-heal"' });
+      res.end();
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json', etag: '"v-heal"' });
+    res.end(feedBody);
+  });
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => srv.close(resolve)));
+  const port = srv.address().port;
+  const feedUrl = `http://127.0.0.1:${port}/feed.json`;
+
+  const { executeRemotePricingSync } = await import('../dist/usage-pricing.js');
+  const { normalizeModelId } = await import('../dist/model-identity.js');
+  const { getRemoteModelSpec } = await import('../dist/model-catalog.js');
+  const remoteCachePath = join(dir, 'remote_pricing.json');
+  const syncStatePath = join(dir, 'pricing-sync.json');
+  const state = {
+    lastRemoteSyncAt: 0,
+    lastSyncSuccess: false,
+    lastCheckAt: 0,
+    lastCheckSuccess: false,
+    nextAutoSyncAt: 0,
+    lastSyncError: null,
+    lastSyncedVersion: '',
+    lastSyncedUpdatedAt: '',
+    lastSyncedSourceUrl: '',
+    lastSyncedEtag: '',
+    lastSyncedSha256: '',
+  };
+
+  // 1) 首次同步写入有效缓存
+  const first = await executeRemotePricingSync({
+    candidateUrls: [feedUrl],
+    remotePricingCachePath: remoteCachePath,
+    pricingSyncStatePath: syncStatePath,
+    state,
+    now: Date.parse('2026-11-22T12:00:00Z'),
+  });
+  assert.equal(first.synced, true);
+  assert.equal(first.unchanged, false);
+
+  // 2) 模拟磁盘缓存损坏（截断 JSON），下次非强制同步不得发送 If-None-Match 也不得走 SHA-256 跳过，应自动重写自愈
+  await writeFile(remoteCachePath, '{"version":1,"prices":INVALID', 'utf8');
+  const healed = await executeRemotePricingSync({
+    candidateUrls: [feedUrl],
+    remotePricingCachePath: remoteCachePath,
+    pricingSyncStatePath: syncStatePath,
+    state,
+    now: Date.parse('2026-11-22T13:00:00Z'),
+    force: false,
+  });
+  assert.equal(seenIfNoneMatch[1], null, '缓存损坏时不得发送 If-None-Match');
+  assert.equal(healed.synced, true);
+  assert.equal(healed.unchanged, false, '损坏缓存自愈重写后 unchanged 应为 false');
+  const repaired = JSON.parse(await readFile(remoteCachePath, 'utf8'));
+  assert.equal(repaired.prices['gemini-4-carbon'].input, 2.0);
+
+  // 3) 缓存含非法 prices 结构时同样视为无效并自愈
+  await writeFile(remoteCachePath, JSON.stringify({ version: 1, prices: { bad: { model: 'bad', input: -1, output: 1, cached: 0 } } }), 'utf8');
+  const healedBadPrices = await executeRemotePricingSync({
+    candidateUrls: [feedUrl],
+    remotePricingCachePath: remoteCachePath,
+    pricingSyncStatePath: syncStatePath,
+    state,
+    now: Date.parse('2026-11-22T14:00:00Z'),
+    force: false,
+  });
+  assert.equal(seenIfNoneMatch[2], null, 'prices 非法时不得发送 If-None-Match');
+  assert.equal(healedBadPrices.unchanged, false);
+
+  // 4) force: true 不发 If-None-Match 且重刷磁盘，同时对有效且同 SHA-256 缓存仍保留 unchanged: true 语义
+  const forced = await executeRemotePricingSync({
+    candidateUrls: [feedUrl],
+    remotePricingCachePath: remoteCachePath,
+    pricingSyncStatePath: syncStatePath,
+    state,
+    now: Date.parse('2026-11-22T15:00:00Z'),
+    force: true,
+  });
+  assert.equal(seenIfNoneMatch[3], null, 'force 刷新不得发送 If-None-Match');
+  assert.equal(forced.synced, true);
+  assert.equal(forced.unchanged, true);
+
+  // P1-15: 2 位数 Claude 版本归一化、10M 远端容量上限、非四大族未定价思考变体折叠
+  assert.equal(normalizeModelId('claude-10.0-sonnet'), 'claude-sonnet-10-0');
+  resetAndRegisterRemoteModelMetadata({
+    models: { 'gemini-10-nova': { displayName: 'Gemini 10 Nova', capacityTokens: 5_000_000 } },
+  });
+  assert.equal(getRemoteModelSpec('gemini-10-nova')?.capacityTokens, 5_000_000);
+
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: {},
+    live: {
+      tier: 'PRO',
+      models: [
+        { model_id: 'deepseek-r2-high', display_name: 'DeepSeek R2 (High)' },
+        { model_id: 'deepseek-r2-low', display_name: 'DeepSeek R2 (Low)' },
+      ],
+    },
+  });
+  const deepseekEntry = snap.unpricedLiveModels.find((m) => m.key === 'deepseek-r2');
+  assert.ok(deepseekEntry, '非四大族未定价思考变体应折叠归并至基模型 deepseek-r2');
+  assert.deepEqual(deepseekEntry.variants, ['Low', 'High']);
+
+  // P2-5: 远端 pricing-feed.json 显式拒收不兼容 schema（如 schema: 2）
+  const badSchemaSrv = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      schema: 2,
+      version: '2026-11-23',
+      prices: { 'gemini-4-carbon': { model: 'gemini-4-carbon', input: 2.0, output: 10.0, cached: 0.2 } },
+    }));
+  });
+  await new Promise((resolve) => badSchemaSrv.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => badSchemaSrv.close(resolve)));
+  const badSchemaRes = await executeRemotePricingSync({
+    candidateUrls: [`http://127.0.0.1:${badSchemaSrv.address().port}/bad-schema.json`],
+    remotePricingCachePath: join(dir, 'bad-schema-cache.json'),
+    pricingSyncStatePath: join(dir, 'bad-schema-state.json'),
+    state: { ...state, lastSyncedVersion: '', lastSyncedSha256: '', lastSyncedEtag: '' },
+    now: Date.parse('2026-11-23T00:00:00Z'),
+  });
+  assert.equal(badSchemaRes.synced, false, '不兼容 schema !== 1 的远端定价包必须被显式拒收');
+});
+
+test('P0-06 & P1-14: gpt-oss-120b 新事件保持未定价且旧锁价保留原出处；gemini-2.5-pro 在 200K 边界精确触发长上下文阶梯', async (t) => {
+  const { resolvePricingFromTable, calculateEstimatedUsd } = await import('../dist/pricing.js');
+  const { UsageLedger } = await import('../dist/usage-ledger.js');
+  const { MODEL_NAMES, MODEL_CAPACITIES } = await import('../dist/model-catalog.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+
+  assert.equal(MODEL_NAMES['gpt-oss-120b'], 'GPT-OSS 120B');
+  assert.equal(MODEL_CAPACITIES['gpt-oss-120b'], 128000);
+  assert.equal(resolvePricingFromTable(DEFAULT_API_PRICES, 'gpt-oss-120b', 1_760_000_000), null);
+
+  const dir = await mkdtemp(join(tmpdir(), 'gb-oss-unpriced-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const ledger = new UsageLedger(dir);
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // 1) 新事件保留 Token 且不生成默认美元金额
+  await ledger.save([{
+    event_key: 'ev-oss-new-1',
+    source_id: 'src-oss',
+    generation_index: 0,
+    model: 'gpt-oss-120b',
+    input_tokens: 10000,
+    output_tokens: 2000,
+    cached_tokens: 5000,
+    total_tokens: 17000,
+    timestamp_seconds: nowSec,
+  }], { billingPrices: DEFAULT_API_PRICES });
+  const agg = await ledger.aggregate({ prices: DEFAULT_API_PRICES, accounts: [], now: nowSec });
+  assert.equal(agg.all_time.totals.total_tokens, 17000);
+  assert.equal(agg.all_time.estimated_usd, 0);
+  assert.equal(agg.all_time.unpriced_models, 1);
+
+  // 2) 旧锁价保留原 provenance（不会随默认目录移除而丢出处）
+  const legacyProv = { sourceUrl: 'https://custom.local/oss', platform: 'Self-hosted', verification: 'user' };
+  await ledger.save([{
+    event_key: 'ev-oss-legacy-lock',
+    source_id: 'src-oss-old',
+    generation_index: 0,
+    model: 'gpt-oss-120b',
+    input_tokens: 1_000_000,
+    output_tokens: 0,
+    cached_tokens: 0,
+    total_tokens: 1_000_000,
+    timestamp_seconds: nowSec - 100,
+  }], { billingPrices: { 'gpt-oss-120b': { model: 'gpt-oss-120b', input: 0.15, output: 0.6, cached: 0.075, provenance: legacyProv } } });
+  const { DatabaseSync } = await import('node:sqlite');
+  const dbCheck = new DatabaseSync(ledger.path, { readOnly: true });
+  try {
+    const row = dbCheck.prepare('SELECT unit_price, usd FROM rate_locks WHERE event_key = ?').get('ev-oss-legacy-lock');
+    assert.ok(row);
+    const unitPrice = JSON.parse(row.unit_price);
+    assert.equal(unitPrice.input, 0.15);
+    assert.deepEqual(unitPrice.provenance, legacyProv);
+    assert.ok(Math.abs(row.usd - 0.15) < 1e-9);
+  } finally {
+    dbCheck.close();
+  }
+
+  // 3) gemini-2.5-pro 200000 vs 200001 Token 边界
+  const baseCost = calculateEstimatedUsd(200_000, 100_000, 0, DEFAULT_API_PRICES['gemini-2.5-pro']);
+  // 200K * 1.25/1M + 100K * 10/1M = 0.25 + 1.0 = 1.25
+  assert.ok(Math.abs(baseCost - 1.25) < 1e-9, `<=200000 token 应走基础费率 1.25，实际 ${baseCost}`);
+
+  const tierCost = calculateEstimatedUsd(200_001, 100_000, 0, DEFAULT_API_PRICES['gemini-2.5-pro']);
+  // 200001 * 2.5/1M + 100K * 15/1M = 0.5000025 + 1.5 = 2.0000025
+  assert.ok(Math.abs(tierCost - 2.0000025) < 1e-9, `200001 token 应触发 >200K 阶梯费率，实际 ${tierCost}`);
 });

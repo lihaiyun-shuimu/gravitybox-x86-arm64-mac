@@ -381,9 +381,12 @@ test('正确服务拒绝额度时不回退到另一个环境的100%，旧错误�
   assert.ok(!archive.includes('synthetic-refresh'));
 }));
 
-test('仅采纳官方进程的固定Google服务端点', () => {
+test('仅采纳官方进程的固定Google服务端点', async () => {
+  const { applicationTarget, resolveBundleLayout } = await import('../dist/application-target.js');
+  const rawLs = resolveBundleLayout(applicationTarget('stable').appPath).languageServerPath;
+  const lsCmd = /\s/.test(rawLs) ? `"${rawLs}"` : rawLs;
   const origin = 'https://daily-cloudcode-pa.googleapis.com';
-  assert.equal(cloudOriginFromCommand('/Applications/Antigravity.app/Contents/Resources/bin/language_server --cloud_code_endpoint ' + origin), origin);
+  assert.equal(cloudOriginFromCommand(`${lsCmd} --cloud_code_endpoint ` + origin), origin);
   assert.equal(cloudOriginFromCommand('/tmp/fake --cloud_code_endpoint ' + origin), null);
-  assert.equal(cloudOriginFromCommand('/Applications/Antigravity.app/Contents/Resources/bin/language_server --cloud_code_endpoint https://attacker.invalid'), null);
+  assert.equal(cloudOriginFromCommand(`${lsCmd} --cloud_code_endpoint https://attacker.invalid`), null);
 });

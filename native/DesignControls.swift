@@ -1,6 +1,14 @@
 import Cocoa
 import QuartzCore
 
+class DesignPopUpButton: NSPopUpButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+class DesignInlineButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 class DesignButton: NSButton {
     private var hoverTracking: NSTrackingArea?
     private let hoverMotion = DesignMotion()
@@ -60,6 +68,16 @@ class DesignButton: NSButton {
         pressMotion.cancel()
     }
     override var wantsDefaultClipping: Bool { true }
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func accessibilityLabel() -> String? {
+        if let explicit = super.accessibilityLabel(), !explicit.isEmpty {
+            return explicit
+        }
+        return title.isEmpty ? nil : title
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -68,13 +86,16 @@ class DesignButton: NSButton {
             pressMotion.cancel()
             if hoverProgress != 0 { hoverProgress = 0 }
             if pressProgress != 0 { pressProgress = 0 }
+        } else {
+            updateTrackingAreas()
         }
     }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let area = hoverTracking { removeTrackingArea(area) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
+        let activeOption: NSTrackingArea.Options = Design.isInPopover(self) ? .activeAlways : .activeInKeyWindow
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, activeOption, .inVisibleRect], owner: self)
         hoverTracking = area
         addTrackingArea(area)
     }
@@ -94,7 +115,7 @@ class DesignButton: NSButton {
         return NSSize(width: ceil(width) + pad + iconExtra, height: btnHeight)
     }
 
-    func drawButtonChromeAndLabel(spinnerLeftInset: CGFloat? = nil, centeredSpinnerWidth: CGFloat? = nil) {
+    func drawButtonChromeAndLabel(spinnerLeftInset: CGFloat? = nil, centeredSpinnerWidth: CGFloat? = nil, iconRotationRadians: CGFloat = 0) {
         let primary = bezelColor != nil
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let inPopover = Design.isInPopover(self)
@@ -279,6 +300,14 @@ class DesignButton: NSButton {
             let totalW = iconW + gap + textSize.width
             let startX = title.isEmpty ? (bounds.width - iconW) / 2 : max(8, (bounds.width - totalW) / 2)
             let iconRect = NSRect(x: startX, y: (bounds.height - iconH) / 2, width: iconW, height: iconH)
+            let signedRotation = isFlipped ? iconRotationRadians : -iconRotationRadians
+            let rotatedCG = (abs(signedRotation) > 0.0001) ? gctx?.cgContext : nil
+            if let cg = rotatedCG {
+                cg.saveGState()
+                cg.translateBy(x: iconRect.midX, y: iconRect.midY)
+                cg.rotate(by: signedRotation)
+                cg.translateBy(x: -iconRect.midX, y: -iconRect.midY)
+            }
             if img.isTemplate, let cg = gctx?.cgContext {
                 cg.saveGState()
                 cg.beginTransparencyLayer(in: iconRect, auxiliaryInfo: nil)
@@ -290,6 +319,9 @@ class DesignButton: NSButton {
                 cg.restoreGState()
             } else {
                 img.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: true, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
+            }
+            if let cg = rotatedCG {
+                cg.restoreGState()
             }
             if !title.isEmpty {
                 let textX = startX + iconW + gap
@@ -325,7 +357,8 @@ final class DesignPopUpHoverOverlay: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+        let activeOption: NSTrackingArea.Options = Design.isInPopover(self) ? .activeAlways : .activeInActiveApp
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, activeOption, .inVisibleRect], owner: self)
         tracking = area
         addTrackingArea(area)
     }
@@ -359,6 +392,8 @@ final class DesignPopUpHoverOverlay: NSView {
             if let popup = superview as? NSPopUpButton, let cell = popup.cell as? DesignPopUpCell {
                 cell.hoverProgress = 0
             }
+        } else {
+            updateTrackingAreas()
         }
     }
 
@@ -366,17 +401,33 @@ final class DesignPopUpHoverOverlay: NSView {
 }
 
 final class DesignPopUpCell: NSPopUpButtonCell {
+    enum VisualStyle {
+        case form
+        case headerPill
+        case menuHeaderPill
+    }
+
+    var visualStyle: VisualStyle = .form
     var hoverProgress: CGFloat = 0
     var leadingSymbolName: String?
+    var leadingImage: NSImage?
+    var fitsSelectedTitleOnly: Bool = false
+    var isActiveState: Bool = false
+    var customHeight: CGFloat? = nil
+    private(set) var isTrackingMenu: Bool = false
 
     private func presentMenuBelow(_ controlView: NSView) {
         guard isEnabled, let menu, !menu.items.isEmpty else { return }
         synchronizeTitleAndSelectedItem()
+        isTrackingMenu = true
         isHighlighted = true
         controlView.needsDisplay = true
+        defer {
+            isTrackingMenu = false
+            isHighlighted = false
+            controlView.needsDisplay = true
+        }
         Design.popUpMenu(menu, below: controlView, matchAnchorWidth: true)
-        isHighlighted = false
-        controlView.needsDisplay = true
     }
 
     override func trackMouse(with event: NSEvent, in cellFrame: NSRect, of controlView: NSView, untilMouseUp flag: Bool) -> Bool {
@@ -392,146 +443,250 @@ final class DesignPopUpCell: NSPopUpButtonCell {
     override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
         let focused = controlView.window?.firstResponder === controlView
         let isSmall = controlSize == .small
-        let cornerR: CGFloat = isSmall ? 7.0 : 7.5
-        let rect = cellFrame.insetBy(dx: 0.75, dy: 0.75)
-        let path = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR)
         let isDark = controlView.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let hp = hoverProgress
         let pp: CGFloat = isHighlighted ? 1.0 : 0.0
         let enableScale: CGFloat = isEnabled ? 1.0 : 0.45
 
-        NSGraphicsContext.saveGraphicsState()
-        if isEnabled {
-            let shadow = NSShadow()
-            shadow.shadowColor = isDark
-                ? NSColor.black.withAlphaComponent(0.32 * (1.0 - 0.5 * pp))
-                : NSColor(srgbRed: 0.05, green: 0.08, blue: 0.16, alpha: (0.075 + 0.03 * hp) * (1.0 - 0.5 * pp))
-            shadow.shadowOffset = NSSize(width: 0, height: -1.0)
-            shadow.shadowBlurRadius = 2.2
-            shadow.set()
-        }
-        let baseFill = isDark
-            ? NSColor.white.withAlphaComponent((0.095 + 0.045 * hp - 0.025 * pp) * enableScale)
-            : NSColor(srgbRed: 0.965, green: 0.972, blue: 0.988, alpha: (0.94 + 0.05 * hp - 0.06 * pp) * enableScale)
-        baseFill.setFill()
-        path.fill()
-        NSGraphicsContext.restoreGraphicsState()
+        switch visualStyle {
+        case .form:
+            let cornerR: CGFloat = isSmall ? 7.0 : 7.5
+            let rect = cellFrame.insetBy(dx: 0.75, dy: 0.75)
+            let path = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR)
 
-        let topGlass = isDark
-            ? NSColor.white.withAlphaComponent((0.13 + 0.05 * hp - 0.03 * pp) * enableScale)
-            : NSColor.white.withAlphaComponent((0.97 + 0.03 * hp - 0.08 * pp) * enableScale)
-        let botGlass = isDark
-            ? NSColor.white.withAlphaComponent((0.07 + 0.035 * hp - 0.02 * pp) * enableScale)
-            : NSColor(srgbRed: 0.935, green: 0.945, blue: 0.970, alpha: (0.88 + 0.06 * hp) * enableScale)
-        if let grad = NSGradient(starting: topGlass, ending: botGlass) {
-            grad.draw(in: path, angle: controlView.isFlipped ? -90 : 90)
-        }
-        if isEnabled && hp > 0.01 {
-            Design.blue.withAlphaComponent((isDark ? 0.08 : 0.045) * hp).setFill()
-            path.fill()
-        }
-
-        if focused {
-            Design.blue.setStroke()
-            path.lineWidth = 1.5
-            path.stroke()
-        } else {
-            let strokeColor: NSColor
-            if isEnabled && hp > 0.05 {
-                strokeColor = isDark
-                    ? NSColor.white.withAlphaComponent(0.14 + 0.08 * hp)
-                    : Design.blue.withAlphaComponent(0.18 * hp + 0.085 * (1.0 - hp))
-            } else {
-                strokeColor = isDark
-                    ? NSColor.white.withAlphaComponent(0.12 * enableScale)
-                    : NSColor.black.withAlphaComponent(0.085 * enableScale)
+            NSGraphicsContext.saveGraphicsState()
+            if isEnabled {
+                let shadow = NSShadow()
+                shadow.shadowColor = isDark
+                    ? NSColor.black.withAlphaComponent(0.32 * (1.0 - 0.5 * pp))
+                    : NSColor(srgbRed: 0.05, green: 0.08, blue: 0.16, alpha: (0.075 + 0.03 * hp) * (1.0 - 0.5 * pp))
+                shadow.shadowOffset = NSSize(width: 0, height: -1.0)
+                shadow.shadowBlurRadius = 2.2
+                shadow.set()
             }
-            strokeColor.setStroke()
-            path.lineWidth = 0.75
-            path.stroke()
-        }
-        if isEnabled {
-            Design.drawSpecularBevel(in: rect, cornerRadius: cornerR, isDark: isDark)
+            let baseFill = isDark
+                ? NSColor.white.withAlphaComponent((0.095 + 0.045 * hp - 0.025 * pp) * enableScale)
+                : NSColor(srgbRed: 0.965, green: 0.972, blue: 0.988, alpha: (0.94 + 0.05 * hp - 0.06 * pp) * enableScale)
+            baseFill.setFill()
+            path.fill()
+            NSGraphicsContext.restoreGraphicsState()
+
+            let topGlass = isDark
+                ? NSColor.white.withAlphaComponent((0.13 + 0.05 * hp - 0.03 * pp) * enableScale)
+                : NSColor.white.withAlphaComponent((0.97 + 0.03 * hp - 0.08 * pp) * enableScale)
+            let botGlass = isDark
+                ? NSColor.white.withAlphaComponent((0.07 + 0.035 * hp - 0.02 * pp) * enableScale)
+                : NSColor(srgbRed: 0.935, green: 0.945, blue: 0.970, alpha: (0.88 + 0.06 * hp) * enableScale)
+            if let grad = NSGradient(starting: topGlass, ending: botGlass) {
+                grad.draw(in: path, angle: controlView.isFlipped ? -90 : 90)
+            }
+            if isEnabled && hp > 0.01 {
+                Design.blue.withAlphaComponent((isDark ? 0.08 : 0.045) * hp).setFill()
+                path.fill()
+            }
+            if isEnabled && isActiveState {
+                let activeTintAlpha: CGFloat = isDark ? (0.18 + 0.04 * hp - 0.03 * pp) : (0.095 + 0.035 * hp - 0.02 * pp)
+                Design.blue.withAlphaComponent(max(0.04, activeTintAlpha)).setFill()
+                path.fill()
+            }
+
+            if focused {
+                Design.blue.setStroke()
+                path.lineWidth = 1.5
+                path.stroke()
+            } else {
+                let strokeColor: NSColor
+                if isEnabled && isActiveState {
+                    strokeColor = Design.blue.withAlphaComponent(isDark ? (0.46 + 0.10 * hp) : (0.34 + 0.10 * hp))
+                } else if isEnabled && hp > 0.05 {
+                    strokeColor = isDark
+                        ? NSColor.white.withAlphaComponent(0.14 + 0.08 * hp)
+                        : Design.blue.withAlphaComponent(0.18 * hp + 0.085 * (1.0 - hp))
+                } else {
+                    strokeColor = isDark
+                        ? NSColor.white.withAlphaComponent(0.12 * enableScale)
+                        : NSColor.black.withAlphaComponent(0.085 * enableScale)
+                }
+                strokeColor.setStroke()
+                path.lineWidth = isActiveState ? 0.85 : 0.75
+                path.stroke()
+            }
+            if isEnabled {
+                Design.drawSpecularBevel(in: rect, cornerRadius: cornerR, isDark: isDark)
+            }
+
+        case .headerPill, .menuHeaderPill:
+            let rect = cellFrame.insetBy(dx: 0.5, dy: 0.5)
+            let isMenuPill = visualStyle == .menuHeaderPill
+            let cornerR: CGFloat = isMenuPill ? Design.Radius.controlCompact : Design.Radius.control
+            let path = NSBezierPath(roundedRect: rect, xRadius: cornerR, yRadius: cornerR)
+
+            let fillColor: NSColor
+            let strokeColor: NSColor
+            if isEnabled && isActiveState {
+                let lightFillAlpha: CGFloat = (isMenuPill ? 0.11 : 0.10) + 0.04 * hp + 0.02 * pp
+                let darkFillAlpha: CGFloat = (isMenuPill ? 0.22 : 0.20) + 0.05 * hp + 0.03 * pp
+                let lightStrokeAlpha: CGFloat = (isMenuPill ? 0.24 : 0.26) + 0.10 * hp
+                let darkStrokeAlpha: CGFloat = (isMenuPill ? 0.36 : 0.38) + 0.10 * hp
+                fillColor = Design.blue.withAlphaComponent(isDark ? darkFillAlpha : lightFillAlpha)
+                strokeColor = Design.blue.withAlphaComponent(isDark ? darkStrokeAlpha : lightStrokeAlpha)
+            } else if isDark {
+                let fillAlpha = (0.08 + 0.05 * hp - 0.02 * pp) * enableScale
+                let strokeAlpha = ((isMenuPill ? 0.10 : 0.12) + 0.08 * hp) * enableScale
+                fillColor = NSColor.white.withAlphaComponent(fillAlpha)
+                strokeColor = NSColor.white.withAlphaComponent(strokeAlpha)
+            } else {
+                let baseLightAlpha: CGFloat = isMenuPill ? 0.72 : 0.82
+                let fillAlpha = (baseLightAlpha + 0.10 * hp - 0.08 * pp) * enableScale
+                let baseStrokeAlpha: CGFloat = isMenuPill ? 0.07 : 0.09
+                let strokeAlpha = (baseStrokeAlpha + 0.05 * hp) * enableScale
+                fillColor = NSColor.white.withAlphaComponent(fillAlpha)
+                strokeColor = NSColor.black.withAlphaComponent(strokeAlpha)
+            }
+            fillColor.setFill()
+            path.fill()
+
+            if focused {
+                Design.blue.setStroke()
+                path.lineWidth = 1.5
+                path.stroke()
+            } else {
+                strokeColor.setStroke()
+                path.lineWidth = 0.5
+                path.stroke()
+            }
         }
 
-        var textLeadingOffset: CGFloat = 10
-        if let symbolName = leadingSymbolName, !symbolName.isEmpty,
-           let symImg = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+        var textLeadingOffset: CGFloat = visualStyle == .form ? (isSmall ? 9.5 : 11) : (isSmall ? 10 : 11)
+
+        let activeAccentColor: NSColor = {
+            if visualStyle == .form {
+                return isDark
+                    ? NSColor(srgbRed: 122/255, green: 192/255, blue: 1.0, alpha: 1.0)
+                    : NSColor(srgbRed: 0.0, green: 94.0 / 255.0, blue: 196.0 / 255.0, alpha: 1.0)
+            }
+            return isDark ? Design.activeBlue : Design.blue
+        }()
+
+        let resolvedLeadingIcon: NSImage? = leadingImage ?? {
+            guard let symbolName = leadingSymbolName, !symbolName.isEmpty else { return nil }
+            return NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+        }()
+        if let iconImg = resolvedLeadingIcon {
             let iconBox: CGFloat = isSmall ? 11.5 : 12.5
-            let rawSz = symImg.size
+            let rawSz = iconImg.size
             let scale = (rawSz.width > 0 && rawSz.height > 0) ? min(iconBox / rawSz.width, iconBox / rawSz.height) : 1.0
             let iconW = max(4, round(rawSz.width * scale * 2.0) / 2.0)
             let iconH = max(4, round(rawSz.height * scale * 2.0) / 2.0)
             let iconRect = NSRect(
-                x: cellFrame.minX + 10,
+                x: cellFrame.minX + textLeadingOffset,
                 y: cellFrame.midY - iconH / 2,
                 width: iconW,
                 height: iconH
             )
             let iconColor = focused
                 ? Design.blue
-                : (isEnabled ? (hp > 0.25 ? Design.primary : Design.secondary) : Design.secondary.withAlphaComponent(0.5))
-            if let cg = NSGraphicsContext.current?.cgContext {
-                cg.saveGState()
-                cg.beginTransparencyLayer(in: iconRect, auxiliaryInfo: nil)
-                symImg.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: controlView.isFlipped, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
-                cg.setBlendMode(.sourceAtop)
-                iconColor.setFill()
-                cg.fill(iconRect)
-                cg.endTransparencyLayer()
-                cg.restoreGState()
+                : (isActiveState && isEnabled
+                    ? activeAccentColor
+                    : (isEnabled ? (hp > 0.25 ? Design.primary : Design.secondary) : Design.secondary.withAlphaComponent(0.5)))
+            if iconImg.isTemplate {
+                if let cg = NSGraphicsContext.current?.cgContext {
+                    cg.saveGState()
+                    cg.beginTransparencyLayer(in: iconRect, auxiliaryInfo: nil)
+                    iconImg.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1.0, respectFlipped: controlView.isFlipped, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)])
+                    cg.setBlendMode(.sourceAtop)
+                    iconColor.setFill()
+                    cg.fill(iconRect)
+                    cg.endTransparencyLayer()
+                    cg.restoreGState()
+                }
+            } else {
+                iconImg.draw(
+                    in: iconRect,
+                    from: .zero,
+                    operation: .sourceOver,
+                    fraction: isEnabled ? 1.0 : 0.5,
+                    respectFlipped: controlView.isFlipped,
+                    hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)]
+                )
             }
-            textLeadingOffset = 10 + iconW + 5.5
+            textLeadingOffset += iconW + 5.0
         }
 
         let fontSize: CGFloat = isSmall ? 11.5 : 12
         let drawFont = NSFont.systemFont(ofSize: fontSize, weight: .medium)
-        let lineH = ceil(drawFont.ascender - drawFont.descender)
-        let trailingZone: CGFloat = isSmall ? 22 : 24
+        let textH = (title as NSString).size(withAttributes: [.font: drawFont]).height
+        let trailingZone: CGFloat = visualStyle == .form ? (isSmall ? 22 : 24) : (isSmall ? 21 : 23)
+        let titleY = round((cellFrame.midY - textH / 2.0) * 2.0) / 2.0
         let titleRect = NSRect(
             x: cellFrame.minX + textLeadingOffset,
-            y: floor(cellFrame.midY - lineH / 2),
+            y: titleY,
             width: max(0, cellFrame.width - textLeadingOffset - trailingZone),
-            height: lineH + 2
+            height: ceil(textH) + 1
         )
         let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
-        let fgColor = isEnabled ? Design.primary : Design.secondary.withAlphaComponent(0.55)
+        let fgColor = isEnabled
+            ? (isActiveState ? activeAccentColor : Design.primary)
+            : Design.secondary.withAlphaComponent(0.55)
         (title as NSString).draw(in: titleRect, withAttributes: [
             .font: drawFont,
             .foregroundColor: fgColor,
             .paragraphStyle: style
         ])
 
-        // 精细双箭头指示器（对齐现代 macOS 胶囊选择框比例）
-        let cx = cellFrame.maxX - (isSmall ? 12 : 13)
-        let cy = cellFrame.midY
-        let chev = NSBezierPath()
+        let chevColor = focused
+            ? Design.blue
+            : (isActiveState && isEnabled
+                ? activeAccentColor.withAlphaComponent(0.88)
+                : (hp > 0.25 && isEnabled ? Design.primary : Design.secondary))
+        chevColor.setStroke()
+
         let ySign: CGFloat = controlView.isFlipped ? 1.0 : -1.0
-        chev.move(to: NSPoint(x: cx - 2.6, y: cy - 1.3 * ySign))
-        chev.line(to: NSPoint(x: cx, y: cy - 3.8 * ySign))
-        chev.line(to: NSPoint(x: cx + 2.6, y: cy - 1.3 * ySign))
-        chev.move(to: NSPoint(x: cx - 2.6, y: cy + 1.3 * ySign))
-        chev.line(to: NSPoint(x: cx, y: cy + 3.8 * ySign))
-        chev.line(to: NSPoint(x: cx + 2.6, y: cy + 1.3 * ySign))
-        chev.lineWidth = 1.2
+        let chev = NSBezierPath()
         chev.lineCapStyle = .round
         chev.lineJoinStyle = .round
-        let chevColor = focused ? Design.blue : (hp > 0.25 && isEnabled ? Design.primary : Design.secondary)
-        chevColor.setStroke()
+        if visualStyle == .form {
+            // 精细双箭头指示器（与左内边距对称）
+            let cx = cellFrame.maxX - (isSmall ? 11.5 : 12.5)
+            let cy = cellFrame.midY
+            chev.move(to: NSPoint(x: cx - 2.6, y: cy - 1.3 * ySign))
+            chev.line(to: NSPoint(x: cx, y: cy - 3.8 * ySign))
+            chev.line(to: NSPoint(x: cx + 2.6, y: cy - 1.3 * ySign))
+            chev.move(to: NSPoint(x: cx - 2.6, y: cy + 1.3 * ySign))
+            chev.line(to: NSPoint(x: cx, y: cy + 3.8 * ySign))
+            chev.line(to: NSPoint(x: cx + 2.6, y: cy + 1.3 * ySign))
+            chev.lineWidth = 1.2
+        } else {
+            // 轻量化单向下箭头指示器（与设置页表单双箭头明确分层）
+            let cx = cellFrame.maxX - (isSmall ? 11.5 : 12.5)
+            let cy = cellFrame.midY
+            chev.move(to: NSPoint(x: cx - 3.2, y: cy - 1.4 * ySign))
+            chev.line(to: NSPoint(x: cx, y: cy + 1.8 * ySign))
+            chev.line(to: NSPoint(x: cx + 3.2, y: cy - 1.4 * ySign))
+            chev.lineWidth = 1.3
+        }
         chev.stroke()
     }
     override func cellSize(forBounds rect: NSRect) -> NSSize {
         let isSmall = controlSize == .small
         let drawFont = NSFont.systemFont(ofSize: isSmall ? 11.5 : 12, weight: .medium)
-        let itemTitles = (menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title)
-        let candidates = itemTitles.isEmpty ? [title] : itemTitles
+        let candidates: [String]
+        if fitsSelectedTitleOnly {
+            candidates = [selectedItem?.title ?? title]
+        } else if pullsDown {
+            candidates = [title]
+        } else {
+            let itemTitles = (menu?.items ?? []).filter { !$0.isSeparatorItem }.map(\.title)
+            candidates = itemTitles.isEmpty ? [title] : itemTitles
+        }
         let maxTitleW = candidates.reduce(CGFloat(0)) { acc, item in
             max(acc, ceil((item as NSString).size(withAttributes: [.font: drawFont]).width))
         }
-        let iconExtra: CGFloat = (leadingSymbolName?.isEmpty == false) ? 18 : 0
-        let chrome: CGFloat = (isSmall ? 34 : 38) + iconExtra
-        let minW: CGFloat = isSmall ? 78 : 88
-        return NSSize(width: max(minW, maxTitleW + chrome), height: isSmall ? 26 : 28)
+        let iconExtra: CGFloat = (leadingImage != nil || leadingSymbolName?.isEmpty == false) ? 18 : 0
+        let baseChrome: CGFloat = visualStyle == .form ? (isSmall ? 34 : 38) : (isSmall ? 35 : 39)
+        let chrome: CGFloat = baseChrome + iconExtra
+        let minW: CGFloat = isSmall ? 58 : 64
+        return NSSize(width: max(minW, maxTitleW + chrome), height: customHeight ?? (isSmall ? 26 : 28))
     }
 }
 
@@ -564,6 +719,12 @@ private func inputTextRect(_ rect: NSRect, font: NSFont? = nil) -> NSRect {
     return NSRect(x: rect.minX + 6, y: rect.midY - height / 2, width: max(0, rect.width - 12), height: height)
 }
 final class DesignTextCell: NSTextFieldCell {
+    override func drawingRect(forBounds theRect: NSRect) -> NSRect {
+        inputTextRect(theRect, font: font)
+    }
+    override func titleRect(forBounds theRect: NSRect) -> NSRect {
+        inputTextRect(theRect, font: font)
+    }
     override func draw(withFrame rect: NSRect, in view: NSView) {
         let focused = (view as? NSTextField)?.currentEditor() != nil
         drawInput(rect, focused: focused)
@@ -574,14 +735,14 @@ final class DesignTextCell: NSTextFieldCell {
         let display = stringValue.isEmpty ? (placeholderString ?? "") : stringValue
         guard !display.isEmpty else { return }
         let color: NSColor = stringValue.isEmpty ? Design.secondary : (isEnabled ? NSColor.labelColor : Design.secondary)
-        (display as NSString).draw(in: inputTextRect(rect, font: font), withAttributes: [
+        (display as NSString).draw(in: drawingRect(forBounds: rect), withAttributes: [
             .font: font ?? .systemFont(ofSize: 12),
             .foregroundColor: color,
             .paragraphStyle: style
         ])
     }
     override func edit(withFrame rect: NSRect, in view: NSView, editor: NSText, delegate: Any?, event: NSEvent?) {
-        let textRect = inputTextRect(rect, font: font)
+        let textRect = drawingRect(forBounds: rect)
         editor.alignment = alignment
         if let tv = editor as? NSTextView {
             tv.drawsBackground = false
@@ -591,7 +752,7 @@ final class DesignTextCell: NSTextFieldCell {
         super.edit(withFrame: textRect, in: view, editor: editor, delegate: delegate, event: event)
     }
     override func select(withFrame rect: NSRect, in view: NSView, editor: NSText, delegate: Any?, start: Int, length: Int) {
-        let textRect = inputTextRect(rect, font: font)
+        let textRect = drawingRect(forBounds: rect)
         editor.alignment = alignment
         if let tv = editor as? NSTextView {
             tv.drawsBackground = false
@@ -599,19 +760,6 @@ final class DesignTextCell: NSTextFieldCell {
             tv.textContainer?.lineFragmentPadding = 0
         }
         super.select(withFrame: textRect, in: view, editor: editor, delegate: delegate, start: start, length: length)
-    }
-}
-final class DesignSecureCell: NSSecureTextFieldCell {
-    override func draw(withFrame rect: NSRect, in view: NSView) {
-        let focused = (view as? NSTextField)?.currentEditor() != nil
-        drawInput(rect, focused: focused)
-        super.drawInterior(withFrame: inputTextRect(rect, font: font), in: view)
-    }
-    override func edit(withFrame rect: NSRect, in view: NSView, editor: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: inputTextRect(rect, font: font), in: view, editor: editor, delegate: delegate, event: event)
-    }
-    override func select(withFrame rect: NSRect, in view: NSView, editor: NSText, delegate: Any?, start: Int, length: Int) {
-        super.select(withFrame: inputTextRect(rect, font: font), in: view, editor: editor, delegate: delegate, start: start, length: length)
     }
 }
 
@@ -656,9 +804,12 @@ final class QuotaRefreshButton: DesignButton {
         let effectiveW = bounds.width > 1 ? bounds.width : intrinsicContentSize.width
         let clampedTextW = min(textW, max(0, effectiveW - 16 - spinnerW - gap))
         let totalW = spinnerW + gap + clampedTextW
-        spinnerLeadingConstraint.constant = title.isEmpty
+        let target = title.isEmpty
             ? round((effectiveW - spinnerW) / 2)
             : max(8, round((effectiveW - totalW) / 2))
+        if abs(spinnerLeadingConstraint.constant - target) > 0.5 {
+            spinnerLeadingConstraint.constant = target
+        }
     }
     override func layout() {
         updateSpinnerLeading()
@@ -668,7 +819,6 @@ final class QuotaRefreshButton: DesignButton {
         if spinner.isHidden {
             drawButtonChromeAndLabel(spinnerLeftInset: nil)
         } else {
-            updateSpinnerLeading()
             drawButtonChromeAndLabel(centeredSpinnerWidth: 13)
         }
     }
@@ -700,59 +850,251 @@ final class QuotaRefreshButton: DesignButton {
     }
 }
 
-// Fixed-width inline refresh button with embedded spinner (keeps button text and width constant so sibling controls never shift).
+// Fixed-width inline refresh button with embedded spinner or compact icon-only rotating arrow mode.
 final class InlineRefreshButton: DesignButton {
+    private final class SpinLinkTarget: NSObject {
+        private weak var owner: InlineRefreshButton?
+        private var didInvalidate = false
+
+        init(owner: InlineRefreshButton) {
+            self.owner = owner
+            super.init()
+        }
+
+        func invalidateOnce(_ link: CADisplayLink?) {
+            owner = nil
+            guard !didInvalidate else { return }
+            didInvalidate = true
+            link?.invalidate()
+        }
+
+        @objc func step(_ sender: CADisplayLink) {
+            guard !didInvalidate, let owner else {
+                invalidateOnce(sender)
+                return
+            }
+            owner.handleSpinDisplayLink(sender)
+        }
+    }
+
     let spinner = NSProgressIndicator()
     let fixedWidth: CGFloat
+    let iconOnly: Bool
+    let iconButtonSize: CGFloat
     private(set) var isBusy = false
-    private var appliedBusyState: (busy: Bool, available: Bool)?
-    override var isActivitySpinning: Bool { !spinner.isHidden }
+    private var appliedBusyState: (busy: Bool, available: Bool, error: String)?
+    private var baseAccessibilityLabel: String
+    private var isUpdatingA11yLabel = false
+
+    private var spinAngle: CGFloat = 0
+    private var spinDisplayLink: CADisplayLink?
+    private var spinDisplayLinkTarget: SpinLinkTarget?
+    private var spinTimer: Timer?
+    private var spinLastTime: CFTimeInterval = 0
+    private let spinSettleMotion = DesignMotion()
+
+    override var isActivitySpinning: Bool { iconOnly ? isBusy : !spinner.isHidden }
     override var intrinsicContentSize: NSSize {
+        if iconOnly {
+            return NSSize(width: iconButtonSize, height: iconButtonSize)
+        }
         let textWidth = ceil((title as NSString).size(withAttributes: [
             .font: font ?? NSFont.systemFont(ofSize: 12, weight: .medium)
         ]).width)
         return NSSize(width: max(fixedWidth, textWidth + 32), height: 28)
     }
-    init(_ buttonTitle: String = L10n.t("common.refresh", fallback: "刷新"), width: CGFloat = 78, target: AnyObject? = nil, action: Selector) {
+
+    init(
+        _ buttonTitle: String = L10n.t("common.refresh", fallback: "刷新"),
+        width: CGFloat = 78,
+        iconOnly: Bool = false,
+        size: CGFloat = 28,
+        target: AnyObject? = nil,
+        action: Selector
+    ) {
         self.fixedWidth = width
+        self.iconOnly = iconOnly
+        self.iconButtonSize = max(20, size)
+        let fallbackLabel = L10n.t("common.refresh", fallback: "刷新")
+        let resolvedLabel = buttonTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallbackLabel : buttonTitle
+        self.baseAccessibilityLabel = resolvedLabel
         super.init(frame: .zero)
-        title = buttonTitle
         self.target = target
         self.action = action
         bezelStyle = .rounded
         isBordered = false
         font = .systemFont(ofSize: 12, weight: .medium)
-        spinner.style = .spinning
-        spinner.controlSize = .small
-        spinner.isDisplayedWhenStopped = false
         spinner.isHidden = true
-        spinner.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(spinner)
-        NSLayoutConstraint.activate([
-            spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
-            spinner.widthAnchor.constraint(equalToConstant: 13),
-            spinner.heightAnchor.constraint(equalToConstant: 13)
-        ])
-        setAccessibilityLabel(buttonTitle)
+        if iconOnly {
+            title = ""
+            toolTip = nil
+            let iconImg = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12.5, weight: .medium))
+            iconImg?.isTemplate = true
+            image = iconImg
+            imagePosition = .imageOnly
+            setContentHuggingPriority(.required, for: .horizontal)
+            setContentHuggingPriority(.required, for: .vertical)
+            setContentCompressionResistancePriority(.required, for: .horizontal)
+            setContentCompressionResistancePriority(.required, for: .vertical)
+        } else {
+            title = buttonTitle
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isDisplayedWhenStopped = false
+            spinner.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(spinner)
+            NSLayoutConstraint.activate([
+                spinner.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+                spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+                spinner.widthAnchor.constraint(equalToConstant: 13),
+                spinner.heightAnchor.constraint(equalToConstant: 13)
+            ])
+        }
+        isUpdatingA11yLabel = true
+        super.setAccessibilityLabel(resolvedLabel)
+        isUpdatingA11yLabel = false
     }
+
     required init?(coder: NSCoder) { fatalError() }
-    override func draw(_ dirtyRect: NSRect) {
-        drawButtonChromeAndLabel(spinnerLeftInset: spinner.isHidden ? 6 : 22)
+
+    deinit {
+        stopSpinDriver(resetAngle: false, settle: false)
     }
-    func setBusy(_ busy: Bool, available: Bool = true) {
-        if let prev = appliedBusyState, prev.busy == busy && prev.available == available {
+
+    override func setAccessibilityLabel(_ accessibilityLabel: String?) {
+        if !isUpdatingA11yLabel, let label = accessibilityLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !label.isEmpty {
+            baseAccessibilityLabel = label
+        }
+        super.setAccessibilityLabel(accessibilityLabel)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopSpinDriver(resetAngle: true, settle: false)
+        } else if iconOnly && isBusy {
+            startSpinDriver()
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if iconOnly {
+            drawButtonChromeAndLabel(iconRotationRadians: spinAngle)
+        } else {
+            drawButtonChromeAndLabel(spinnerLeftInset: spinner.isHidden ? 6 : 22)
+        }
+    }
+
+    func setBusy(_ busy: Bool, available: Bool = true, error: String? = nil) {
+        let normalizedError = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let targetEnabled = available && !busy
+        if let prev = appliedBusyState, prev.busy == busy && prev.available == available && prev.error == normalizedError {
+            if isEnabled != targetEnabled {
+                isEnabled = targetEnabled
+                needsDisplay = true
+            }
             return
         }
-        appliedBusyState = (busy: busy, available: available)
+        appliedBusyState = (busy: busy, available: available, error: normalizedError)
         isBusy = busy
-        isEnabled = available && !busy
-        if spinner.isHidden != !busy {
+        isEnabled = targetEnabled
+        if iconOnly {
+            if !title.isEmpty {
+                title = ""
+            }
+            if busy {
+                startSpinDriver()
+            } else {
+                stopSpinDriver(resetAngle: true, settle: true)
+            }
+        } else if spinner.isHidden != !busy {
             spinner.isHidden = !busy
             if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
         }
-        setAccessibilityLabel(busy ? L10n.t("design.inline_refresh.busy", ["title": title], fallback: "\(title)，刷新中") : title)
+        let labelSource = iconOnly ? baseAccessibilityLabel : (title.isEmpty ? baseAccessibilityLabel : title)
+        isUpdatingA11yLabel = true
+        super.setAccessibilityLabel(busy ? L10n.t("design.inline_refresh.busy", ["title": labelSource], fallback: "\(labelSource)，刷新中") : labelSource)
+        isUpdatingA11yLabel = false
+        if !normalizedError.isEmpty {
+            setAccessibilityHelp(L10n.t("design.quota_refresh.incomplete", ["error": normalizedError], fallback: "刷新未完成：\(normalizedError)"))
+        } else if iconOnly {
+            setAccessibilityHelp(busy ? L10n.t("design.inline_refresh.busy", ["title": labelSource], fallback: "\(labelSource)，刷新中") : labelSource)
+        } else {
+            setAccessibilityHelp(nil)
+        }
         needsDisplay = true
+    }
+
+    private func startSpinDriver() {
+        guard iconOnly, isBusy, Design.shouldAnimate(in: self) else { return }
+        spinSettleMotion.cancel()
+        guard spinDisplayLink == nil, spinTimer == nil else { return }
+        spinLastTime = CACurrentMediaTime()
+        let proxy = SpinLinkTarget(owner: self)
+        if let link = DesignMotion.defaultMakeDisplayLink(for: self, target: proxy, selector: #selector(SpinLinkTarget.step(_:))) {
+            if #available(macOS 14.0, *) {
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            }
+            link.add(to: .main, forMode: .common)
+            spinDisplayLinkTarget = proxy
+            spinDisplayLink = link
+        } else {
+            let t = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+                self?.stepSpinFrame()
+            }
+            spinTimer = t
+            RunLoop.main.add(t, forMode: .common)
+        }
+    }
+
+    private func handleSpinDisplayLink(_ link: CADisplayLink) {
+        guard link === spinDisplayLink else { return }
+        stepSpinFrame()
+    }
+
+    private func stepSpinFrame() {
+        guard iconOnly, isBusy, Design.shouldAnimate(in: self) else {
+            stopSpinDriver(resetAngle: true, settle: false)
+            return
+        }
+        let now = CACurrentMediaTime()
+        let dt = max(0, min(0.05, now - spinLastTime))
+        spinLastTime = now
+        spinAngle = (spinAngle + CGFloat(dt) * (.pi * 2.0 / 0.85)).truncatingRemainder(dividingBy: .pi * 2.0)
+        needsDisplay = true
+    }
+
+    private func stopSpinDriver(resetAngle: Bool, settle: Bool) {
+        let link = spinDisplayLink
+        spinDisplayLink = nil
+        let proxy = spinDisplayLinkTarget
+        spinDisplayLinkTarget = nil
+        if let proxy {
+            proxy.invalidateOnce(link)
+        } else {
+            link?.invalidate()
+        }
+        let activeTimer = spinTimer
+        spinTimer = nil
+        activeTimer?.invalidate()
+
+        spinSettleMotion.cancel()
+        if settle && Design.shouldAnimate(in: self) {
+            let normalized = spinAngle.truncatingRemainder(dividingBy: .pi * 2.0)
+            if normalized > 0.02 {
+                spinSettleMotion.animate(in: self, from: normalized, to: .pi * 2.0, curve: .hover, threshold: 0.01) { [weak self] angle in
+                    guard let self else { return }
+                    self.spinAngle = angle >= (.pi * 2.0 - 0.01) ? 0 : angle
+                    self.needsDisplay = true
+                }
+                return
+            }
+        }
+        if resetAngle && spinAngle != 0 {
+            spinAngle = 0
+            needsDisplay = true
+        }
     }
 }
 
@@ -808,6 +1150,7 @@ final class DesignSegmentedControl: NSControl {
         override func becomeFirstResponder() -> Bool { let result = super.becomeFirstResponder(); needsDisplay = true; return result }
         override func resignFirstResponder() -> Bool { let result = super.resignFirstResponder(); needsDisplay = true; return result }
         override var allowsVibrancy: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         let index: Int
         let compact: Bool
         weak var owner: DesignSegmentedControl?
@@ -926,6 +1269,7 @@ final class DesignSegmentedControl: NSControl {
         equalWidthSegments: Bool = true,
         maxSegmentWidth: CGFloat? = nil
     ) {
+        _ = trackingMode // Retained for NSSegmentedControl drop-in compatibility; single-selection is fixed.
         self.labels = labels
         self.compact = compact
         self.equalWidthSegments = equalWidthSegments
@@ -1159,14 +1503,14 @@ final class DesignSwitch: NSSwitch {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        focusRingType = .none
+        focusRingType = .exterior
         thumbProgress = (super.state == .on) ? 1.0 : 0.0
         suppressNativeLayers()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        focusRingType = .none
+        focusRingType = .exterior
         thumbProgress = (super.state == .on) ? 1.0 : 0.0
         suppressNativeLayers()
     }
@@ -1195,6 +1539,9 @@ final class DesignSwitch: NSSwitch {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if window == nil {
+            thumbMotion.cancel()
+        }
         suppressNativeLayers()
         needsDisplay = true
     }
@@ -1223,22 +1570,31 @@ final class DesignSwitch: NSSwitch {
         super.keyDown(with: event)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    private var switchTrackRect: NSRect {
         let trackW: CGFloat = 32
         let trackH: CGFloat = 18
-        let trackRect = NSRect(
+        return NSRect(
             x: round((bounds.width - trackW) / 2),
             y: round((bounds.height - trackH) / 2),
             width: trackW,
             height: trackH
         )
-        if window?.firstResponder === self {
-            Design.blue.setStroke()
-            let ring = NSBezierPath(roundedRect: trackRect.insetBy(dx: -3, dy: -3), xRadius: 12, yRadius: 12)
-            ring.lineWidth = 2; ring.stroke()
-        }
-        let trackRadius = trackH / 2
+    }
+
+    override var focusRingMaskBounds: NSRect {
+        switchTrackRect
+    }
+
+    override func drawFocusRingMask() {
+        let rect = switchTrackRect
+        let radius = rect.height / 2
+        NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let trackRect = switchTrackRect
+        let trackRadius = trackRect.height / 2
         let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: trackRadius, yRadius: trackRadius)
 
         let p = min(1.0, max(0.0, thumbProgress))

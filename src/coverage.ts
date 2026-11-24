@@ -1,5 +1,5 @@
-import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { resolveBundleLayout } from './application-target.js';
 import { openAsarArchive, parseAsarHeaderPrefix, resolveAsarEntryRange, type AsarFileEntry } from './asar.js';
 import { extractUiStrings, extractedKind, fetchBuffer, foldDictionaryKey, isEnglishSource, normalizeText as normalize } from './bundle.js';
 import { decodeScopedKey } from './candidates.js';
@@ -288,7 +288,7 @@ export function asarSources(buffer: Buffer): CoverageSource[] {
 }
 
 export async function nativeSources(appPath: string): Promise<CoverageSource[]> {
-  const archive = await openAsarArchive(join(appPath, 'Contents/Resources/app.asar'), 8_000_000);
+  const archive = await openAsarArchive(resolveBundleLayout(appPath).asarPath, 8_000_000);
   try {
     const result: CoverageSource[] = [];
     for (const { path, entry } of collectNativeAsarEntries(archive.header.files)) {

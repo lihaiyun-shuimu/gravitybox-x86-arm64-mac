@@ -3,6 +3,24 @@ import OSLog
 
 private let lifecycleLogger = Logger(subsystem: "local.gravitybox.app", category: "Lifecycle")
 private var safeRelaunchInFlightIds = Set<ObjectIdentifier>()
+private var openAntigravityProbeInFlightIds = Set<ObjectIdentifier>()
+
+enum StartupLaunchAction: Equatable {
+    case showMainPanel
+    case stayInMenuBar
+    case launchAntigravityInBackground
+}
+
+enum ReopenLaunchAction: Equatable {
+    case showMainPanel
+    case launchAntigravityInBackground
+}
+
+struct ProcessTreeEntry: Equatable {
+    let pid: Int32
+    let ppid: Int32
+    let args: String
+}
 
 #if NATIVE_UI_TEST
 struct SafeRelaunchTestingHooks {
@@ -21,12 +39,98 @@ private var safeRelaunchTestingHooksById: [ObjectIdentifier: SafeRelaunchTesting
 extension Assistant {
     static let remoteDebuggingArguments = ["--remote-debugging-port=0"]
 
-    private static func makeOpenConfiguration() -> NSWorkspace.OpenConfiguration {
+    static func makeOpenConfiguration(environment: [String: String] = [:]) -> NSWorkspace.OpenConfiguration {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
         config.createsNewApplicationInstance = false
         config.arguments = remoteDebuggingArguments
+        if !environment.isEmpty {
+            config.environment = environment
+        }
         return config
+    }
+
+    static func makeOpenCommandArguments(launchPath: String, environment: [String: String] = [:]) -> [String] {
+        var args = ["-a", launchPath]
+        for key in environment.keys.sorted() {
+            if let value = environment[key] {
+                args.append(contentsOf: ["--env", "\(key)=\(value)"])
+            }
+        }
+        args.append("--args")
+        args.append(contentsOf: remoteDebuggingArguments)
+        return args
+    }
+
+    func effectiveProxyMode() -> AntigravityProxyMode {
+        let raw = configuration?.value.antigravityProxyMode ?? "off"
+        return AntigravityProxyMode(rawValue: raw) ?? .off
+    }
+
+    func currentProxyResolution() -> ProxyResolution {
+        SystemProxyResolver.resolve(
+            mode: effectiveProxyMode(),
+            manualUrl: configuration?.value.antigravityProxyManualUrl ?? ""
+        )
+    }
+
+    func currentRunningProxyState(resolution: ProxyResolution? = nil) -> RunningAntigravityProxyState {
+        let resolved = resolution ?? currentProxyResolution()
+        return SystemProxyResolver.inspectRunningAntigravity(expected: resolved, appPath: targetApplication.path)
+    }
+
+    func syncBackendProxyConfiguration() {
+        guard let bridge else { return }
+        let mode = effectiveProxyMode()
+        let manualUrl = configuration?.value.antigravityProxyManualUrl ?? ""
+        bridge.send([
+            "command": "proxy_set",
+            "mode": mode.rawValue,
+            "manualUrl": manualUrl
+        ]) { _ in }
+    }
+
+    func applyProxyConfiguration(mode: AntigravityProxyMode, manualUrl: String) throws {
+        let trimmedManual = manualUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextManualUrl: String
+        switch mode {
+        case .manual:
+            switch SystemProxyResolver.normalizeManualProxyUrl(trimmedManual) {
+            case .success(let normalized):
+                nextManualUrl = normalized
+            case .failure(let error):
+                throw error
+            }
+        case .off, .system:
+            if trimmedManual.isEmpty {
+                nextManualUrl = configuration?.value.antigravityProxyManualUrl ?? ""
+            } else {
+                nextManualUrl = trimmedManual
+            }
+        }
+        configuration?.value.antigravityProxyMode = mode.rawValue
+        configuration?.value.antigravityProxyManualUrl = nextManualUrl
+        try configuration?.save()
+        syncBackendProxyConfiguration()
+        updateViews()
+    }
+
+    @objc func safeRelaunchAntigravityForProxy() {
+        safeRelaunchAntigravityForDebug()
+    }
+
+    private func currentAntigravityLaunchEnvironment() -> [String: String] {
+        SystemProxyResolver.launchEnvironment(for: currentProxyResolution())
+    }
+
+    private func needsProxyRelaunch(resolution: ProxyResolution) -> Bool {
+        guard case .active = resolution else { return false }
+        switch currentRunningProxyState(resolution: resolution) {
+        case .missing, .mismatch:
+            return true
+        case .notRunning, .matched, .overriddenByShell:
+            return false
+        }
     }
 
     static func devToolsActivePortFilePath() -> String {
@@ -112,8 +216,9 @@ extension Assistant {
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
         do {
+            defer { try? pipe.fileHandleForReading.close() }
             try task.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
             task.waitUntilExit()
             let output = String(data: data, encoding: .utf8) ?? ""
             return hasDebugPortArgument(inPsOutput: output, appPaths: appPaths)
@@ -133,20 +238,177 @@ extension Assistant {
         safeRelaunchInFlightIds.remove(key)
     }
     #endif
+    static func startupLaunchAction(
+        launchAntigravityOnStart: Bool,
+        loginLaunch: Bool,
+        restartedAfterUpdate: Bool,
+        launchedByAntigravity: Bool
+    ) -> StartupLaunchAction {
+        if loginLaunch || launchedByAntigravity {
+            return .stayInMenuBar
+        }
+        if restartedAfterUpdate {
+            return .showMainPanel
+        }
+        return launchAntigravityOnStart ? .launchAntigravityInBackground : .showMainPanel
+    }
+
+    static func parsePsPidPpidArgs(_ output: String) -> [ProcessTreeEntry] {
+        var entries: [ProcessTreeEntry] = []
+        for rawLine in output.split(separator: "\n") {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            var scanner = Substring(trimmed)
+            guard let pidEnd = scanner.firstIndex(where: { $0 == " " || $0 == "\t" }) else { continue }
+            guard let pid = Int32(scanner[..<pidEnd]) else { continue }
+            scanner = scanner[pidEnd...].drop(while: { $0 == " " || $0 == "\t" })
+            guard let ppidEnd = scanner.firstIndex(where: { $0 == " " || $0 == "\t" }) else { continue }
+            guard let ppid = Int32(scanner[..<ppidEnd]) else { continue }
+            let args = scanner[ppidEnd...].drop(while: { $0 == " " || $0 == "\t" })
+            guard !args.isEmpty else { continue }
+            entries.append(ProcessTreeEntry(pid: pid, ppid: ppid, args: String(args)))
+        }
+        return entries
+    }
+
+    private static func isChromiumHelperArgs(_ args: String) -> Bool {
+        let chromiumTypes = [
+            "--type=renderer",
+            "--type=gpu-process",
+            "--type=utility",
+            "--type=zygote",
+            "--type=broker",
+            "--type=ppapi"
+        ]
+        return chromiumTypes.contains { args.contains($0) }
+    }
+
+    private static func isBlockingAntigravityArgs(
+        _ args: String,
+        appPaths: [String],
+        includeLanguageServer: Bool
+    ) -> Bool {
+        let trimmed = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        return appPaths.contains { appPath in
+            let lsPath = appPath + "/Contents/Resources/bin/language_server"
+            let isLs = trimmed.hasPrefix(lsPath) || trimmed.contains(lsPath)
+            if isLs {
+                return includeLanguageServer
+            }
+            if includeLanguageServer {
+                return trimmed.hasPrefix(appPath + "/Contents/")
+            }
+            guard trimmed.hasPrefix(appPath + "/Contents/") else { return false }
+            if trimmed.contains("chrome_crashpad_handler") {
+                return false
+            }
+            if trimmed.hasPrefix(appPath + "/Contents/Frameworks/") {
+                return isChromiumHelperArgs(trimmed)
+            }
+            return true
+        }
+    }
+
+    private static func languageServerTreeExcludedPids(
+        entries: [ProcessTreeEntry],
+        appPaths: [String]
+    ) -> Set<Int32> {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        var queue: [Int32] = []
+        var excluded = Set<Int32>()
+        for entry in entries {
+            childrenByParent[entry.ppid, default: []].append(entry.pid)
+            let isLs = appPaths.contains { appPath in
+                let lsPath = appPath + "/Contents/Resources/bin/language_server"
+                return entry.args.hasPrefix(lsPath) || entry.args.contains(lsPath)
+            }
+            if isLs && excluded.insert(entry.pid).inserted {
+                queue.append(entry.pid)
+            }
+        }
+        var cursor = 0
+        while cursor < queue.count {
+            let current = queue[cursor]
+            cursor += 1
+            for childPid in childrenByParent[current] ?? [] {
+                if excluded.insert(childPid).inserted {
+                    queue.append(childPid)
+                }
+            }
+        }
+        return excluded
+    }
+
     static func hasRunningAntigravityProcess(
         psOutput: String,
         appPaths: [String],
         includeLanguageServer: Bool = true
     ) -> Bool {
         psOutput.split(separator: "\n").contains { line in
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            return appPaths.contains { appPath in
-                let lsPath = appPath + "/Contents/Resources/bin/language_server"
-                let isLs = trimmed.hasPrefix(lsPath) || trimmed.contains(lsPath)
-                if isLs && !includeLanguageServer { return false }
-                return trimmed.hasPrefix(appPath + "/Contents/") || (includeLanguageServer && trimmed.contains(lsPath))
+            isBlockingAntigravityArgs(
+                String(line),
+                appPaths: appPaths,
+                includeLanguageServer: includeLanguageServer
+            )
+        }
+    }
+
+    static func hasRunningAntigravityProcess(
+        psPidPpidArgsOutput: String,
+        appPaths: [String],
+        includeLanguageServer: Bool = true
+    ) -> Bool {
+        let entries = parsePsPidPpidArgs(psPidPpidArgsOutput)
+        let excludedPids = includeLanguageServer
+            ? Set<Int32>()
+            : languageServerTreeExcludedPids(entries: entries, appPaths: appPaths)
+        return entries.contains { entry in
+            if !includeLanguageServer && excludedPids.contains(entry.pid) {
+                return false
+            }
+            return isBlockingAntigravityArgs(
+                entry.args,
+                appPaths: appPaths,
+                includeLanguageServer: includeLanguageServer
+            )
+        }
+    }
+
+    static func describeBlockingAntigravityProcesses(
+        psPidPpidArgsOutput: String,
+        appPaths: [String],
+        includeLanguageServer: Bool = false
+    ) -> [String] {
+        let entries = parsePsPidPpidArgs(psPidPpidArgsOutput)
+        let excludedPids = includeLanguageServer
+            ? Set<Int32>()
+            : languageServerTreeExcludedPids(entries: entries, appPaths: appPaths)
+        var roles: [String] = []
+        var seen = Set<String>()
+        for entry in entries {
+            if !includeLanguageServer && excludedPids.contains(entry.pid) { continue }
+            guard isBlockingAntigravityArgs(entry.args, appPaths: appPaths, includeLanguageServer: includeLanguageServer) else {
+                continue
+            }
+            let role: String
+            if appPaths.contains(where: { entry.args.hasPrefix($0 + "/Contents/MacOS/") }) {
+                role = "main"
+            } else if entry.args.contains("--type=renderer") {
+                role = "renderer"
+            } else if entry.args.contains("--type=gpu-process") {
+                role = "gpu-process"
+            } else if entry.args.contains("--type=utility") {
+                role = "utility"
+            } else if entry.args.contains("/Contents/Resources/bin/language_server") {
+                role = "language_server"
+            } else {
+                role = "helper"
+            }
+            if seen.insert(role).inserted {
+                roles.append(role)
             }
         }
+        return roles
     }
 
     static func hasLiveAntigravitySubprocesses(
@@ -155,23 +417,61 @@ extension Assistant {
     ) -> Bool {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-ax", "-ww", "-o", "args="]
+        task.arguments = ["-ax", "-ww", "-o", "pid=,ppid=,args="]
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
         do {
+            defer { try? pipe.fileHandleForReading.close() }
             try task.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
             task.waitUntilExit()
             let output = String(data: data, encoding: .utf8) ?? ""
             return hasRunningAntigravityProcess(
-                psOutput: output,
+                psPidPpidArgsOutput: output,
                 appPaths: appPaths,
                 includeLanguageServer: includeLanguageServer
             )
         } catch {
             return false
         }
+    }
+
+    private static func liveBlockingProcessRoles(
+        appPaths: [String] = DesktopApplicationTarget.allTargets.map(\.path),
+        includeLanguageServer: Bool = false
+    ) -> [String] {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-ax", "-ww", "-o", "pid=,ppid=,args="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do {
+            defer { try? pipe.fileHandleForReading.close() }
+            try task.run()
+            let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+            task.waitUntilExit()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return describeBlockingAntigravityProcesses(
+                psPidPpidArgsOutput: output,
+                appPaths: appPaths,
+                includeLanguageServer: includeLanguageServer
+            )
+        } catch {
+            return []
+        }
+    }
+
+    static func reopenLaunchAction(
+        launchAntigravityOnStart: Bool,
+        hasVisibleMainWindow: Bool,
+        isAntigravityRunning: Bool
+    ) -> ReopenLaunchAction {
+        if launchAntigravityOnStart && !hasVisibleMainWindow && !isAntigravityRunning {
+            return .launchAntigravityInBackground
+        }
+        return .showMainPanel
     }
 
     func quitAntigravityAndWait(completion: @escaping (Bool) -> Void) {
@@ -349,13 +649,32 @@ extension Assistant {
     @objc func toggleHud() {
         setHudEnabled(!effectiveHudEnabled())
     }
-    private func launchAntigravityDirectly() {
+    var isSafeRelaunchInFlight: Bool {
+        safeRelaunchInFlightIds.contains(ObjectIdentifier(self))
+    }
+
+    @objc func handleAppIconReopen() {
+        let hasVisibleMainWindow = window?.isVisible == true && window?.isMiniaturized != true
+        let action = Self.reopenLaunchAction(
+            launchAntigravityOnStart: configuration?.value.launchAntigravityOnStart == true,
+            hasVisibleMainWindow: hasVisibleMainWindow,
+            isAntigravityRunning: Self.isAntigravityRunning()
+        )
+        switch action {
+        case .launchAntigravityInBackground:
+            launchAntigravityDirectly()
+        case .showMainPanel:
+            showPanel()
+        }
+    }
+
+    func launchAntigravityDirectly() {
         #if NATIVE_UI_TEST
         openedApplications += 1
         #else
         suppressLifecycleAutoQuit(seconds: 30.0)
         let launchPath = DesktopApplicationTarget.preferredLaunchPath(fallbackChannel: Self.applicationChannel)
-        let config = Self.makeOpenConfiguration()
+        let config = Self.makeOpenConfiguration(environment: currentAntigravityLaunchEnvironment())
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: launchPath), configuration: config) { [weak self] _, error in
             if let error {
                 DispatchQueue.main.async { self?.showMessage(error.localizedDescription, error: true) }
@@ -365,23 +684,60 @@ extension Assistant {
     }
 
     @objc func openAntigravity() {
+        let proxyResolution = currentProxyResolution()
         #if NATIVE_UI_TEST
-        if statusValue.mode == "debug-port-missing" {
+        let key = ObjectIdentifier(self)
+        let running = safeRelaunchTestingHooksById[key]?.isRunning?() ?? true
+        if running && (statusValue.mode == "debug-port-missing" || needsProxyRelaunch(resolution: proxyResolution)) {
             safeRelaunchAntigravityForDebug()
             return
         }
         launchAntigravityDirectly()
         #else
-        let wantsTranslation = pendingTranslationTarget ?? statusValue.translationEnabled ?? (effectiveConfiguredLanguage() != "en")
-        let wantsConnection = effectiveHudEnabled() || wantsTranslation
-        let runningWithoutDebugPort = wantsConnection
-            && Self.isAntigravityRunning()
-            && !(Self.hasLiveDevToolsPort() || Self.hasLiveAntigravityWithDebugPort())
-        if statusValue.mode == "debug-port-missing" || runningWithoutDebugPort {
-            safeRelaunchAntigravityForDebug()
+        let running = Self.isAntigravityRunning()
+        guard running else {
+            launchAntigravityDirectly()
             return
         }
-        launchAntigravityDirectly()
+        let key = ObjectIdentifier(self)
+        guard !openAntigravityProbeInFlightIds.contains(key) else { return }
+        openAntigravityProbeInFlightIds.insert(key)
+        let wantsTranslation = statusValue.translationEnabled ?? (effectiveConfiguredLanguage() != "en")
+        let wantsConnection = effectiveHudEnabled() || wantsTranslation
+        let isDebugPortMissingMode = statusValue.mode == "debug-port-missing"
+        let appPath = targetApplication.path
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let needsDebugPortRelaunch: Bool
+            if isDebugPortMissingMode {
+                needsDebugPortRelaunch = true
+            } else if wantsConnection {
+                needsDebugPortRelaunch = !(Self.hasLiveDevToolsPort() || Self.hasLiveAntigravityWithDebugPort())
+            } else {
+                needsDebugPortRelaunch = false
+            }
+            let needsProxy: Bool
+            if needsDebugPortRelaunch {
+                needsProxy = false
+            } else if case .active = proxyResolution {
+                switch SystemProxyResolver.inspectRunningAntigravity(expected: proxyResolution, appPath: appPath) {
+                case .missing, .mismatch:
+                    needsProxy = true
+                case .notRunning, .matched, .overriddenByShell:
+                    needsProxy = false
+                }
+            } else {
+                needsProxy = false
+            }
+            DispatchQueue.main.async {
+                openAntigravityProbeInFlightIds.remove(key)
+                guard let self, !self.quitting else { return }
+                if Self.isAntigravityRunning() && (needsDebugPortRelaunch || needsProxy) {
+                    self.safeRelaunchAntigravityForDebug()
+                } else {
+                    self.launchAntigravityDirectly()
+                }
+            }
+        }
         #endif
     }
 
@@ -389,20 +745,44 @@ extension Assistant {
         let key = ObjectIdentifier(self)
         guard !safeRelaunchInFlightIds.contains(key) else { return }
         safeRelaunchInFlightIds.insert(key)
+        updateViews()
 
         #if NATIVE_UI_TEST
         guard safeRelaunchTestingHooksById[key] != nil else {
             safeRelaunchInFlightIds.remove(key)
+            updateViews()
             return
         }
-        #endif
         performSafeRelaunchAfterConfirm(key: key)
+        #else
+        if statusValue.sshWindowsCount > 0 {
+            let hostsSummary = statusValue.activeSshHosts.isEmpty
+                ? "SSH"
+                : statusValue.activeSshHosts.joined(separator: L10n.shared.isEnglish ? ", " : "、")
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = L10n.t("ssh.relaunch.confirm_title", fallback: "确认安全重启 Antigravity？")
+            alert.informativeText = L10n.t("ssh.relaunch.active_windows_warning", ["count": statusValue.sshWindowsCount, "hosts": hostsSummary])
+            alert.addButton(withTitle: L10n.t("ssh.relaunch.confirm_btn", fallback: "继续安全重启"))
+            alert.addButton(withTitle: L10n.t("common.cancel"))
+            presentSheetAlert(alert) { [weak self] resp in
+                guard resp == .alertFirstButtonReturn else {
+                    safeRelaunchInFlightIds.remove(key)
+                    self?.updateViews()
+                    return
+                }
+                self?.performSafeRelaunchAfterConfirm(key: key)
+            }
+            return
+        }
+        performSafeRelaunchAfterConfirm(key: key)
+        #endif
     }
 
     private func performSafeRelaunchAfterConfirm(key: ObjectIdentifier) {
         suppressLifecycleAutoQuit(seconds: 30.0)
 
-        let terminateTargets: () -> Void = {
+        let terminateTargets: (Bool) -> Void = { activateFirst in
             #if NATIVE_UI_TEST
             if let hook = safeRelaunchTestingHooksById[key]?.terminate {
                 hook()
@@ -412,16 +792,19 @@ extension Assistant {
             let matchingApps = NSRunningApplication.runningApplications(withBundleIdentifier: DesktopApplicationTarget().bundleIdentifier)
                 .filter { DesktopApplicationTarget.matchesAny($0) && !$0.isTerminated }
             for app in matchingApps {
+                if activateFirst {
+                    _ = app.activate(options: [])
+                }
                 _ = app.terminate()
             }
         }
 
         let start = Date()
-        terminateTargets()
+        terminateTargets(false)
 
         #if NATIVE_UI_TEST
         let hooks = safeRelaunchTestingHooksById[key]
-        let maxWaitSeconds = hooks?.timeoutSeconds ?? 10.0
+        let maxWaitSeconds = hooks?.timeoutSeconds ?? 15.0
         let pollIntervalMs = hooks?.pollIntervalMilliseconds ?? 150
         let settleDelayMs = 20
 
@@ -440,14 +823,19 @@ extension Assistant {
                         return
                     }
                     self.suppressLifecycleAutoQuit(seconds: 20.0)
-                    self.relaunchAntigravityForSafeDebug(attemptsRemaining: 3, attemptNumber: 1, key: key)
+                    self.relaunchAntigravityForSafeDebug(
+                        attemptsRemaining: 3,
+                        attemptNumber: 1,
+                        key: key
+                    )
                 }
                 return
             }
             if Date().timeIntervalSince(start) >= maxWaitSeconds {
                 safeRelaunchInFlightIds.remove(key)
+                updateViews()
                 showMessage(
-                    L10n.t("assistant.safe_relaunch_timeout", fallback: "Antigravity 在 10 秒内未能退出，未强制关闭。请先保存工作并手动退出 Antigravity，再通过「打开 Antigravity」重新启动。"),
+                    L10n.t("assistant.safe_relaunch_timeout", fallback: "Antigravity 在 15 秒内未能退出，未强制关闭。请先保存工作并手动退出 Antigravity，再通过「打开 Antigravity」重新启动。"),
                     error: true
                 )
                 refresh()
@@ -472,13 +860,15 @@ extension Assistant {
         #else
         let appPaths = DesktopApplicationTarget.allTargets.map(\.path)
         let queue = DispatchQueue(label: "local.gravitybox.safe-relaunch", qos: .userInitiated)
-        let maxWaitSeconds: TimeInterval = 10.0
+        let maxWaitSeconds: TimeInterval = 15.0
         let pollIntervalMs = 150
         let settleDelayMs = 300
+        var retriedTerminate = false
 
         func pollStep() {
-            // Safe relaunch only resets the Electron UI shell for --remote-debugging-port; ignore external/detached language_server processes.
-            let stillRunning = DesktopApplicationTarget.isRegisteredRunning()
+            // Safe relaunch only resets the Electron UI shell for --remote-debugging-port; ignore detached language_server / sidecar_sdk trees.
+            let registeredRunning = DesktopApplicationTarget.isRegisteredRunning()
+            let stillRunning = registeredRunning
                 || Self.hasLiveAntigravitySubprocesses(appPaths: appPaths, includeLanguageServer: false)
             if !stillRunning {
                 queue.asyncAfter(deadline: .now() + .milliseconds(settleDelayMs)) { [weak self] in
@@ -488,22 +878,37 @@ extension Assistant {
                             return
                         }
                         self.suppressLifecycleAutoQuit(seconds: 20.0)
-                        self.relaunchAntigravityForSafeDebug(attemptsRemaining: 3, attemptNumber: 1, key: key)
+                        self.relaunchAntigravityForSafeDebug(
+                            attemptsRemaining: 3,
+                            attemptNumber: 1,
+                            key: key
+                        )
                     }
                 }
                 return
             }
-            if Date().timeIntervalSince(start) >= maxWaitSeconds {
+            let elapsed = Date().timeIntervalSince(start)
+            if elapsed >= maxWaitSeconds {
+                let roles = Self.liveBlockingProcessRoles(appPaths: appPaths, includeLanguageServer: false)
+                let roleSummary = roles.isEmpty ? (registeredRunning ? "registered-app" : "unknown") : roles.joined(separator: ",")
+                lifecycleLogger.warning("安全重启等待 Antigravity 退出超时 (15s)，未强制关闭；阻塞进程角色: \(roleSummary, privacy: .public)")
                 DispatchQueue.main.async { [weak self] in
                     safeRelaunchInFlightIds.remove(key)
                     guard let self else { return }
+                    self.updateViews()
                     self.showMessage(
-                        L10n.t("assistant.safe_relaunch_timeout", fallback: "Antigravity 在 10 秒内未能退出，未强制关闭。请先保存工作并手动退出 Antigravity，再通过「打开 Antigravity」重新启动。"),
+                        L10n.t("assistant.safe_relaunch_timeout", fallback: "Antigravity 在 15 秒内未能退出，未强制关闭。请先保存工作并手动退出 Antigravity，再通过「打开 Antigravity」重新启动。"),
                         error: true
                     )
                     self.refresh()
                 }
                 return
+            }
+            if !retriedTerminate && elapsed >= 2.0 && registeredRunning {
+                retriedTerminate = true
+                DispatchQueue.main.async {
+                    terminateTargets(true)
+                }
             }
             queue.asyncAfter(deadline: .now() + .milliseconds(pollIntervalMs)) { [weak self] in
                 guard self != nil else {
@@ -524,7 +929,11 @@ extension Assistant {
         #endif
     }
 
-    private func relaunchAntigravityForSafeDebug(attemptsRemaining: Int = 3, attemptNumber: Int = 1, key: ObjectIdentifier) {
+    private func relaunchAntigravityForSafeDebug(
+        attemptsRemaining: Int = 3,
+        attemptNumber: Int = 1,
+        key: ObjectIdentifier
+    ) {
         #if NATIVE_UI_TEST
         let hooks = safeRelaunchTestingHooksById[key]
         let retryDelayMs = hooks?.relaunchRetryDelayMilliseconds ?? 20
@@ -538,6 +947,7 @@ extension Assistant {
                     if launched {
                         safeRelaunchInFlightIds.remove(key)
                         self.openedApplications += 1
+                        self.updateViews()
                         self.refresh()
                     } else if attemptsRemaining > 1 {
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(retryDelayMs)) { [weak self] in
@@ -553,6 +963,7 @@ extension Assistant {
                         }
                     } else {
                         safeRelaunchInFlightIds.remove(key)
+                        self.updateViews()
                         self.showMessage(
                             L10n.t("assistant.safe_relaunch_failed", ["detail": L10n.t("assistant.relaunch_manual")]),
                             error: true
@@ -565,16 +976,18 @@ extension Assistant {
         }
         safeRelaunchInFlightIds.remove(key)
         launchAntigravityDirectly()
+        updateViews()
         refresh()
         return
         #else
         suppressLifecycleAutoQuit(seconds: 30.0)
         let launchPath = DesktopApplicationTarget.preferredLaunchPath(fallbackChannel: Self.applicationChannel)
+        let launchEnv = currentAntigravityLaunchEnvironment()
         if attemptsRemaining <= 1 {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                proc.arguments = ["-a", launchPath, "--args"] + Self.remoteDebuggingArguments
+                proc.arguments = Self.makeOpenCommandArguments(launchPath: launchPath, environment: launchEnv)
                 proc.standardOutput = FileHandle.nullDevice
                 proc.standardError = FileHandle.nullDevice
                 let launchError: Error? = {
@@ -586,7 +999,7 @@ extension Assistant {
                         return error
                     }
                 }()
-                let result = Self.waitForDebugReadyLaunch(maxWaitSeconds: 3.0)
+                let result = Self.waitForDebugReadyLaunch(maxWaitSeconds: 6.0)
                 guard let self else {
                     DispatchQueue.main.async { safeRelaunchInFlightIds.remove(key) }
                     return
@@ -602,10 +1015,10 @@ extension Assistant {
             return
         }
 
-        let config = Self.makeOpenConfiguration()
+        let config = Self.makeOpenConfiguration(environment: launchEnv)
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: launchPath), configuration: config) { [weak self] _, openError in
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let result = Self.waitForDebugReadyLaunch(maxWaitSeconds: 2.5)
+                let result = Self.waitForDebugReadyLaunch(maxWaitSeconds: 5.0)
                 guard let self else {
                     DispatchQueue.main.async { safeRelaunchInFlightIds.remove(key) }
                     return
@@ -623,7 +1036,7 @@ extension Assistant {
     }
 
     #if !NATIVE_UI_TEST
-    private static func waitForDebugReadyLaunch(maxWaitSeconds: TimeInterval = 2.5) -> (running: Bool, debugReady: Bool) {
+    private static func waitForDebugReadyLaunch(maxWaitSeconds: TimeInterval = 5.0) -> (running: Bool, debugReady: Bool) {
         let deadline = Date().addingTimeInterval(maxWaitSeconds)
         while Date() < deadline {
             let running = isAntigravityRunning()
@@ -652,7 +1065,7 @@ extension Assistant {
             }
             if result.debugReady {
                 safeRelaunchInFlightIds.remove(key)
-                self.antigravityWasRunning = true
+                self.updateViews()
                 self.refresh()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     self?.refresh()
@@ -668,9 +1081,7 @@ extension Assistant {
                 return
             }
             safeRelaunchInFlightIds.remove(key)
-            if result.running {
-                self.antigravityWasRunning = true
-            }
+            self.updateViews()
             let detail = launchError?.localizedDescription ?? L10n.t("assistant.relaunch_manual")
             self.showMessage(L10n.t("assistant.safe_relaunch_failed", ["detail": detail]), error: true)
             self.refresh()
@@ -685,11 +1096,12 @@ extension Assistant {
         #else
         suppressLifecycleAutoQuit(seconds: 30.0)
         let launchPath = DesktopApplicationTarget.preferredLaunchPath(fallbackChannel: Self.applicationChannel)
+        let launchEnv = currentAntigravityLaunchEnvironment()
         if attemptsRemaining <= 1 {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                proc.arguments = ["-a", launchPath, "--args"] + Self.remoteDebuggingArguments
+                proc.arguments = Self.makeOpenCommandArguments(launchPath: launchPath, environment: launchEnv)
                 proc.standardOutput = FileHandle.nullDevice
                 proc.standardError = FileHandle.nullDevice
                 let launchError: Error? = {
@@ -715,14 +1127,13 @@ extension Assistant {
             return
         }
 
-        let config = Self.makeOpenConfiguration()
+        let config = Self.makeOpenConfiguration(environment: launchEnv)
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: launchPath), configuration: config) { [weak self] app, error in
             guard let self else { return }
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 guard let self else { return }
                 let running = Self.isAntigravityRunning() || (app != nil && app?.isTerminated == false)
                 if running {
-                    DispatchQueue.main.async { self.antigravityWasRunning = true }
                     return
                 }
                 if attemptsRemaining > 1 {
@@ -749,92 +1160,10 @@ extension Assistant {
         DesktopApplicationTarget.isRegisteredRunning()
     }
 
-    func installAntigravityLifecycleObserver() {
+    func cleanupLegacyLifecycleAgent() {
         #if !NATIVE_UI_TEST
-        antigravityWasRunning = Self.isAntigravityRunning()
-        let nc = NSWorkspace.shared.notificationCenter
-        if let obs = workspaceLaunchObserver { nc.removeObserver(obs) }
-        if let obs = workspaceTerminateObserver { nc.removeObserver(obs) }
-        workspaceLaunchObserver = nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            guard let self else { return }
-            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, Self.isAntigravityApp(app) {
-                self.antigravityWasRunning = true
-            } else if Self.isAntigravityRunning() {
-                self.antigravityWasRunning = true
-            }
-        }
-        workspaceTerminateObserver = nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
-            guard let self else { return }
-            let matchedApp = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication).map(Self.isAntigravityApp) ?? false
-            guard matchedApp || (self.antigravityWasRunning && !Self.isAntigravityRunning()) else { return }
-            self.checkAntigravityExitedAndQuitIfNeeded()
-        }
-        #endif
-    }
-
-    func checkAntigravityExitedAndQuitIfNeeded() {
-        #if !NATIVE_UI_TEST
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            guard let self else { return }
-            if Self.isAntigravityRunning() {
-                self.antigravityWasRunning = true
-                return
-            }
-            let wasRunning = self.antigravityWasRunning
-            self.antigravityWasRunning = false
-            guard wasRunning,
-                  self.configuration?.value.syncAntigravityLifecycle == true,
-                  !self.quitting,
-                  Date() >= self.suppressLifecycleAutoQuitUntil else { return }
-            self.stopBackendAndQuit()
-        }
-        #endif
-    }
-
-    func syncLifecycleAgentRegistration() {
-        #if !NATIVE_UI_TEST
-        antigravityWasRunning = Self.isAntigravityRunning()
-        let enabled = configuration?.value.syncAntigravityLifecycle == true
-        let launchAgentsDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
-        let plistURL = launchAgentsDir.appendingPathComponent("\(Self.lifecycleAgentLabel).plist")
-        let installedExec = "/Applications/GravityBox.app/Contents/MacOS/GravityBox"
-        let executablePath = FileManager.default.isExecutableFile(atPath: installedExec)
-            ? installedExec
-            : (Bundle.main.executableURL?.path ?? installedExec)
-        let uid = getuid()
         DispatchQueue.global(qos: .utility).async {
-            let fm = FileManager.default
-            func runLaunchctl(_ args: [String]) {
-                let task = Process()
-                task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                task.arguments = args
-                task.standardOutput = FileHandle.nullDevice
-                task.standardError = FileHandle.nullDevice
-                try? task.run()
-                task.waitUntilExit()
-            }
-            if enabled {
-                try? fm.createDirectory(at: launchAgentsDir, withIntermediateDirectories: true)
-                let plist: [String: Any] = [
-                    "Label": Self.lifecycleAgentLabel,
-                    "ProgramArguments": [executablePath, "--lifecycle-agent"],
-                    "RunAtLoad": true,
-                    "KeepAlive": true,
-                    "ProcessType": "Background"
-                ]
-                if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-                    try? data.write(to: plistURL, options: .atomic)
-                    runLaunchctl(["bootout", "gui/\(uid)", plistURL.path])
-                    runLaunchctl(["bootstrap", "gui/\(uid)", plistURL.path])
-                }
-            } else {
-                if fm.fileExists(atPath: plistURL.path) {
-                    runLaunchctl(["bootout", "gui/\(uid)", plistURL.path])
-                    try? fm.removeItem(at: plistURL)
-                } else {
-                    runLaunchctl(["bootout", "gui/\(uid)/\(Self.lifecycleAgentLabel)"])
-                }
-            }
+            AntigravityLifecycleAgent.cleanupPlistAndBootout()
         }
         #endif
     }
@@ -863,13 +1192,14 @@ extension Assistant {
                 switch result {
                 case .success:
                     lifecycleLogger.info("后台子进程自愈重启成功，重新同步状态与用量。")
+                    self.syncBackendProxyConfiguration()
                     self.refresh()
                     if self.contentVisible && self.currentPage == 2 {
                         self.usagePage?.fetch()
                     }
                     if self.isMenuPanelShown, let panel = self.menuPanelController {
                         let periodKey = MenuPanelController.periods[max(0, min(MenuPanelController.periods.count - 1, panel.selectedPeriod))]
-                        self.fetchUsageSummary(period: periodKey, force: true, allowCached: false)
+                        self.fetchUsageSummary(period: periodKey, environmentId: panel.selectedEnvironmentId, force: true, allowCached: false)
                     }
                 case .failure(let error):
                     lifecycleLogger.error("后台子进程自愈重启失败: \(error.localizedDescription, privacy: .private)")
@@ -1010,73 +1340,30 @@ extension Assistant {
 
 #if !NATIVE_UI_TEST
 enum AntigravityLifecycleAgent {
-    private static var cachedConfigMtime: Date?
-    private static var cachedSyncEnabled: Bool = false
-
-    static func isSyncEnabled() -> Bool {
-        let configURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/GravityBox/config.json")
-        let mtime = (try? FileManager.default.attributesOfItem(atPath: configURL.path))?[.modificationDate] as? Date
-        if let mtime, mtime == cachedConfigMtime {
-            return cachedSyncEnabled
+    static func cleanupPlistAndBootout() {
+        let fm = FileManager.default
+        let plistURL = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(Assistant.lifecycleAgentLabel).plist")
+        let hadPlist = fm.fileExists(atPath: plistURL.path)
+        let uid = getuid()
+        func runLaunchctl(_ args: [String]) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            task.arguments = args
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+            task.waitUntilExit()
         }
-        guard let data = try? Data(contentsOf: configURL),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            cachedConfigMtime = nil
-            cachedSyncEnabled = false
-            return false
+        if hadPlist {
+            runLaunchctl(["bootout", "gui/\(uid)", plistURL.path])
+            try? fm.removeItem(at: plistURL)
         }
-        cachedConfigMtime = mtime
-        Assistant.applicationChannel = "stable"
-        cachedSyncEnabled = (raw["syncAntigravityLifecycle"] as? Bool == true)
-        return cachedSyncEnabled
-    }
-
-    static func isMainGravityBoxRunning() -> Bool {
-        Assistant.findExistingMainPeer(excludingPid: getpid()) != nil
-    }
-
-    static func launchGravityBoxIfNeeded() {
-        guard isSyncEnabled(), !isMainGravityBoxRunning() else { return }
-        let installedURL = URL(fileURLWithPath: "/Applications/GravityBox.app")
-        let bundleURL = FileManager.default.fileExists(atPath: installedURL.path) ? installedURL : Bundle.main.bundleURL
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = false
-        config.createsNewApplicationInstance = false
-        config.arguments = ["--launched-by-antigravity"]
-        NSWorkspace.shared.openApplication(at: bundleURL, configuration: config, completionHandler: nil)
+        runLaunchctl(["bootout", "gui/\(uid)/\(Assistant.lifecycleAgentLabel)"])
     }
 
     static func run() -> Never {
-        if !isSyncEnabled() { exit(0) }
-        var wasRunning = Assistant.isAntigravityRunning()
-        let nc = NSWorkspace.shared.notificationCenter
-        nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { note in
-            if !isSyncEnabled() { exit(0) }
-            if let launched = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-               Assistant.isAntigravityApp(launched) {
-                wasRunning = true
-                launchGravityBoxIfNeeded()
-            }
-        }
-        nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { _ in
-            if !Assistant.isAntigravityRunning() {
-                wasRunning = false
-            }
-        }
-        let timer = Timer(timeInterval: 6.0, repeats: true) { _ in
-            if !isSyncEnabled() { exit(0) }
-            let nowRunning = Assistant.isAntigravityRunning()
-            if nowRunning && !wasRunning {
-                wasRunning = true
-                launchGravityBoxIfNeeded()
-            } else if !nowRunning {
-                wasRunning = false
-            }
-        }
-        timer.tolerance = 1.5
-        RunLoop.main.add(timer, forMode: .common)
-        RunLoop.main.run()
+        cleanupPlistAndBootout()
         exit(0)
     }
 }

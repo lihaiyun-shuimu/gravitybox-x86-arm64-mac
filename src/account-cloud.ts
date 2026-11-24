@@ -1,5 +1,7 @@
 import { CloudQuotaAuthorityError, mergeSubscriptionTier, type CloudProviderContext } from './account-probe.js';
 import { bt } from './i18n.js';
+import { normalizeCatalogTierLabel } from './pricing.js';
+import { resolveOutboundFetch } from './proxy.js';
 import {
   CodedAccountError,
   accountErrorCode,
@@ -71,6 +73,7 @@ export async function fetchCloudQuotaForAccount(params: {
   onTokenRefreshed: (account: Account, previousRefresh: string) => Promise<void>;
 }): Promise<Account> {
   const { account, providerContext, fetchImpl, signal } = params;
+  const outboundFetch = resolveOutboundFetch(fetchImpl);
   const endpointSet=(method:string,legacy:string[])=>providerContext?[providerContext.origin+'/v1internal:'+method]:legacy;
   const providerAgent=providerContext?.userAgent??'Antigravity/0.9.0';
   account.quota_refresh_error = null;
@@ -115,13 +118,31 @@ export async function fetchCloudQuotaForAccount(params: {
         throw new CodedAccountError('missing_oauth_client', bt('account_cloud.err.missing_oauth_client'));
       }
       try {
-        const response = await fetchImpl('https://oauth2.googleapis.com/token', {
+        const response = await outboundFetch('https://oauth2.googleapis.com/token', {
           method: 'POST', signal: requestSignal(10000),
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret,
             refresh_token: account.token.refresh_token, grant_type: 'refresh_token' }).toString(),
         });
-        if (!response.ok) throw new CodedAccountError('refresh_failed', bt('account_cloud.err.refresh_failed'));
+        if (!response.ok) {
+          let oauthError = '';
+          try {
+            const rawErr: any = typeof response.json === 'function'
+              ? await response.json()
+              : JSON.parse(await (response as any).text());
+            if (typeof rawErr?.error === 'string') oauthError = rawErr.error.trim().toLowerCase();
+          } catch {}
+          if (response.status === 429) {
+            throw new CodedAccountError('oauth_rate_limited', bt('account_cloud.err.oauth_rate_limited'));
+          }
+          if (response.status >= 500) {
+            throw new CodedAccountError('oauth_server_error', bt('account_cloud.err.oauth_server_error'));
+          }
+          if (oauthError === 'invalid_client' || oauthError === 'unauthorized_client') {
+            throw new CodedAccountError('oauth_client_error', bt('account_cloud.err.oauth_client_error'));
+          }
+          throw new CodedAccountError('refresh_failed', bt('account_cloud.err.refresh_failed'));
+        }
         const data: any = typeof response.json === 'function'
           ? await response.json()
           : JSON.parse(await (response as any).text());
@@ -157,7 +178,7 @@ export async function fetchCloudQuotaForAccount(params: {
       return Promise.all(ordered(endpoints).map(async endpoint => {
         if (parentSignal.aborted) return { endpoint, ok: false, error: bt('account_cloud.err.aborted') };
         try {
-          const response = await fetchImpl(endpoint, {
+          const response = await outboundFetch(endpoint, {
             method: 'POST', signal: requestSignal(6000),
             headers: {
               Authorization: `Bearer ${account.token.access_token}`,
@@ -171,7 +192,7 @@ export async function fetchCloudQuotaForAccount(params: {
             if (providerContext && endpoint.endsWith(':retrieveUserQuotaSummary') && failure.includes('3501')) {
               await loadReady;
               if (projectObserved && projectId) {
-                const retry = await fetchImpl(endpoint,{method:'POST',signal:requestSignal(6000),headers:{Authorization:`Bearer ${account.token.access_token}`,'Content-Type':'application/json','User-Agent':providerAgent},body:JSON.stringify({project:projectId})});
+                const retry = await outboundFetch(endpoint,{method:'POST',signal:requestSignal(6000),headers:{Authorization:`Bearer ${account.token.access_token}`,'Content-Type':'application/json','User-Agent':providerAgent},body:JSON.stringify({project:projectId})});
                 if(!retry.ok)return {endpoint,ok:false,error:await httpFailure(retry)};
                 const data=await retry.json() as T;
                 if(!normalizeCloudGroups(data,nowSec).some(group=>group.buckets.some(bucket=>bucket.remaining_fraction_known)))return{endpoint,ok:false,error:bt('account_cloud.err.project_no_verifiable_quota')};
@@ -180,7 +201,7 @@ export async function fetchCloudQuotaForAccount(params: {
             }
             if (!projectId || JSON.stringify(body(projectId))===JSON.stringify(body(null))) return { endpoint, ok: false, error: failure };
             // 403/权限受阻时按官方惯例去掉 project 再试一次（同端点内重试）。
-            const retry = await fetchImpl(endpoint, {
+            const retry = await outboundFetch(endpoint, {
               method: 'POST', signal: requestSignal(6000),
               headers: {
                 Authorization: `Bearer ${account.token.access_token}`,
@@ -321,6 +342,26 @@ export async function fetchCloudQuotaForAccount(params: {
           matchModelToSharedPool(m, freshWindows, freshGroups, subscriptionTier, freshModels) === null
       )
     );
+    const normalizedSubscriptionTier = normalizeCatalogTierLabel(subscriptionTier);
+    const missingIndependentModelIds = new Set<string>();
+    for (const item of freshStandalone) {
+      if (item.availability !== 'disabled' && item.quotaState !== 'known' && item.key) {
+        missingIndependentModelIds.add(item.key);
+      }
+    }
+    for (const m of freshModels) {
+      if (isExcludedFromStandaloneModelPool(m) || m.own_percentage_known) continue;
+      const isMissingOther =
+        m.family === 'other' &&
+        matchModelToSharedPool(m, freshWindows, freshGroups, subscriptionTier, freshModels) === null;
+      const isMissingStandaloneFamily =
+        (m.family === 'argon' && freshArgon.mode !== 'unified' && freshArgon.mode !== 'disabled') ||
+        (m.family === 'carbon' && freshCarbon.mode !== 'unified' && freshCarbon.mode !== 'disabled');
+      if (isMissingOther || isMissingStandaloneFamily) {
+        if (m.model_id) missingIndependentModelIds.add(m.model_id);
+        if (m.name) missingIndependentModelIds.add(m.name);
+      }
+    }
     const needIndependentQuota = providerContext !== null && (needOtherStandaloneQuota || (['argon', 'carbon'] as const).some(family => {
       const status = family === 'argon' ? freshArgon : freshCarbon;
       if (status.mode === 'unified' || status.mode === 'disabled') return false;
@@ -328,7 +369,7 @@ export async function fetchCloudQuotaForAccount(params: {
       const hasFamilyGroup = freshGroups.some(g => g.family === family && !isGroupAllDisabled(g));
       if (hasFamilyGroup || familyModels.some(m => m.own_percentage_known)) return false;
       if (family === 'argon') {
-        if (familyModels.length === 0 && freshGroups.length > 0 && /free|starter|ultra/i.test(subscriptionTier ?? '')) {
+        if (familyModels.length === 0 && freshGroups.length > 0 && (normalizedSubscriptionTier === 'FREE' || normalizedSubscriptionTier === 'ULTRA')) {
           return false;
         }
         return true;
@@ -337,7 +378,8 @@ export async function fetchCloudQuotaForAccount(params: {
     }));
     if (needIndependentQuota && providerContext) {
       const independent=await queryAll<any>([providerContext.origin+'/v1internal:retrieveUserQuota'],()=>projectContextRecovered&&projectObserved&&projectId?{project:projectId}:{});
-      for(const result of independent) {note('independent-quota',result.endpoint,result.ok);if(result.ok)freshModels=mergeModelCatalogues([freshModels,normalizeIndependentArgonQuota(result.data,nowSec)]);}
+      const independentOpts = missingIndependentModelIds.size > 0 ? { allowedModelIds: missingIndependentModelIds } : undefined;
+      for(const result of independent) {note('independent-quota',result.endpoint,result.ok);if(result.ok)freshModels=mergeModelCatalogues([freshModels,normalizeIndependentArgonQuota(result.data,nowSec,independentOpts)]);}
       freshModels = resolveModelsWithGroupDescriptions(freshModels, freshGroups);
     }
 

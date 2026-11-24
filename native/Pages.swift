@@ -1,4 +1,5 @@
 import Cocoa
+import QuartzCore
 
 final class BentoShareBarView: NSView {
     let fraction: CGFloat
@@ -56,6 +57,130 @@ private final class BentoRowStackView: NSStackView {
     }
 }
 
+/// Subtle neutral micro-badge marking the Hero card as local when SSH hosts are present under "All" / "Local".
+private final class LocalScopeMicroBadge: NSView {
+    override var allowsVibrancy: Bool { false }
+    private let iconView = NSImageView()
+    private let label = text("", size: 10.5, weight: .medium)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        let img = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10.5, weight: .medium))
+        img?.isTemplate = true
+        iconView.image = img
+        iconView.setAccessibilityElement(false)
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        label.setAccessibilityElement(false)
+        label.font = .systemFont(ofSize: 10.5, weight: .medium)
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(iconView)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 19),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 12),
+            iconView.heightAnchor.constraint(equalToConstant: 11),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 3.5),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6.5),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+        refreshTitleAndColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    private static let tintColor = Design.dynamicAlpha(Design.color(0x5C6470, 0xBEC2CC), 0.95, 0.92)
+    private static let fillColor = Design.dynamicAlpha(Design.color(0xF4F5F8, 0xFFFFFF), 1.0, 0.055)
+    private static let strokeColor = Design.dynamicAlpha(Design.color(0x000000, 0xFFFFFF), 0.065, 0.095)
+
+    func refreshTitleAndColors() {
+        let title = L10n.t("ssh.scope.local", fallback: "本机")
+        if label.stringValue != title {
+            label.stringValue = title
+            invalidateIntrinsicContentSize()
+        }
+        setAccessibilityLabel(title)
+        iconView.contentTintColor = Self.tintColor
+        label.textColor = Self.tintColor
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 6.0 + 12.0 + 3.5 + ceil(label.intrinsicContentSize.width) + 6.5, height: 19)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshTitleAndColors()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 2 && bounds.height > 2 else { return }
+        let outerRect = bounds.insetBy(dx: 0.25, dy: 0.25)
+        let path = NSBezierPath(roundedRect: outerRect, xRadius: 5.25, yRadius: 5.25)
+        Self.fillColor.setFill()
+        path.fill()
+        Self.strokeColor.setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+    }
+}
+
+private final class CompanionStatusDotView: NSView {
+    var state: SshHostState = .online {
+        didSet {
+            guard oldValue != state else { return }
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 6),
+            heightAnchor.constraint(equalToConstant: 6)
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let color = SshEnvironmentVisuals.statusDotColor(for: state, appearance: effectiveAppearance)
+        let dotRect = NSRect(x: 0.25, y: 0.25, width: bounds.width - 0.5, height: bounds.height - 0.5)
+        if SshEnvironmentVisuals.isStatusDotFilled(for: state) {
+            color.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+        } else {
+            color.setStroke()
+            let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.65, dy: 0.65))
+            ring.lineWidth = 1.15
+            ring.stroke()
+        }
+    }
+}
+
 final class DashboardPage: NSObject {
     static let tallBentoExpandThreshold: CGFloat = 322
     static let tallBentoCollapseThreshold: CGFloat = 314
@@ -63,9 +188,13 @@ final class DashboardPage: NSObject {
     unowned let app: Assistant
     let view: NSView
 
+    // 顶栏同源环境切换器 + 轻文本占比
+    let contextPill = EnvironmentContextPill(style: .headerPill, compact: false, minWidth: 68, maxWidth: 168, height: 26)
+    let contextMetaLabel = text("", size: 11.5, weight: .regular, color: .secondaryLabelColor)
+
     // Hero 账号与 5 桶配额
     let debugPortTitleLabel = text(L10n.t("status.debug_port_missing", fallback: "未开启调试端口"), size: 12.5, weight: .semibold, color: .labelColor)
-    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。"), size: 11.5, color: Design.secondary, wrap: true)
+    let debugPortBodyLabel = text(L10n.t("debug_port_missing.banner_body", fallback: "未带调试端口运行，请安全重启以连接；建议通过 GravityBox 启动 Antigravity。"), size: 11.5, color: Design.secondary, wrap: true)
     let safeRelaunchButton = button(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接"), target: nil, action: #selector(safeRelaunchAntigravityPressed))
     let debugPortBannerBox: NSBox
     let activeAccountLabel = text(L10n.t("overview.loading_account"), size: 16, weight: .semibold)
@@ -74,11 +203,20 @@ final class DashboardPage: NSObject {
     let accountStatusLabel = text("", size: 11, color: Design.secondary, wrap: true)
     let activeEmailLabel = text("", size: 11, color: .secondaryLabelColor, wrap: true)
     let tierBadge = TierBadge(L10n.t("overview.tier_pending"), scale: .regular)
-    let currentAccountPill = pillBadge("", color: Design.blue)
+    private let heroLocalScopeBadge = LocalScopeMicroBadge()
+    let heroRemoteHostBadge = SshHostTagBadge(scale: .regular, showStatusDot: true)
     // F04: percentage = remaining quota, so the title carries the "剩余" semantics explicitly.
     let coreQuotaStack = NSStackView()
     let standaloneDivider = divider()
     let standaloneQuotaStack = NSStackView()
+    private let companionDivider = divider()
+    private let companionRowsStack = NSStackView()
+    let companionMoreButton = DesignInlineButton(title: "", target: nil, action: nil)
+    private let companionSection = NSStackView()
+    private var companionFingerprint = ""
+    private var heroCardBox: NSBox?
+    private var environmentChangeGeneration: Int = 0
+    private(set) var metricsContainer: NSView?
     let refreshQuotaButton: QuotaRefreshButton
 
     // 三磁贴 Bento 磁贴
@@ -108,8 +246,13 @@ final class DashboardPage: NSObject {
 
     var metricsKey = ""
     var metricsLoading = false
+    private var activeRequestEnvId: String? = nil
+    private var requestGeneration: Int = 0
     var lastMetricsFetchTime: Date = .distantPast
     var lastSuccessfulSummary: [String: Any]?
+    private var cachedSummariesByEnv: [String: [String: Any]] = [:]
+    private var cachedSummaryFetchTimeByEnv: [String: Date] = [:]
+    private var lastRenderedContextKey: String = "all"
     let dataTimestampLabel = text("", size: 11, color: .secondaryLabelColor)
     let usageQualityLabel = text("", size: 11.5, color: .secondaryLabelColor, wrap: true)
 
@@ -162,13 +305,27 @@ final class DashboardPage: NSObject {
         debugBanner.isHidden = true
         debugPortBannerBox = debugBanner
 
-        let stack = pageStack(title: L10n.t("overview.title"))
-        stack.spacing = Design.Spacing.standard
+        let titleLabel = text(L10n.t("overview.title"), size: 24, weight: .semibold)
+        titleLabel.identifier = NSUserInterfaceItemIdentifier("page-title")
+        titleLabel.setContentHuggingPriority(.required, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        contextMetaLabel.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+        contextMetaLabel.lineBreakMode = .byTruncatingTail
+        contextMetaLabel.maximumNumberOfLines = 1
+        contextMetaLabel.setContentHuggingPriority(.required, for: .horizontal)
+        contextMetaLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        contextMetaLabel.isHidden = true
+        let headerRow = horizontal([titleLabel, contextPill, flexibleSpace(), contextMetaLabel], spacing: 10)
+        headerRow.alignment = .centerY
+        headerRow.detachesHiddenViews = true
+        let stack = vertical([headerRow], spacing: Design.Spacing.standard)
+
         activeAccountLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         activeAccountLabel.lineBreakMode = .byTruncatingTail
         activeAccountLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         activeAccountLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        accountStatusLabel.maximumNumberOfLines = 2
+        accountStatusLabel.maximumNumberOfLines = 1
         accountStatusLabel.lineBreakMode = .byTruncatingTail
         accountStatusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         accountStatusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -181,12 +338,15 @@ final class DashboardPage: NSObject {
         activeEmailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let titleSpacer = flexibleSpace()
         titleSpacer.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-        let titleRow = horizontal([activeAccountLabel, tierBadge, titleSpacer], spacing: 6)
+        heroLocalScopeBadge.isHidden = true
+        heroLocalScopeBadge.toolTip = nil
+        heroRemoteHostBadge.isHidden = true
+        heroRemoteHostBadge.toolTip = nil
+        let titleRow = horizontal([activeAccountLabel, tierBadge, heroLocalScopeBadge, heroRemoteHostBadge, titleSpacer], spacing: 6)
         titleRow.alignment = .centerY
         titleRow.detachesHiddenViews = true
         tierBadge.setContentHuggingPriority(.required, for: .horizontal)
         tierBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
-        currentAccountPill.isHidden = true
         let identity = vertical([titleRow, activeEmailLabel, accountStatusLabel], spacing: 4)
         for row in identity.arrangedSubviews { fillWidth(row, in: identity) }
         identity.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -211,33 +371,48 @@ final class DashboardPage: NSObject {
         let quotaSectionStack = vertical([coreQuotaStack, standaloneDivider, standaloneQuotaStack], spacing: 8)
         quotaSectionStack.detachesHiddenViews = true
         for sub in quotaSectionStack.arrangedSubviews { fillWidth(sub, in: quotaSectionStack) }
-        let quotaSectionHost = NSView()
-        quotaSectionHost.translatesAutoresizingMaskIntoConstraints = false
-        quotaSectionStack.translatesAutoresizingMaskIntoConstraints = false
-        quotaSectionHost.addSubview(quotaSectionStack)
-        let tightQuotaHeight = quotaSectionHost.heightAnchor.constraint(equalTo: quotaSectionStack.heightAnchor)
-        tightQuotaHeight.priority = NSLayoutConstraint.Priority(480)
-        let maxQuotaCushion = quotaSectionHost.heightAnchor.constraint(lessThanOrEqualTo: quotaSectionStack.heightAnchor, constant: 8)
-        maxQuotaCushion.priority = NSLayoutConstraint.Priority(495)
-        NSLayoutConstraint.activate([
-            quotaSectionStack.leadingAnchor.constraint(equalTo: quotaSectionHost.leadingAnchor),
-            quotaSectionStack.trailingAnchor.constraint(equalTo: quotaSectionHost.trailingAnchor),
-            quotaSectionStack.centerYAnchor.constraint(equalTo: quotaSectionHost.centerYAnchor),
-            quotaSectionStack.topAnchor.constraint(greaterThanOrEqualTo: quotaSectionHost.topAnchor),
-            quotaSectionStack.bottomAnchor.constraint(lessThanOrEqualTo: quotaSectionHost.bottomAnchor),
-            tightQuotaHeight,
-            maxQuotaCushion
-        ])
-        quotaSectionHost.setContentHuggingPriority(NSLayoutConstraint.Priority(480), for: .vertical)
+        quotaSectionStack.setContentHuggingPriority(NSLayoutConstraint.Priority(480), for: .vertical)
+
+        companionRowsStack.orientation = .vertical
+        companionRowsStack.alignment = .leading
+        companionRowsStack.spacing = 5
+        companionRowsStack.detachesHiddenViews = true
+        companionMoreButton.isBordered = false
+        companionMoreButton.bezelStyle = .inline
+        companionMoreButton.controlSize = .small
+        companionMoreButton.font = .systemFont(ofSize: 11, weight: .medium)
+        companionMoreButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9.5, weight: .semibold))
+        companionMoreButton.image?.isTemplate = true
+        companionMoreButton.imagePosition = .imageTrailing
+        companionMoreButton.contentTintColor = Design.blue
+        companionMoreButton.toolTip = nil
+        companionMoreButton.action = #selector(companionMoreHostsPressed(_:))
+        companionMoreButton.setContentHuggingPriority(.required, for: .horizontal)
+        companionMoreButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        companionMoreButton.isHidden = true
+        companionSection.orientation = .vertical
+        companionSection.alignment = .leading
+        companionSection.spacing = 6
+        companionSection.detachesHiddenViews = true
+        companionSection.addArrangedSubview(companionDivider)
+        companionSection.addArrangedSubview(companionRowsStack)
+        companionSection.addArrangedSubview(companionMoreButton)
+        fillWidth(companionDivider, in: companionSection)
+        fillWidth(companionRowsStack, in: companionSection)
+        companionSection.isHidden = true
 
         let heroDivider = divider()
-        let heroCard = group([accountTopRow, heroDivider, quotaSectionHost, dataTimestampLabel], inset: 14, spacing: 8)
+        let heroCard = group([accountTopRow, heroDivider, quotaSectionStack, dataTimestampLabel, companionSection], inset: 14, spacing: 8)
+        heroCard.wantsLayer = true
+        heroCardBox = heroCard
         if let heroInner = groupStack(heroCard) {
             heroInner.distribution = .fill
             heroInner.detachesHiddenViews = true
             heroInner.setCustomSpacing(8, after: accountTopRow)
             heroInner.setCustomSpacing(8, after: heroDivider)
-            heroInner.setCustomSpacing(6, after: quotaSectionHost)
+            heroInner.setCustomSpacing(6, after: quotaSectionStack)
+            heroInner.setCustomSpacing(8, after: dataTimestampLabel)
         }
         heroCard.cornerRadius = Design.Radius.card
         heroCard.borderWidth = 0.5
@@ -252,6 +427,7 @@ final class DashboardPage: NSObject {
         costMetricCard = cost as? MetricCardBox
         requestsMetricCard = requests as? MetricCardBox
         let metrics = horizontal([token, cost, requests], spacing: 12); metrics.distribution = .fillEqually; metrics.alignment = .top
+        metricsContainer = metrics
         for card in [token, cost, requests] {
             card.topAnchor.constraint(equalTo: metrics.topAnchor).isActive = true
             card.bottomAnchor.constraint(equalTo: metrics.bottomAnchor).isActive = true
@@ -358,6 +534,10 @@ final class DashboardPage: NSObject {
         }
         refreshQuotaButton.target = self
         safeRelaunchButton.target = self
+        companionMoreButton.target = self
+        contextPill.onSelectScope = { [weak self] scope in
+            self?.app.selectOverviewEnvironment(scope.overviewKey)
+        }
         safeRelaunchButton.setAccessibilityLabel(L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启 Antigravity 以连接"))
         if let boot = app.cachedDashboardBootstrapSummary {
             lastSuccessfulSummary = boot
@@ -409,9 +589,18 @@ final class DashboardPage: NSObject {
         let standaloneRows = standaloneQuotaStack.isHidden ? 0 : standaloneQuotaStack.arrangedSubviews.count
         let coreH: CGFloat = coreRows > 0 ? (CGFloat(coreRows) * 31.5 + CGFloat(max(0, coreRows - 1)) * 9.0) : 0
         let standH: CGFloat = standaloneRows > 0 ? (17.0 + CGFloat(standaloneRows) * 31.5 + CGFloat(max(0, standaloneRows - 1)) * 6.0) : 0
+        let quotaH = coreH + standH
         let stampH: CGFloat = dataTimestampLabel.isHidden ? 0 : 20.0
         let statusH: CGFloat = accountStatusLabel.isHidden ? 0 : 18.0
-        let heroH: CGFloat = 81.0 + coreH + standH + stampH + statusH
+        let companionH: CGFloat
+        if companionSection.isHidden {
+            companionH = 0
+        } else {
+            let rowCount = CGFloat(companionRowsStack.arrangedSubviews.count)
+            let moreH: CGFloat = companionMoreButton.isHidden ? 0 : 20.0
+            companionH = 15.0 + rowCount * 20.0 + max(0, rowCount - 1) * 5.0 + moreH
+        }
+        let heroH: CGFloat = 81.0 + quotaH + stampH + statusH + companionH
         let kpiH: CGFloat = min(148.0, max(103.0, viewportH * 0.21))
         let qualityH: CGFloat = usageQualityLabel.isHidden ? 0 : 26.0
         let debugBannerH: CGFloat = debugPortBannerBox.isHidden ? 0 : (max(56.0, debugPortBannerBox.bounds.height) + 12.0)
@@ -437,6 +626,8 @@ final class DashboardPage: NSObject {
         updateReadinessMatrix()
         bentoRightStack.needsLayout = true
     }
+
+    private static let metricRowFillColor = Design.dynamicAlpha(Design.color(0x000000, 0xFFFFFF), 0.02, 0.03)
 
     private static func makeBentoSubRow(
         title: String,
@@ -499,9 +690,7 @@ final class DashboardPage: NSObject {
         box.borderWidth = 0.5
         box.borderColor = Design.border
         box.enablesHoverHighlight = false
-        box.fillColor = NSColor(name: nil) { app in
-            app.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor.white.withAlphaComponent(0.03) : NSColor.black.withAlphaComponent(0.02)
-        }
+        box.fillColor = Self.metricRowFillColor
         let a11ySummary = [title, badgeText, subtitle, trailingText].filter { !$0.isEmpty }.joined(separator: L10n.shared.isEnglish ? ", " : "，")
         box.setAccessibilityElement(true)
         box.setAccessibilityRole(.group)
@@ -548,10 +737,48 @@ final class DashboardPage: NSObject {
         }
     }
 
+    func currentOverviewEnvironmentId() -> String {
+        let key = app.overviewEnvironmentKey
+        if key == "local" { return "local" }
+        if key.hasPrefix("env:") {
+            let id = String(key.dropFirst("env:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return id.isEmpty ? "all" : id
+        }
+        return "all"
+    }
+
+    private func summaryEnvironmentId(_ result: [String: Any]) -> String {
+        let usg = result["usage"] as? [String: Any]
+        let raw = (usg?["selectedEnvironmentId"] as? String)
+            ?? (usg?["selected_environment_id"] as? String)
+            ?? "all"
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "all" : trimmed
+    }
+
     func updateReadinessMatrix() {
-        let dashUsage = (lastSuccessfulSummary?["usage"] as? [String: Any]) ?? [:]
-        let report = app.cachedUsageReportsByPeriod["today:all"]
-            ?? app.cachedUsageReportsByPeriod["today"]
+        let envId = currentOverviewEnvironmentId()
+        let activeSummary: [String: Any]? = cachedSummariesByEnv[envId]
+            ?? (lastSuccessfulSummary.flatMap { summaryEnvironmentId($0) == envId ? $0 : nil })
+        let dashUsage = (activeSummary?["usage"] as? [String: Any]) ?? [:]
+        if (dashUsage["availability"] as? String) == "unavailable" {
+            trendTitleLabel.stringValue = L10n.t("overview.trend.title")
+            hoveredTrendPoint = nil
+            currentTrendPoints = []
+            todayTrendChart.points = []
+            syncTrendDetailLabel()
+            todayPeakBadge.title = L10n.t("overview.trend.24h_badge")
+            todayPeakBadge.tint = Design.inactivePill
+            let unavailableFp = "\(envId)||unavailable"
+            if bentoFingerprint != unavailableFp {
+                bentoFingerprint = unavailableFp
+                renderEmptyActiveModelsBento()
+            }
+            return
+        }
+        let reportCacheKey = envId == "all" ? "today" : "today|env=\(envId)|acc=all"
+        let report = app.cachedUsageReportsByPeriod[reportCacheKey]
+            ?? (envId == "all" ? app.cachedUsageReportsByPeriod["today:all"] : nil)
             ?? [:]
         let summary = report["summary"] as? [String: Any] ?? [:]
         let hourly = (dashUsage["todayHourly"] as? [[String: Any]])
@@ -594,7 +821,7 @@ final class DashboardPage: NSObject {
         let totalReqs = models.reduce(0) { $0 + intVal($1, "requestCount", fallback: intVal($1, "request_count")) }
         let displayLimit = models.count >= 3 ? activeModelDisplayLimit : 2
 
-        let fp = models.prefix(3).map {
+        let fp = "\(envId)||" + models.prefix(3).map {
             let m = "\($0["model"] ?? "")"
             let t = intVal($0, "totalTokens", fallback: intVal($0, "total_tokens"))
             let r = intVal($0, "requestCount", fallback: intVal($0, "request_count"))
@@ -639,7 +866,7 @@ final class DashboardPage: NSObject {
                 }
                 let sharePct = Int(round(shareRatio * 100))
                 let shareNote = sharePct > 0 ? L10n.t("overview.bento.share_pct", ["pct": sharePct]) : ""
-                let isPriced = (item["priced"] as? Bool) ?? true
+                let isPriced = UsageMetricsPresentation.isModelRowPriced(item)
                 let isPartialModel = (item["partiallyPriced"] as? Bool) ?? false
                 let isUnpricedModel = !isPriced && !isPartialModel && mTokens > 0
                 let badgeText: String
@@ -684,7 +911,7 @@ final class DashboardPage: NSObject {
             let mTokens = intVal(topModel, "totalTokens", fallback: intVal(topModel, "total_tokens"))
             let mReqs = intVal(topModel, "requestCount", fallback: intVal(topModel, "request_count"))
             let mUsd = doubleVal(topModel, "estimatedUsd", fallback: doubleVal(topModel, "estimated_usd"))
-            let isPriced = (topModel["priced"] as? Bool) ?? true
+            let isPriced = UsageMetricsPresentation.isModelRowPriced(topModel)
             let isPartialModel = (topModel["partiallyPriced"] as? Bool) ?? false
             let isUnpricedModel = !isPriced && !isPartialModel && mTokens > 0
             let badgeText: String
@@ -731,31 +958,40 @@ final class DashboardPage: NSObject {
             bentoRightStack.addArrangedSubview(hintRow)
             fillWidth(hintRow, in: bentoRightStack)
         } else {
-            rightBentoCountBadge.title = L10n.t("overview.bento.no_calls_badge")
-            rightBentoCountBadge.tint = Design.inactivePill
-
-            let emptyRow1 = Self.makeBentoSubRow(
-                title: L10n.t("overview.bento.empty_title"),
-                badgeText: L10n.t("overview.bento.empty_badge"),
-                badgeTint: Design.inactivePill,
-                subtitle: L10n.t("overview.bento.empty_sub"),
-                trailingText: L10n.t("overview.bento.empty_tokens_trailing"),
-                trailingTint: Design.secondary
-            )
-            bentoRightStack.addArrangedSubview(emptyRow1)
-            fillWidth(emptyRow1, in: bentoRightStack)
-
-            let emptyRow2 = Self.makeBentoSubRow(
-                title: L10n.t("overview.bento.detail_title"),
-                badgeText: L10n.t("overview.bento.detail_badge"),
-                badgeTint: Design.inactivePill,
-                subtitle: L10n.t("overview.bento.detail_sub"),
-                trailingText: L10n.t("overview.bento.empty_reqs_trailing"),
-                trailingTint: Design.secondary
-            )
-            bentoRightStack.addArrangedSubview(emptyRow2)
-            fillWidth(emptyRow2, in: bentoRightStack)
+            renderEmptyActiveModelsBento()
         }
+    }
+
+    private func renderEmptyActiveModelsBento() {
+        bentoRightStack.arrangedSubviews.forEach {
+            bentoRightStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        rightBentoTitleLabel.stringValue = L10n.t("overview.bento.active_models")
+        rightBentoCountBadge.title = L10n.t("overview.bento.no_calls_badge")
+        rightBentoCountBadge.tint = Design.inactivePill
+
+        let emptyRow1 = Self.makeBentoSubRow(
+            title: L10n.t("overview.bento.empty_title"),
+            badgeText: L10n.t("overview.bento.empty_badge"),
+            badgeTint: Design.inactivePill,
+            subtitle: L10n.t("overview.bento.empty_sub"),
+            trailingText: L10n.t("overview.bento.empty_tokens_trailing"),
+            trailingTint: Design.secondary
+        )
+        bentoRightStack.addArrangedSubview(emptyRow1)
+        fillWidth(emptyRow1, in: bentoRightStack)
+
+        let emptyRow2 = Self.makeBentoSubRow(
+            title: L10n.t("overview.bento.detail_title"),
+            badgeText: L10n.t("overview.bento.detail_badge"),
+            badgeTint: Design.inactivePill,
+            subtitle: L10n.t("overview.bento.detail_sub"),
+            trailingText: L10n.t("overview.bento.empty_reqs_trailing"),
+            trailingTint: Design.secondary
+        )
+        bentoRightStack.addArrangedSubview(emptyRow2)
+        fillWidth(emptyRow2, in: bentoRightStack)
     }
 
     @objc func safeRelaunchAntigravityPressed() {
@@ -764,12 +1000,16 @@ final class DashboardPage: NSObject {
 
     func syncDebugPortBanner() {
         let showBanner = app.statusValue.mode == "debug-port-missing"
+        let inFlight = app.isSafeRelaunchInFlight
         let visibilityChanged = debugPortBannerBox.isHidden != !showBanner
         debugPortTitleLabel.stringValue = L10n.t("status.debug_port_missing", fallback: "未开启调试端口")
-        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "Antigravity 未带调试端口运行，请先保存工作后安全重启以连接。")
-        let btnTitle = L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接")
+        debugPortBodyLabel.stringValue = L10n.t("debug_port_missing.banner_body", fallback: "未带调试端口运行，请安全重启以连接；建议通过 GravityBox 启动 Antigravity。")
+        let btnTitle = inFlight
+            ? L10n.t("assistant.safe_relaunch_busy", fallback: "正在安全重启…")
+            : L10n.t("assistant.safe_relaunch_btn", fallback: "安全重启以连接")
         safeRelaunchButton.title = btnTitle
         safeRelaunchButton.setAccessibilityLabel(btnTitle)
+        safeRelaunchButton.isEnabled = !inFlight
         safeRelaunchButton.toolTip = nil
         debugPortBannerBox.isHidden = !showBanner
         safeRelaunchButton.isHidden = !showBanner
@@ -778,7 +1018,18 @@ final class DashboardPage: NSObject {
         }
     }
 
+    private func currentOverviewScope() -> EnvironmentScope {
+        EnvironmentScope(rawEnvironmentId: app.overviewEnvironmentKey)
+    }
+
     @objc func refreshActiveQuota() {
+        if let remote = app.selectedOverviewRemoteSession() {
+            app.refreshRemoteQuota(
+                remoteKey: remote["remoteKey"] as? String,
+                environmentId: currentOverviewEnvironmentId()
+            )
+            return
+        }
         let activeId = ((lastSuccessfulSummary?["accounts"] as? [String: Any])?["currentAccountId"] as? String)
             ?? (app.resolvedActiveAccount()?["id"] as? String)
             ?? app.activeAccountId
@@ -786,6 +1037,376 @@ final class DashboardPage: NSObject {
             app.refreshSingleAccountQuota(id: activeId)
         } else {
             app.refreshAccountQuotas()
+        }
+    }
+
+    func handleOverviewEnvironmentChanged() {
+        syncContextHeader()
+        let envId = currentOverviewEnvironmentId()
+        let cached = cachedSummariesByEnv[envId] ?? syntheticSummaryFromUsageCache(for: envId)
+        if let cached {
+            renderSummary(cached, isStaleFallback: false)
+        } else if let remote = app.selectedOverviewRemoteSession() {
+            animateContextTransitionIfNeeded()
+            renderRemoteHeroSection(remote)
+        } else if let base = lastSuccessfulSummary {
+            renderSummary(base, isStaleFallback: false)
+        }
+        metricsKey = ""
+        environmentChangeGeneration &+= 1
+        let targetGeneration = environmentChangeGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.environmentChangeGeneration == targetGeneration else { return }
+            self.update(force: false)
+        }
+    }
+
+    func syncRemoteSessionsUI() {
+        syncContextHeader()
+        let envId = currentOverviewEnvironmentId()
+        if let summary = cachedSummariesByEnv[envId] ?? syntheticSummaryFromUsageCache(for: envId) ?? lastSuccessfulSummary {
+            renderSummary(summary, isStaleFallback: false)
+        } else if let remote = app.selectedOverviewRemoteSession() {
+            renderRemoteHeroSection(remote)
+        }
+    }
+
+    private func syntheticSummaryFromUsageCache(for envId: String) -> [String: Any]? {
+        let cacheKey = envId == "all" ? "today" : "today|env=\(envId)|acc=all"
+        guard let report = app.cachedUsageReportsByPeriod[cacheKey]
+            ?? (envId == "all" ? app.cachedUsageReportsByPeriod["today:all"] : nil) else {
+            return nil
+        }
+        let summary = report["summary"] as? [String: Any] ?? [:]
+        let todayTokens = intVal(summary, "totalTokens", fallback: intVal(summary, "total_tokens"))
+        let todayUsd = doubleVal(summary, "estimatedUsd", fallback: doubleVal(summary, "estimated_usd"))
+        let todayRequests = intVal(summary, "requestCount", fallback: intVal(summary, "request_count"))
+        var usageDict: [String: Any] = [
+            "selectedEnvironmentId": envId,
+            "todayTokens": todayTokens,
+            "estimatedUsd": todayUsd,
+            "requestCount": todayRequests,
+            "todayPricedModels": intVal(summary, "pricedModels", fallback: intVal(summary, "priced_models")),
+            "todayUnpricedModels": intVal(summary, "unpricedModels", fallback: intVal(summary, "unpriced_models")),
+            "databasesScanned": intVal(summary, "databasesScanned"),
+            "databasesDiscovered": intVal(summary, "databasesDiscovered"),
+            "availability": (summary["availability"] as? String) ?? "complete",
+            "todayHourly": (report["todayHourly"] as? [[String: Any]]) ?? [],
+            "todayByModel": (report["byModel"] as? [[String: Any]]) ?? (report["models"] as? [[String: Any]]) ?? []
+        ]
+        let allTimeKey = envId == "all" ? "all" : "all|env=\(envId)|acc=all"
+        if let allReport = app.cachedUsageReportsByPeriod[allTimeKey]
+            ?? (envId == "all" ? app.cachedUsageReportsByPeriod["all:all"] : nil),
+           let allSummary = allReport["summary"] as? [String: Any],
+           !allSummary.isEmpty {
+            usageDict["totalTokens"] = max(todayTokens, intVal(allSummary, "totalTokens", fallback: intVal(allSummary, "total_tokens")))
+            usageDict["allTimeEstimatedUsd"] = max(todayUsd, doubleVal(allSummary, "estimatedUsd", fallback: doubleVal(allSummary, "estimated_usd")))
+            usageDict["totalRequestCount"] = max(todayRequests, intVal(allSummary, "requestCount", fallback: intVal(allSummary, "request_count")))
+            usageDict["pricedModels"] = intVal(allSummary, "pricedModels", fallback: intVal(allSummary, "priced_models"))
+            usageDict["unpricedModels"] = intVal(allSummary, "unpricedModels", fallback: intVal(allSummary, "unpriced_models"))
+        } else if let cachedUsage = cachedSummariesByEnv[envId]?["usage"] as? [String: Any],
+                  (cachedUsage["allTimePending"] as? Bool) != true,
+                  cachedUsage["totalTokens"] != nil || cachedUsage["allTimeEstimatedUsd"] != nil || cachedUsage["totalRequestCount"] != nil {
+            usageDict["totalTokens"] = max(todayTokens, intVal(cachedUsage, "totalTokens", fallback: intVal(cachedUsage, "total_tokens")))
+            usageDict["allTimeEstimatedUsd"] = max(todayUsd, doubleVal(cachedUsage, "allTimeEstimatedUsd", fallback: doubleVal(cachedUsage, "estimatedUsd")))
+            usageDict["totalRequestCount"] = max(todayRequests, intVal(cachedUsage, "totalRequestCount", fallback: intVal(cachedUsage, "requestCount")))
+            usageDict["pricedModels"] = intVal(cachedUsage, "pricedModels", fallback: intVal(cachedUsage, "priced_models"))
+            usageDict["unpricedModels"] = intVal(cachedUsage, "unpricedModels", fallback: intVal(cachedUsage, "unpriced_models"))
+        } else {
+            usageDict["allTimePending"] = true
+        }
+        if let bd = (report["environmentBreakdown"] as? [String: Any]) ?? (report["environment_breakdown"] as? [String: Any]) {
+            usageDict["environmentBreakdown"] = bd
+        }
+        var synthetic: [String: Any] = ["usage": usageDict]
+        if let baseAccounts = (cachedSummariesByEnv["all"]?["accounts"] as? [String: Any])
+            ?? (lastSuccessfulSummary?["accounts"] as? [String: Any]) {
+            synthetic["accounts"] = baseAccounts
+        }
+        return synthetic
+    }
+
+    private static func overviewShareNote(
+        from usageDict: [String: Any]?,
+        fallbackShares: [String: Double]
+    ) -> String? {
+        if let breakdown = (usageDict?["environmentBreakdown"] as? [String: Any])
+            ?? (usageDict?["environment_breakdown"] as? [String: Any]) {
+            let localTokens = intVal(breakdown, "local_tokens", fallback: intVal(breakdown, "localTokens"))
+            let sshTokens = intVal(breakdown, "ssh_tokens", fallback: intVal(breakdown, "sshTokens"))
+            let hasSsh = (breakdown["has_ssh_data"] as? Bool) ?? (breakdown["hasSshData"] as? Bool) ?? (sshTokens > 0)
+            if hasSsh {
+                let localPct: Int
+                let sshPct: Int
+                if breakdown["local_share_pct"] != nil || breakdown["localSharePct"] != nil {
+                    let rawLocal = doubleVal(breakdown, "local_share_pct", fallback: doubleVal(breakdown, "localSharePct"))
+                    let clampedLocal = max(0, min(100, Int(round(rawLocal))))
+                    localPct = clampedLocal
+                    if breakdown["ssh_share_pct"] != nil || breakdown["sshSharePct"] != nil {
+                        let rawSsh = doubleVal(breakdown, "ssh_share_pct", fallback: doubleVal(breakdown, "sshSharePct"))
+                        sshPct = max(0, min(100, Int(round(rawSsh))))
+                    } else {
+                        sshPct = 100 - clampedLocal
+                    }
+                } else {
+                    let total = localTokens + sshTokens
+                    guard total > 0 else { return nil }
+                    localPct = max(0, min(100, Int(round((Double(localTokens) / Double(total)) * 100.0))))
+                    sshPct = 100 - localPct
+                }
+                if localTokens + sshTokens > 0 || localPct + sshPct > 0 {
+                    return L10n.t("usage.env.share_note", ["localPct": localPct, "sshPct": sshPct])
+                }
+            }
+        }
+        if let rawLocal = fallbackShares["local"] {
+            let clampedLocal = max(0, min(100, Int(round(rawLocal))))
+            let remoteSum = fallbackShares
+                .filter { $0.key != "local" && $0.key != "all" }
+                .values
+                .filter { $0.isFinite && $0 > 0 }
+                .reduce(0, +)
+            if remoteSum > 0 {
+                let sshPct = max(0, min(100, Int(round(remoteSum))))
+                return L10n.t("usage.env.share_note", ["localPct": clampedLocal, "sshPct": sshPct])
+            }
+        }
+        return nil
+    }
+
+    func syncContextHeader(usageDict: [String: Any]? = nil) {
+        let items = app.buildContextPillItems(includeAll: true, includeHistorical: false, includeSharePct: true)
+        let scope = currentOverviewScope()
+        contextPill.update(items: items, selectedScope: scope, isActive: !scope.isAll)
+        let hasLiveSsh = items.contains { $0.kind == .ssh }
+
+        guard hasLiveSsh else {
+            contextMetaLabel.stringValue = ""
+            contextMetaLabel.isHidden = true
+            heroLocalScopeBadge.isHidden = true
+            heroRemoteHostBadge.isHidden = true
+            return
+        }
+
+        heroLocalScopeBadge.refreshTitleAndColors()
+        switch scope {
+        case .all:
+            let allUsage = usageDict
+                ?? (cachedSummariesByEnv["all"]?["usage"] as? [String: Any])
+                ?? (lastSuccessfulSummary?["usage"] as? [String: Any])
+                ?? app.cachedUsageReportsByPeriod["today"]
+            if let note = Self.overviewShareNote(from: allUsage, fallbackShares: app.usageEnvironmentShareById) {
+                contextMetaLabel.stringValue = note
+                contextMetaLabel.isHidden = false
+            } else {
+                contextMetaLabel.stringValue = ""
+                contextMetaLabel.isHidden = true
+            }
+            heroRemoteHostBadge.isHidden = true
+            heroLocalScopeBadge.isHidden = false
+        case .local:
+            contextMetaLabel.stringValue = ""
+            contextMetaLabel.isHidden = true
+            heroRemoteHostBadge.isHidden = true
+            heroLocalScopeBadge.isHidden = false
+        case .remote(let envId):
+            let host = app.environmentNode(for: envId)
+                ?? app.canonicalRemoteHosts().first { $0.environmentId == envId }
+            let winCount = host?.windowCount ?? 1
+            let meta = winCount > 1
+                ? L10n.t("overview.ssh.remote_pill_window_meta", ["count": winCount], fallback: "远程只读 · \(winCount) 窗口")
+                : L10n.t("overview.ssh.remote_pill_meta", fallback: "远程只读")
+            contextMetaLabel.stringValue = meta
+            contextMetaLabel.isHidden = false
+            heroLocalScopeBadge.isHidden = true
+            if let host {
+                heroRemoteHostBadge.update(
+                    hostLabel: host.cleanHostLabel,
+                    state: host.state,
+                    windowCount: host.windowCount,
+                    showStatusDot: true
+                )
+                heroRemoteHostBadge.isHidden = false
+            } else {
+                heroRemoteHostBadge.isHidden = true
+            }
+        }
+    }
+
+    private func isLowCoreQuota(_ contract: QuotaPresentation.Contract) -> Bool {
+        for group in contract.coreGroups {
+            for win in group.windows {
+                if let pct = win.percentage, pct <= 20 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func primaryCoreQuotaPercentage(_ contract: QuotaPresentation.Contract) -> Int? {
+        for group in contract.coreGroups {
+            if let pct = group.windows.compactMap(\.percentage).min() {
+                return pct
+            }
+        }
+        return nil
+    }
+
+    @objc private func inspectCompanionHost(_ sender: NSButton) {
+        guard let envId = sender.identifier?.rawValue, !envId.isEmpty else { return }
+        app.selectOverviewEnvironment("env:\(envId)")
+    }
+
+    @objc private func companionMoreHostsPressed(_ sender: NSButton) {
+        let items = app.buildContextPillItems(includeAll: true, includeHistorical: false, includeSharePct: true)
+        guard items.contains(where: { $0.kind == .ssh }) else { return }
+        let menu = SshEnvironmentVisuals.buildGroupedMenu(items: items, fontSize: 12.5, minimumWidth: 204)
+        let currentId = currentOverviewScope().rawEnvironmentId
+        for menuItem in menu.items where menuItem.representedObject != nil {
+            menuItem.target = self
+            menuItem.action = #selector(companionMoreMenuItemSelected(_:))
+            menuItem.state = (menuItem.representedObject as? String) == currentId ? .on : .off
+        }
+        Design.popUpMenu(menu, below: sender)
+    }
+
+    @objc private func companionMoreMenuItemSelected(_ sender: NSMenuItem) {
+        guard let rawId = sender.representedObject as? String, !rawId.isEmpty else { return }
+        let scope = EnvironmentScope(rawEnvironmentId: rawId)
+        app.selectOverviewEnvironment(scope.overviewKey)
+    }
+
+    private func clearCompanionSection() {
+        companionFingerprint = ""
+        if !companionRowsStack.arrangedSubviews.isEmpty {
+            companionRowsStack.arrangedSubviews.forEach {
+                companionRowsStack.removeArrangedSubview($0)
+                $0.removeFromSuperview()
+            }
+        }
+        companionMoreButton.isHidden = true
+        companionSection.isHidden = true
+    }
+
+    private func animateContextTransitionIfNeeded() {
+        let nextCtx = app.overviewEnvironmentKey
+        guard nextCtx != lastRenderedContextKey else { return }
+        lastRenderedContextKey = nextCtx
+        guard Design.shouldAnimate(in: view) else { return }
+        guard let layer = heroCardBox?.layer else { return }
+        let transition = CATransition()
+        transition.type = .fade
+        transition.duration = 0.14
+        transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(transition, forKey: kCATransition)
+    }
+
+    private func applyStatusLine(warnings: [String], hasWarning: Bool) {
+        let joined = warnings.joined(separator: " · ")
+        if !joined.isEmpty {
+            self.accountStatusLabel.isHidden = false
+            self.accountStatusLabel.stringValue = joined
+            self.accountStatusLabel.textColor = hasWarning ? accessibleWarningColor() : Design.secondary
+        } else {
+            self.accountStatusLabel.isHidden = true
+            self.accountStatusLabel.stringValue = ""
+        }
+        self.accountStatusLabel.toolTip = nil
+    }
+
+    private func renderRemoteHeroSection(_ remote: [String: Any], preserveErrorBanner: Bool = false) {
+        clearCompanionSection()
+        let currentEnvId = currentOverviewEnvironmentId()
+        let canonicalHost = app.environmentNode(for: currentEnvId)
+            ?? app.canonicalRemoteHosts().first { $0.environmentId == currentEnvId }
+        let state = remote["state"] as? String ?? "connected"
+        let hostState = canonicalHost?.state ?? SshHostState(rawSessionState: state)
+        let hostRaw = (remote["hostLabel"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let rawResolvedHost = hostRaw.isEmpty ? (canonicalHost?.hostLabel ?? "") : hostRaw
+        let cleanHost = SshEnvironmentResolver.cleanHostLabel(rawResolvedHost)
+        let host = cleanHost.isEmpty ? L10n.t("ssh.remote_fallback", fallback: "远端") : cleanHost
+        let email = (canonicalHost?.email.isEmpty == false ? canonicalHost?.email : nil)
+            ?? ((remote["email"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        let name = (canonicalHost?.name.isEmpty == false ? canonicalHost?.name : nil)
+            ?? ((remote["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+        let tierRaw = (canonicalHost?.tier.isEmpty == false ? canonicalHost?.tier : nil)
+            ?? ((remote["subscription_tier"] as? String) ?? (remote["tier"] as? String) ?? "")
+        let normalizedTier = AccountIdentity.normalizeTier(tierRaw)
+        let lastErr = (canonicalHost?.lastError.isEmpty == false ? canonicalHost?.lastError : nil)
+            ?? ((remote["lastError"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+
+        self.activeAccountLabel.stringValue = !name.isEmpty ? name : (!email.isEmpty ? email : host)
+        self.activeEmailLabel.stringValue = email.isEmpty
+            ? L10n.t("ssh.context.remote_switch_hint", fallback: "远程主机账号由远端独立管理，此处仅供只读查看与刷新。")
+            : email
+        self.activeEmailLabel.toolTip = nil
+        self.tierBadge.title = normalizedTier.isEmpty ? tierRaw : normalizedTier
+        self.tierBadge.isHidden = email.isEmpty || (normalizedTier.isEmpty && tierRaw.isEmpty)
+
+        heroLocalScopeBadge.isHidden = true
+        heroRemoteHostBadge.update(
+            hostLabel: canonicalHost?.cleanHostLabel ?? host,
+            state: hostState,
+            windowCount: canonicalHost?.windowCount ?? 1,
+            showStatusDot: true
+        )
+        heroRemoteHostBadge.isHidden = false
+
+        let quotaContract = QuotaPresentation.contract(remote)
+        let hasQuotaGroups = !(quotaContract.coreGroups.isEmpty && quotaContract.standaloneGroups.isEmpty)
+        if hasQuotaGroups {
+            Self.syncCoreGroupBars(quotaContract.coreGroups, into: coreQuotaStack, compact: true)
+            let standaloneGroups = quotaContract.standaloneGroups
+            standaloneDivider.isHidden = standaloneGroups.isEmpty
+            Self.syncStandaloneGroupBars(standaloneGroups, into: standaloneQuotaStack, compact: true)
+        } else {
+            Self.syncCoreGroupBars(QuotaPresentation.contract([:]).coreGroups, into: coreQuotaStack, compact: true)
+            standaloneDivider.isHidden = true
+            Self.syncStandaloneGroupBars([], into: standaloneQuotaStack, compact: true)
+        }
+
+        let freshness = canonicalHost.map { app.quotaFreshness(forHost: $0) } ?? .unknown
+        var statuses: [String] = []
+        var hasWarning = false
+        if hostState == .offlineRecent || hostState == .historicalOnly {
+            statuses.append(L10n.t("ssh.context.remote_disconnected", fallback: "SSH 连接已断开（暂示上次快照）"))
+            hasWarning = true
+        } else if hostState == .authExpired || freshness == .authExpired {
+            statuses.append(L10n.t("ssh.context.remote_auth_expired", fallback: "远端登录态已过期，请在 SSH 窗口重新登录"))
+            hasWarning = true
+        } else if !lastErr.isEmpty || freshness == .errorFallback {
+            statuses.append(L10n.t("ssh.context.remote_probe_error", fallback: "远端配额刷新失败，暂示上次快照"))
+            hasWarning = true
+        }
+        if !hasQuotaGroups {
+            statuses.append(L10n.t("ssh.context.remote_no_quota", fallback: "暂未获取到远端配额"))
+            hasWarning = true
+        }
+        let contractWarn = QuotaPresentation.warningSummary(quotaContract)
+        if !contractWarn.isEmpty {
+            statuses.append(contractWarn)
+            hasWarning = true
+        }
+
+        applyStatusLine(warnings: statuses, hasWarning: hasWarning)
+
+        if !preserveErrorBanner {
+            let rawTs = canonicalHost?.effectiveQuotaTimestamp
+                ?? QuotaPresentation.number(remote["quotaLastUpdated"])
+                ?? QuotaPresentation.number(remote["observedAt"])
+                ?? 0
+            let obsTs = rawTs > 10_000_000_000 ? rawTs / 1000.0 : rawTs
+            if obsTs > 0 {
+                let obsDate = Date(timeIntervalSince1970: obsTs)
+                dataTimestampLabel.isHidden = false
+                dataTimestampLabel.stringValue = L10n.t("accounts.updated_at", ["time": Self.quotaObservedFormatter.string(from: obsDate)])
+                dataTimestampLabel.textColor = (freshness == .stale) ? accessibleWarningColor() : .secondaryLabelColor
+            } else {
+                dataTimestampLabel.isHidden = false
+                dataTimestampLabel.stringValue = L10n.t("ssh.context.no_timestamp", fallback: "暂无采样时间")
+                dataTimestampLabel.textColor = .tertiaryLabelColor
+            }
         }
     }
 
@@ -805,28 +1426,49 @@ final class DashboardPage: NSObject {
             }
             return
         }
-        let hasDashboardBentoData = (lastSuccessfulSummary?["usage"] as? [String: Any])?["todayByModel"] != nil
-        if lastSuccessfulSummary != nil && !hasDashboardBentoData {
-            app.fetchUsageSummary(period: "today", force: force) { [weak self] _ in
+        let requestedEnvId = currentOverviewEnvironmentId()
+        let activeCache = cachedSummariesByEnv[requestedEnvId] ?? (requestedEnvId == "all" ? lastSuccessfulSummary : nil)
+        let hasDashboardBentoData = (activeCache?["usage"] as? [String: Any])?["todayByModel"] != nil
+        if activeCache != nil && !hasDashboardBentoData {
+            app.fetchUsageSummary(period: "today", environmentId: requestedEnvId == "all" ? nil : requestedEnvId, force: force) { [weak self] _ in
                 self?.updateReadinessMatrix()
             }
         }
-        guard !metricsLoading else { return }
+        if metricsLoading && activeRequestEnvId == requestedEnvId && !force {
+            return
+        }
 
         let now = Date()
-        let interval = now.timeIntervalSince(lastMetricsFetchTime)
+        let lastAt = cachedSummaryFetchTimeByEnv[requestedEnvId] ?? (requestedEnvId == "all" ? lastMetricsFetchTime : .distantPast)
+        let interval = now.timeIntervalSince(lastAt)
         let timeExpired = interval >= 15.0
 
-        let currentKey = "\(app.activeAccountId)_\(status.accountsRevision)_\(status.activeAccountEmail)_\(status.activeFiveHourQuota ?? -1)_\(status.liveAccountEmail)"
+        let currentKey = "\(app.activeAccountId)_\(status.accountsRevision)_\(status.activeAccountEmail)_\(status.activeFiveHourQuota ?? -1)_\(status.liveAccountEmail)_\(status.remoteObservedVersion)_\(status.remoteSyncRevision)_\(requestedEnvId)"
         if !force && !timeExpired && currentKey == metricsKey { return }
         metricsLoading = true
+        activeRequestEnvId = requestedEnvId
+        requestGeneration += 1
+        let gen = requestGeneration
 
-        app.bridge.send(["command": "dashboard_summary"]) { [weak self] response in
+        var payload: [String: Any] = ["command": "dashboard_summary"]
+        if requestedEnvId != "all" {
+            payload["environmentId"] = requestedEnvId
+        }
+        app.bridge.send(payload) { [weak self] response in
             guard let self else { return }
-            self.metricsLoading = false
+            let isCurrentReq = (gen == self.requestGeneration && self.currentOverviewEnvironmentId() == requestedEnvId)
+            if isCurrentReq {
+                self.metricsLoading = false
+                self.activeRequestEnvId = nil
+            }
             switch response {
             case .failure(let error):
-                if let old = self.lastSuccessfulSummary {
+                guard isCurrentReq else { return }
+                let failedAt = Date()
+                self.lastMetricsFetchTime = failedAt
+                self.cachedSummaryFetchTimeByEnv[requestedEnvId] = failedAt
+                self.metricsKey = currentKey
+                if let old = self.cachedSummariesByEnv[requestedEnvId] ?? (requestedEnvId == "all" ? self.lastSuccessfulSummary : nil) {
                     self.renderSummary(old, isStaleFallback: true)
                 } else {
                     self.dataTimestampLabel.isHidden = false
@@ -835,16 +1477,34 @@ final class DashboardPage: NSObject {
                 }
             case .success(let result):
                 let fetchedAt = Date()
+                self.cachedSummariesByEnv[requestedEnvId] = result
+                self.cachedSummaryFetchTimeByEnv[requestedEnvId] = fetchedAt
+                if result["environments"] != nil {
+                    self.app.syncEnvironmentsFromPayload(result, notifyUI: false)
+                } else if let incomingRemotes = result["remoteSessions"] as? [[String: Any]] {
+                    if let focusedStr = result["focusedContextKey"] as? String, !focusedStr.isEmpty {
+                        self.app.statusValue.focusedContextKey = focusedStr
+                    }
+                    let focusedKey = (result["focusedContextKey"] as? String) ?? self.app.statusValue.focusedContextKey
+                    self.app.syncRemoteSessionsFromPayload(incomingRemotes, focusedKey: focusedKey, notifyUI: false)
+                }
+                if let usageDict = result["usage"] as? [String: Any] {
+                    self.app.syncUsageEnvironmentsFromReport(usageDict)
+                }
+                if requestedEnvId == "all" {
+                    self.app.cachedDashboardBootstrapSummary = result
+                    if let usageDict = result["usage"] as? [String: Any], let periodsMap = usageDict["periods"] as? [String: Any] {
+                        self.app.ingestUsagePeriods(from: periodsMap, fetchedAt: fetchedAt)
+                    }
+                    self.app.scheduleUIBootstrapSave()
+                    self.app.menuPanelController?.syncFromAssistant()
+                }
+                guard isCurrentReq else { return }
                 self.lastMetricsFetchTime = fetchedAt
                 self.metricsKey = currentKey
                 self.lastSuccessfulSummary = result
-                self.app.cachedDashboardBootstrapSummary = result
-                if let usageDict = result["usage"] as? [String: Any], let periodsMap = usageDict["periods"] as? [String: Any] {
-                    self.app.ingestUsagePeriods(from: periodsMap, fetchedAt: fetchedAt)
-                }
-                self.app.scheduleUIBootstrapSave()
                 if (result["usage"] as? [String: Any])?["todayByModel"] == nil {
-                    self.app.fetchUsageSummary(period: "today", force: force) { [weak self] _ in
+                    self.app.fetchUsageSummary(period: "today", environmentId: requestedEnvId == "all" ? nil : requestedEnvId, force: force) { [weak self] _ in
                         self?.updateReadinessMatrix()
                     }
                 }
@@ -1040,7 +1700,7 @@ final class DashboardPage: NSObject {
                     title: group.displayName,
                     percentage: nil,
                     resetText: "",
-                    icon: "sparkles",
+                    icon: "hexagon",
                     placeholder: ph,
                     stale: group.quotaState == "stale"
                 ))
@@ -1067,9 +1727,182 @@ final class DashboardPage: NSObject {
         syncQuotaBarRows(rows, into: stack, compact: compact, minBarHeight: minBarHeight)
     }
 
+    private func makeCompanionRow(for host: CanonicalHostEnvironment, contract: QuotaPresentation.Contract? = nil) -> NSView {
+        let contract = contract ?? QuotaPresentation.contract(host.rawSession)
+        let lowQuota = isLowCoreQuota(contract)
+        let statusDot = CompanionStatusDotView()
+        statusDot.state = host.state
+
+        let iconTint: NSColor
+        if host.state == .authExpired {
+            iconTint = accessibleWarningColor()
+        } else if host.state.isOfflineLike {
+            iconTint = Design.secondary
+        } else if !host.lastError.isEmpty || lowQuota {
+            iconTint = accessibleWarningColor()
+        } else {
+            iconTint = Design.secondary
+        }
+        let icon = NSImageView(image: SshTerminalIcon.image(pointSize: 12.5))
+        icon.setAccessibilityElement(false)
+        icon.contentTintColor = iconTint
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 12.5).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 12.5).isActive = true
+
+        let displayHost = host.cleanHostLabel
+        let hostLbl = text(displayHost, size: 11.5, weight: .semibold, color: .labelColor)
+        hostLbl.maximumNumberOfLines = 1
+        hostLbl.lineBreakMode = .byTruncatingTail
+        hostLbl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        hostLbl.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+        let detailText: String
+        let detailColor: NSColor
+        if host.state == .authExpired {
+            let expiredText = L10n.t("overview.ssh.session_expired", fallback: "登录已过期")
+            let parts = host.email.isEmpty ? [expiredText] : [host.email, expiredText]
+            detailText = parts.joined(separator: " · ")
+            detailColor = accessibleWarningColor()
+        } else if host.state == .offlineRecent {
+            let disconnectedText = L10n.t("overview.ssh.disconnected", fallback: "已断开")
+            let parts = host.email.isEmpty ? [disconnectedText] : [host.email, disconnectedText]
+            detailText = parts.joined(separator: " · ")
+            detailColor = Design.secondary
+        } else if host.state == .historicalOnly {
+            let histText = L10n.t("ssh.picker.state.historical_only", fallback: "历史记录")
+            let parts = host.email.isEmpty ? [histText] : [host.email, histText]
+            detailText = parts.joined(separator: " · ")
+            detailColor = Design.secondary
+        } else if !host.lastError.isEmpty {
+            let errText = L10n.t("ssh.context.remote_probe_error", fallback: "远端配额刷新失败")
+            let parts = host.email.isEmpty ? [errText] : [host.email, errText]
+            detailText = parts.joined(separator: " · ")
+            detailColor = accessibleWarningColor()
+        } else {
+            var parts: [String] = []
+            if !host.email.isEmpty {
+                parts.append(host.email)
+            }
+            if let pct = primaryCoreQuotaPercentage(contract) {
+                parts.append("\(pct)%")
+            }
+            if parts.isEmpty {
+                parts.append(L10n.t("ssh.picker.state.online", fallback: "在线"))
+            }
+            detailText = parts.joined(separator: " · ")
+            detailColor = lowQuota ? accessibleWarningColor() : .secondaryLabelColor
+        }
+        let detailLbl = text(detailText, size: 11, color: detailColor)
+        detailLbl.maximumNumberOfLines = 1
+        detailLbl.lineBreakMode = .byTruncatingMiddle
+        detailLbl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        detailLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let rawViewTitle = L10n.t("overview.ssh.view_btn", fallback: "查看 →")
+        let cleanViewTitle = rawViewTitle
+            .replacingOccurrences(of: " →", with: "")
+            .replacingOccurrences(of: "→", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let viewBtn = DesignInlineButton(title: cleanViewTitle, target: self, action: #selector(inspectCompanionHost(_:)))
+        viewBtn.isBordered = false
+        viewBtn.bezelStyle = .inline
+        viewBtn.controlSize = .small
+        viewBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        viewBtn.attributedTitle = NSAttributedString(
+            string: cleanViewTitle,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: Design.blue
+            ]
+        )
+        viewBtn.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9.5, weight: .semibold))
+        viewBtn.image?.isTemplate = true
+        viewBtn.imagePosition = .imageTrailing
+        viewBtn.contentTintColor = Design.blue
+        viewBtn.toolTip = nil
+        viewBtn.identifier = NSUserInterfaceItemIdentifier(host.environmentId)
+        viewBtn.setAccessibilityLabel("\(displayHost) \(cleanViewTitle)")
+        viewBtn.setContentHuggingPriority(.required, for: .horizontal)
+        viewBtn.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let row = horizontal([statusDot, icon, hostLbl, detailLbl, flexibleSpace(), viewBtn], spacing: 6)
+        row.setCustomSpacing(4.5, after: statusDot)
+        row.setCustomSpacing(4.5, after: icon)
+        row.alignment = .centerY
+        return row
+    }
+
+    private func syncCompanionSection(localEmail: String) {
+        guard currentOverviewScope().isAll else {
+            clearCompanionSection()
+            return
+        }
+        let hosts = app.canonicalRemoteHosts()
+        guard !hosts.isEmpty else {
+            clearCompanionSection()
+            return
+        }
+        let sorted = hosts.sorted { lhs, rhs in
+            func rank(_ h: CanonicalHostEnvironment) -> Int {
+                if h.state == .authExpired || !h.lastError.isEmpty { return 0 }
+                if isLowCoreQuota(QuotaPresentation.contract(h.rawSession)) { return 1 }
+                if SshEnvironmentResolver.isSameAccountAsLocal(host: h, localEmail: localEmail) != true { return 2 }
+                if h.state.isOfflineLike { return 3 }
+                return 4
+            }
+            let r1 = rank(lhs), r2 = rank(rhs)
+            if r1 != r2 { return r1 < r2 }
+            return lhs.cleanHostLabel.localizedCaseInsensitiveCompare(rhs.cleanHostLabel) == .orderedAscending
+        }
+
+        let topRows = Array(sorted.prefix(2))
+        let topContracts = topRows.map { QuotaPresentation.contract($0.rawSession) }
+        let rowFingerprints = zip(topRows, topContracts).map { host, contract -> String in
+            let displayHost = host.cleanHostLabel
+            let lowQuota = isLowCoreQuota(contract) ? "1" : "0"
+            let pct = primaryCoreQuotaPercentage(contract).map(String.init) ?? "-"
+            return "\(host.environmentId)|\(displayHost)|\(host.state.rawValue)|\(host.email)|\(host.lastError)|\(lowQuota)|\(pct)"
+        }.joined(separator: "||")
+        let nextFingerprint = "\(L10n.shared.currentLocale)||\(sorted.count)||\(rowFingerprints)"
+        if !companionSection.isHidden && nextFingerprint == companionFingerprint {
+            return
+        }
+        companionFingerprint = nextFingerprint
+
+        companionRowsStack.arrangedSubviews.forEach {
+            companionRowsStack.removeArrangedSubview($0)
+            $0.removeFromSuperview()
+        }
+        for (host, contract) in zip(topRows, topContracts) {
+            let row = makeCompanionRow(for: host, contract: contract)
+            companionRowsStack.addArrangedSubview(row)
+            fillWidth(row, in: companionRowsStack)
+        }
+        if sorted.count > 2 {
+            let remaining = sorted.count - 2
+            let moreTitle = L10n.t("overview.ssh.more_hosts", ["count": remaining], fallback: "+\(remaining) 台主机")
+            companionMoreButton.title = moreTitle
+            companionMoreButton.attributedTitle = NSAttributedString(
+                string: moreTitle,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                    .foregroundColor: Design.blue
+                ]
+            )
+            companionMoreButton.setAccessibilityLabel(moreTitle)
+            companionMoreButton.isHidden = false
+        } else {
+            companionMoreButton.isHidden = true
+        }
+        companionSection.isHidden = false
+    }
+
     // B12: account half failed. Keep the retry hint local and never invent a 0% quota or an empty
     // account identity; the usage KPI area is rendered independently below.
     private func renderAccountsError(_ error: String, bothFailed: Bool) {
+        clearCompanionSection()
         let detail = Self.shortError(error)
         self.activeAccountLabel.stringValue = bothFailed ? L10n.t("overview.status.error_both") : L10n.t("overview.status.error_accounts")
         self.tierBadge.isHidden = true
@@ -1086,7 +1919,7 @@ final class DashboardPage: NSObject {
                 QuotaBarSpec(title: L10n.t("quota.bar.gemini_weekly"), percentage: nil, resetText: "", icon: "calendar", placeholder: failedTxt, stale: false)
             ],
             [
-                QuotaBarSpec(title: L10n.t("quota.bar.claude_5h"), percentage: nil, resetText: "", icon: "cpu", placeholder: failedTxt, stale: false),
+                QuotaBarSpec(title: L10n.t("quota.bar.claude_5h"), percentage: nil, resetText: "", icon: "hourglass", placeholder: failedTxt, stale: false),
                 QuotaBarSpec(title: L10n.t("quota.bar.claude_weekly"), percentage: nil, resetText: "", icon: "calendar", placeholder: failedTxt, stale: false)
             ]
         ], into: coreQuotaStack, compact: true)
@@ -1128,6 +1961,13 @@ final class DashboardPage: NSObject {
     func renderSummary(_ result: [String: Any], isStaleFallback: Bool) {
         let signpost = PerformanceSignpost.begin("DashboardRenderSummary")
         defer { PerformanceSignpost.end("DashboardRenderSummary", signpost) }
+        let resultEnvId = summaryEnvironmentId(result)
+        let incomingUsageDict = result["usage"] as? [String: Any]
+        if !isStaleFallback && (incomingUsageDict?["allTimePending"] as? Bool) != true {
+            cachedSummariesByEnv[resultEnvId] = result
+        }
+        animateContextTransitionIfNeeded()
+
         let formatter = Self.fetchTimeFormatter
         let fetchTimeStr = formatter.string(from: lastMetricsFetchTime == .distantPast ? Date() : lastMetricsFetchTime)
         // B12: dashboard_summary reports partial failures via accountsError / usageError (snake_case
@@ -1151,6 +1991,16 @@ final class DashboardPage: NSObject {
             quotaTime = L10n.t("overview.status.quota_sampled", ["time": formatter.string(from: qDate)])
             quotaUpdateDisplay = L10n.t("accounts.updated_at", ["time": Self.quotaObservedFormatter.string(from: qDate)])
         }
+
+        // 1. 账号与配额（支持 全部 / 本机 / SSH 远程上下文切换；本机异常与远端异常互相隔离；仅实时 IPC 响应同步 remoteSessions）
+        let currentEnvId = currentOverviewEnvironmentId()
+        let matchedUsageDict: [String: Any]? = (resultEnvId == currentEnvId)
+            ? usageDict
+            : (cachedSummariesByEnv[currentEnvId]?["usage"] as? [String: Any])
+                ?? (syntheticSummaryFromUsageCache(for: currentEnvId)?["usage"] as? [String: Any])
+        syncContextHeader(usageDict: resultEnvId == "all" ? usageDict : nil)
+        let currentScope = currentOverviewScope()
+
         dataTimestampLabel.toolTip = nil
         dataTimestampLabel.setAccessibilityHelp(L10n.t("overview.status.a11y_data_time", ["quota": quotaTime, "fetch": fetchKey]))
         let hasErrorBanner = isStaleFallback || accountsFailed || usageFailed
@@ -1158,14 +2008,22 @@ final class DashboardPage: NSObject {
             dataTimestampLabel.isHidden = false
             dataTimestampLabel.stringValue = isStaleFallback ? L10n.t("overview.status.stale_fallback") : accountsFailed && usageFailed ? L10n.t("overview.status.data_read_failed") : accountsFailed ? L10n.t("overview.status.accounts_short_failed") : L10n.t("overview.status.usage_short_failed")
             dataTimestampLabel.textColor = accessibleWarningColor()
-        } else {
-            dataTimestampLabel.isHidden = quotaUpdateDisplay.isEmpty
+        } else if !quotaUpdateDisplay.isEmpty {
+            dataTimestampLabel.isHidden = false
             dataTimestampLabel.stringValue = quotaUpdateDisplay
             dataTimestampLabel.textColor = .secondaryLabelColor
+        } else if currentScope.isRemote {
+            dataTimestampLabel.isHidden = false
+            dataTimestampLabel.stringValue = L10n.t("ssh.context.no_timestamp", fallback: "暂无采样时间")
+            dataTimestampLabel.textColor = .tertiaryLabelColor
+        } else {
+            dataTimestampLabel.isHidden = true
+            dataTimestampLabel.stringValue = ""
         }
 
-        // 1. 账号与配额
-        if let acc = accountsDict, !accountsFailed {
+        if let remote = app.selectedOverviewRemoteSession() {
+            self.renderRemoteHeroSection(remote, preserveErrorBanner: hasErrorBanner)
+        } else if let acc = accountsDict, !accountsFailed {
             let email = acc["activeEmail"] as? String ?? ""
             let name = acc["activeName"] as? String ?? ""
             let tier = acc["activeTier"] as? String ?? "FREE"
@@ -1174,15 +2032,13 @@ final class DashboardPage: NSObject {
 
             if email.isEmpty {
                 self.activeAccountLabel.stringValue = L10n.t("overview.account.no_saved")
-                self.accountStatusLabel.isHidden = true
-                self.accountStatusLabel.stringValue = ""
-                self.accountStatusLabel.toolTip = nil
+                applyStatusLine(warnings: [], hasWarning: false)
                 self.activeEmailLabel.stringValue = L10n.t("overview.account.add_hint")
                 self.activeEmailLabel.toolTip = nil
-                self.currentAccountPill.isHidden = true
+                syncCompanionSection(localEmail: "")
             } else {
                 self.activeAccountLabel.stringValue = name.isEmpty ? email : name
-                self.currentAccountPill.isHidden = true
+                syncCompanionSection(localEmail: email)
                 let isStale = acc["isStale"] as? Bool == true
 
                 let isConnected = acc["isLiveVerified"] as? Bool == true
@@ -1226,14 +2082,12 @@ final class DashboardPage: NSObject {
                     if isSavedOnlyBadge { finalBadgeTint = accessibleWarningColor() }
                     finalStatus = finalStatus.isEmpty ? stale.hint : "\(finalStatus) · \(stale.hint)"
                 }
-                self.accountStatusLabel.isHidden = finalStatus.isEmpty
-                self.accountStatusLabel.stringValue = finalStatus
-                // B01: stale groups keep the existing orange warning semantics even while the
-                // running identity itself is verified (the badge is not part of the header today).
-                self.accountStatusLabel.textColor = !stale.hint.isEmpty
-                    ? accessibleWarningColor()
-                    : (finalBadgeTint == .secondaryLabelColor ? Design.secondary : finalBadgeTint)
-                self.accountStatusLabel.toolTip = nil
+                let quotaWarning = QuotaPresentation.warningSummary(quotaContract)
+                var warnings: [String] = []
+                if !finalStatus.isEmpty { warnings.append(finalStatus) }
+                if !quotaWarning.isEmpty { warnings.append(quotaWarning) }
+                let hasWarning = !stale.hint.isEmpty || !quotaWarning.isEmpty || (finalBadgeTint != .secondaryLabelColor && !finalStatus.isEmpty)
+                applyStatusLine(warnings: warnings, hasWarning: hasWarning)
                 self.activeEmailLabel.stringValue = email
                 self.activeEmailLabel.toolTip = nil
             }
@@ -1246,29 +2100,28 @@ final class DashboardPage: NSObject {
             let standaloneGroups = quotaContract.standaloneGroups
             standaloneDivider.isHidden = standaloneGroups.isEmpty
             Self.syncStandaloneGroupBars(standaloneGroups, into: standaloneQuotaStack, compact: true)
-            let quotaWarning = QuotaPresentation.warningSummary(quotaContract)
-            if !quotaWarning.isEmpty {
-                self.accountStatusLabel.isHidden = false
-                self.accountStatusLabel.stringValue = [self.accountStatusLabel.stringValue, quotaWarning].filter { !$0.isEmpty }.joined(separator: " · ")
-                self.accountStatusLabel.textColor = accessibleWarningColor()
-                self.accountStatusLabel.toolTip = nil
-            }
         } else {
             self.renderAccountsError(accountsError, bothFailed: usageFailed)
         }
 
-        // 2. 用量与账单
-        if let usg = usageDict, !usageFailed {
+        // 2. 用量与账单（严格匹配 currentEnvId，禁止跨环境串读旧合计数值）
+
+        if let usg = matchedUsageDict, !(resultEnvId == currentEnvId && usageFailed) {
             // B12: reset the warning styling left behind by a previous failure before rendering.
             self.todayTokensDetail.textColor = Design.secondary
             self.usageDetail.textColor = Design.secondary
             self.todayRequestsDetail.textColor = Design.secondary
+            let hasTotalTokens = usg["totalTokens"] != nil || usg["total_tokens"] != nil
+            let hasAllUsd = usg["allTimeEstimatedUsd"] != nil
+            let hasTotalRequests = usg["totalRequestCount"] != nil
+            let allTimePending = (usg["allTimePending"] as? Bool == true)
+                || (!hasTotalTokens && !hasAllUsd && !hasTotalRequests)
             let todayTokens = intVal(usg, "todayTokens")
-            let totalTokens = intVal(usg, "totalTokens")
+            let totalTokens = intVal(usg, "totalTokens", fallback: intVal(usg, "total_tokens"))
             let todayUsd = doubleVal(usg, "estimatedUsd")
-            let allUsd = doubleVal(usg, "allTimeEstimatedUsd", fallback: todayUsd)
+            let allUsd = allTimePending ? 0.0 : doubleVal(usg, "allTimeEstimatedUsd", fallback: todayUsd)
             let todayRequests = intVal(usg, "requestCount")
-            let totalRequests = intVal(usg, "totalRequestCount", fallback: todayRequests)
+            let totalRequests = allTimePending ? 0 : intVal(usg, "totalRequestCount", fallback: todayRequests)
             let dbScanned = intVal(usg, "databasesScanned")
             let dbDiscovered = intVal(usg, "databasesDiscovered", fallback: dbScanned)
             let unpriced = intVal(usg, "unpricedModels")
@@ -1285,6 +2138,14 @@ final class DashboardPage: NSObject {
             if availability == "unavailable" {
                 self.renderUsageError(L10n.t("overview.usage.db_unavailable"))
                 self.usageQualityLabel.stringValue = L10n.t("overview.usage.stats_unavailable")
+                self.hoveredTrendPoint = nil
+                self.currentTrendPoints = []
+                self.todayTrendChart.points = []
+                self.syncTrendDetailLabel()
+                self.todayPeakBadge.title = L10n.t("overview.trend.24h_badge")
+                self.todayPeakBadge.tint = Design.inactivePill
+                self.bentoFingerprint = ""
+                self.renderEmptyActiveModelsBento()
                 return
             }
             for label in [todayTokensDetail, usageDetail, todayRequestsDetail] { label.textColor = .secondaryLabelColor }
@@ -1292,7 +2153,9 @@ final class DashboardPage: NSObject {
             let totalK = InterfaceText.formatCompactTokens(totalTokens)
 
             self.todayTokensMetric.stringValue = todayK
-            self.todayTokensDetail.stringValue = L10n.t("overview.metric.total_tokens", ["tokens": totalK])
+            self.todayTokensDetail.stringValue = allTimePending
+                ? L10n.t("overview.metric.total_tokens", ["tokens": "—"])
+                : L10n.t("overview.metric.total_tokens", ["tokens": totalK])
 
             let todayUnpriced = intVal(usg, "todayUnpricedModels")
             let todayPriced = intVal(usg, "todayPricedModels")
@@ -1307,7 +2170,9 @@ final class DashboardPage: NSObject {
                 tint: accessibleWarningColor()
             )
             let totalCostSummary: String
-            if unpriced > 0 && allPriced == 0 && allUsd == 0 {
+            if allTimePending {
+                totalCostSummary = L10n.t("overview.metric.total_cost", ["cost": "—"])
+            } else if unpriced > 0 && allPriced == 0 && allUsd == 0 {
                 totalCostSummary = L10n.t("overview.metric.total_unpriced")
             } else if unpriced > 0 {
                 totalCostSummary = L10n.t("overview.metric.total_partial_cost", ["cost": InterfaceText.formatUsd(allUsd)])
@@ -1321,11 +2186,21 @@ final class DashboardPage: NSObject {
             self.costMetricCard?.titleField?.stringValue = L10n.t("overview.metric.today_cost")
 
             self.todayRequestsMetric.stringValue = InterfaceText.formatInteger(todayRequests)
-            self.todayRequestsDetail.stringValue = L10n.t("overview.metric.total_requests", ["count": InterfaceText.formatInteger(totalRequests)])
+            self.todayRequestsDetail.stringValue = allTimePending
+                ? L10n.t("overview.metric.total_requests", ["count": "—"])
+                : L10n.t("overview.metric.total_requests", ["count": InterfaceText.formatInteger(totalRequests)])
 
             self.tokenMetricCard?.refreshAccessibility()
             self.costMetricCard?.refreshAccessibility()
             self.requestsMetricCard?.refreshAccessibility()
+        } else if resultEnvId != currentEnvId && !usageFailed {
+            self.todayTokensMetric.stringValue = "—"
+            self.todayTokensDetail.stringValue = L10n.t("overview.metric.total_tokens_placeholder")
+            self.usageMetric.stringValue = "—"
+            self.costMetricCard?.setStatusBadge(nil)
+            self.usageDetail.stringValue = L10n.t("overview.metric.total_cost_placeholder")
+            self.todayRequestsMetric.stringValue = "—"
+            self.todayRequestsDetail.stringValue = L10n.t("overview.metric.total_requests_placeholder")
         } else {
             self.renderUsageError(usageError)
         }

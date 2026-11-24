@@ -48,7 +48,7 @@ export function resolveVisibleHorizontalBounds(anchorEl, winOverride = null) {
   };
 
   const convView = anchorEl.closest(
-    '[data-testid="conversation-view"], [data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"]'
+    '[data-testid="conversation-view"], [data-media-drop-scope="subpane"], [data-testid="subagent-tab-conversation"], [data-testid="side-question-tab-conversation"], [data-testid="side-question-tab-content"]'
   );
   if (convView) {
     clampWithPane(convView, false);

@@ -44,8 +44,7 @@
     "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "gpt-oss-120b"
+    "claude-sonnet-5-5"
   ],
   "feedModels": [
     "gemini-3.8-flash",
@@ -66,7 +65,6 @@
     "claude-3-5-haiku",
     "gpt-4o",
     "gpt-4o-mini",
-    "gpt-oss-120b",
     "gemini-2.5-flash-lite",
     "gemini-3.5-flash-lite"
   ],
@@ -141,10 +139,6 @@
     },
     "gpt-4o-mini": {
       "displayName": "GPT-4o mini",
-      "capacityTokens": 128000
-    },
-    "gpt-oss-120b": {
-      "displayName": "GPT-OSS 120B",
       "capacityTokens": 128000
     },
     "gemini-2.5-flash-lite": {
@@ -252,6 +246,14 @@
         "input": 1.25,
         "output": 10,
         "cached": 0.125,
+        "contextTiers": [
+          {
+            "thresholdTokens": 200000,
+            "input": 2.5,
+            "output": 15,
+            "cached": 0.25
+          }
+        ],
         "provenance": {
           "sourceUrl": "https://cloud.google.com/model-garden/pricing?hl=en",
           "platform": "Google Cloud 标准 Global API",
@@ -664,27 +666,6 @@
           "verification": "historical",
           "platformEn": "OpenAI Standard API",
           "conditionsEn": "Historical benchmark; excludes regional, long-context, or cache-write surcharges; verify against official source"
-        }
-      }
-    ],
-    "gpt-oss-120b": [
-      {
-        "model": "gpt-oss-120b",
-        "validFrom": null,
-        "validUntil": null,
-        "input": 0.15,
-        "output": 0.6,
-        "cached": 0.075,
-        "provenance": {
-          "sourceUrl": "https://developers.openai.com/api/docs/pricing",
-          "platform": "开放权重模型 API 参考基准",
-          "conditions": "参考同类开放权重 120B 模型公开 API 基准估算",
-          "checkedAt": "2026-10-23",
-          "validFrom": null,
-          "validUntil": null,
-          "verification": "historical",
-          "platformEn": "Open-Weight Model API Reference Benchmark",
-          "conditionsEn": "Estimated from comparable open-weight 120B model public API benchmarks"
         }
       }
     ],

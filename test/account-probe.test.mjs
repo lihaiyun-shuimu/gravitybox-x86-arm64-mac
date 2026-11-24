@@ -13,7 +13,7 @@ import {
 
 const LS_BIN = '/Applications/Antigravity.app/Contents/Resources/bin/language_server';
 const INSIDERS_LS_BIN = '/Applications/Antigravity - Insiders.app/Contents/Resources/bin/language_server';
-const testTarget = () => applicationTarget('stable', '/Users/test');
+const testTarget = () => applicationTarget('stable', '/Users/test', { appPath: '/Applications/Antigravity.app' });
 const testMappers = { modelQuotaFromNormalized, groupToQuotaGroup };
 
 function makeFetchMock({
@@ -261,4 +261,54 @@ test('多候选回退：首个 language_server 无监听端口或 RPC 失败时�
     testMappers
   );
   assert.equal(nullStatus, null);
+});
+
+test('P1-11 & P1-15: 仅含 modelOrAlias.model 的陌生模型不丢弃、PRO+Ultra升级文案不误判、WINDOW_DAILY/24_HOUR 准确归类', async () => {
+  const { buildLiveProbeResultFromRpc, resolveProbeSubscriptionTier } = await import('../dist/account-probe.js');
+  const { classifyWindow, normalizeLiveModels } = await import('../dist/quota.js');
+
+  // P1-11: 缺少 modelId/id 时使用 modelOrAlias.model 作为后备身份
+  const models = normalizeLiveModels([
+    {
+      modelOrAlias: { model: 'MODEL_PLACEHOLDER_M999' },
+      label: 'Frontier Preview X',
+      quotaInfo: { remainingFraction: 0.75, resetTime: '2026-11-23T18:00:00Z' },
+    },
+  ], Date.now());
+  assert.equal(models.length, 1);
+  assert.equal(models[0].model_id, 'MODEL_PLACEHOLDER_M999');
+  assert.equal(models[0].display_name, 'Frontier Preview X');
+  assert.equal(models[0].own_percentage, 75);
+
+  // P1-15: PRO 结构化等级 + 含 Ultra 升级提示的 description 不被误判为 ULTRA
+  const proWithUltraPromo = {
+    email: 'pro-promo@example.invalid',
+    userTier: {
+      id: 'g1-pro-tier',
+      name: 'Google AI Pro',
+      description: 'Upgrade to Google AI Ultra for higher limits',
+    },
+  };
+  assert.equal(resolveProbeSubscriptionTier(proWithUltraPromo), 'PRO');
+
+  const realUltra = {
+    email: 'real-ultra@example.invalid',
+    userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' },
+    planStatus: { planInfo: { planName: 'Pro' } },
+  };
+  assert.equal(resolveProbeSubscriptionTier(realUltra), 'ULTRA');
+
+  const liveRes = buildLiveProbeResultFromRpc(
+    { userStatus: proWithUltraPromo },
+    {
+      groups: [
+        { displayName: 'Daily Pool', buckets: [{ bucketId: 'b-day', window: 'WINDOW_DAILY', remainingFraction: 0.5 }] },
+      ],
+    }
+  );
+  assert.equal(liveRes?.tier, 'PRO');
+  assert.equal(classifyWindow('WINDOW_DAILY'), 'daily');
+  assert.equal(classifyWindow('WINDOW_24_HOUR'), 'daily');
+  assert.equal(classifyWindow('WINDOW_5_HOUR'), '5h');
+  assert.equal(classifyWindow('WINDOW_WEEKLY'), 'weekly');
 });

@@ -3,12 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, rm, stat, copyFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { AccountsManager, MockKeychainAdapter } from '../dist/accounts.js';
 import { AccountSwitchService, replaceTopicRow } from '../dist/account-switch.js';
 import { ProtobufReader as Reader, ProtobufWriter as Writer } from '../dist/protobuf.js';
-const run = promisify(execFile);
+const execSql = (dbPath, sql) => { const d = new DatabaseSync(dbPath); try { d.exec(sql); } finally { d.close(); } };
 const now = () => Math.floor(Date.now() / 1000);
 const quota = pct => ({ models: [{ name: 'gemini-test', percentage: pct, percentage_known: true, reset_time: '' }], quota_groups: [{ display_name: 'Gemini', buckets: [{ bucket_id: 'gemini-5h', window: '5h', remaining_fraction: pct / 100, remaining_fraction_known: true, reset_time: '' }] }], last_updated: now(), is_forbidden: false, model_forwarding_rules: {} });
 async function fixture(t) {
@@ -17,7 +16,7 @@ async function fixture(t) {
   const stateDir = join(root, 'state'), profile = join(root, 'profile');
   await mkdir(join(profile, 'User', 'globalStorage'), { recursive: true });
   const db = join(profile, 'User', 'globalStorage', 'state.vscdb');
-  await run('/usr/bin/sqlite3', [db, "CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value TEXT); INSERT INTO ItemTable VALUES('unrelated','keep'),('jetskiStateSync.agentManagerInitState','old-state');"]);
+  execSql(db, "CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value TEXT); INSERT INTO ItemTable VALUES('unrelated','keep'),('jetskiStateSync.agentManagerInitState','old-state');");
   const manager = new AccountsManager(stateDir);
   manager.probeLiveLanguageServer = async () => null;
   const a = await manager.upsertAccount({ email: 'a@example.test', refreshToken: 'synthetic-a', accessToken: 'synthetic-access-a', expiresIn: 3600 });
@@ -25,7 +24,7 @@ async function fixture(t) {
   const keychain = new MockKeychainAdapter(); await keychain.writePassword('gemini', 'antigravity', 'old-keychain');
   return { root, stateDir, profile, db, manager, a, b, keychain };
 }
-const rows = async f => JSON.parse((await run('/usr/bin/sqlite3', ['-json', f.db, 'SELECT key,value FROM ItemTable ORDER BY key;'])).stdout);
+const rows = async f => { const d = new DatabaseSync(f.db); try { return d.prepare('SELECT key,value FROM ItemTable ORDER BY key;').all(); } finally { d.close(); } };
 
 test('备用号刷新使用本账号凭据与账号范围；项目元信息可保存，失败保留旧记录', async t => {
   const f = await fixture(t), before = quota(62); f.b.quota = before; f.b.token.access_token = 'pending_refresh'; await f.manager.saveAccount(f.b);
@@ -74,7 +73,7 @@ test('切号事务同步SQLite、钥匙串与本机索引，保留其他数据�
   const f = await fixture(t), before = await rows(f);
   const original = { index: await readFile(join(f.stateDir, 'accounts.json'), 'utf8') };
   const unrelatedTopic = replaceTopicRow(undefined, 'other-sentinel', Writer.encodeString(1, 'keep-row'));
-  await run('/usr/bin/sqlite3', [f.db, `INSERT INTO ItemTable VALUES('antigravityUnifiedStateSync.oauthToken','${unrelatedTopic}');`]);
+  execSql(f.db, `INSERT INTO ItemTable VALUES('antigravityUnifiedStateSync.oauthToken','${unrelatedTopic}');`);
   const service = new AccountSwitchService(f.manager, { ...f, isRunning: async () => false });
   await service.switchAccount(f.b.id);
   const written = Object.fromEntries((await rows(f)).map(r => [r.key, r.value]));
@@ -89,7 +88,8 @@ test('切号事务同步SQLite、钥匙串与本机索引，保留其他数据�
   const readback = new AccountsManager(join(f.root, 'readback'));
   const saved = await readback.saveCurrentAccount({ homeDir: f.root, appSupportDir, keychain: new MockKeychainAdapter() });
   assert.equal(saved.email, f.b.email); assert.equal(saved.token.refresh_token, f.b.token.refresh_token);
-  const journal = join(f.stateDir, 'account-switch-journal-stable.json'); assert.equal((await stat(journal)).mode & 0o777, 0o600);
+  const journal = join(f.stateDir, 'account-switch-journal-stable.json');
+  if (process.platform !== 'win32') assert.equal((await stat(journal)).mode & 0o777, 0o600);
   await service.rollback();
   assert.equal(await f.keychain.readPassword('gemini', 'antigravity'), 'old-keychain'); assert.equal(await readFile(join(f.stateDir, 'accounts.json'), 'utf8'), original.index);
   assert.deepEqual((await rows(f)).filter(r => r.key !== 'antigravityUnifiedStateSync.oauthToken'), before);

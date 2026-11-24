@@ -168,12 +168,20 @@ class FakeElement {
   matches(sel) {
     const s = String(sel);
     if (s.includes('.surface-composer') && this.classList.contains('surface-composer')) return true;
+    if (s.includes('.__gravitybox_hud_host__') && this.classList.contains('__gravitybox_hud_host__')) return true;
+    if (s.includes('.model-selector') && this.classList.contains('model-selector')) return true;
     if (s.includes('conversation-view') && this.getAttribute('data-testid') === 'conversation-view') return true;
     if (s.includes('subagent-tab-conversation') && this.getAttribute('data-testid') === 'subagent-tab-conversation') return true;
     if (s.includes('data-media-drop-scope="subpane"') && this.getAttribute('data-media-drop-scope') === 'subpane') return true;
     if (s.includes('overview-panel-host') && this.getAttribute('data-testid') === 'overview-panel-host') return true;
     if (s.includes('data-split-root="true"') && this.getAttribute('data-split-root') === 'true') return true;
     if (s.includes('agent-input-box') && this.getAttribute('data-testid') === 'agent-input-box') return true;
+    if (s.includes('model-selector-trigger') && this.getAttribute('data-testid') === 'model-selector-trigger') return true;
+    if (s.includes('[contenteditable="true"]') && this.getAttribute('contenteditable') === 'true') return true;
+    if (s.includes('[role="button"]') && this.getAttribute('role') === 'button') return true;
+    if (/(?:^|[\s,>])button(?=$|[\s,\[.:])/i.test(s) && this.tagName === 'BUTTON') return true;
+    if (/(?:^|[\s,>])textarea(?=$|[\s,\[.:])/i.test(s) && this.tagName === 'TEXTAREA') return true;
+    if (/(?:^|[\s,>])input(?=$|[\s,\[.:])/i.test(s) && this.tagName === 'INPUT') return true;
     return false;
   }
 
@@ -3281,5 +3289,396 @@ describe('HudInstance 与 AntigravityHudManager 生产模块生命周期、垂�
       globalThis.MutationObserver = OrigMO;
       globalThis.document = origDoc;
     }
+  });
+
+  it('scoped composer characterData 监听在模型按钮纯文本更新时立即触发 MODEL_CHANGED 并忽略编辑器输入与完整清理', async () => {
+    const observers = [];
+    const OrigMO = globalThis.MutationObserver;
+    const OrigRO = globalThis.ResizeObserver;
+    const origDoc = globalThis.document;
+    const origWin = globalThis.window;
+
+    globalThis.MutationObserver = class {
+      constructor(cb) {
+        this.cb = cb;
+        this.records = [];
+        this.disconnected = false;
+        observers.push(this);
+      }
+      observe(target, opts) {
+        this.records.push({ target, opts });
+      }
+      disconnect() {
+        this.disconnected = true;
+      }
+    };
+    globalThis.ResizeObserver = class {
+      observe() {}
+      disconnect() {}
+    };
+
+    const doc = new FakeElement('document');
+    doc.body = new FakeElement('body', doc);
+    doc.documentElement = new FakeElement('html', doc);
+    doc.hidden = false;
+    doc.createElement = (tag) => new FakeElement(tag, doc);
+    doc.querySelectorAll = (sel) => doc.body.querySelectorAll(sel);
+    doc.querySelector = (sel) => doc.body.querySelector(sel);
+    doc.addEventListener = () => {};
+    doc.removeEventListener = () => {};
+    globalThis.document = doc;
+    globalThis.window = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      location: { pathname: '/c/11111111-2222-3333-4444-555555555555' },
+      matchMedia: () => ({ matches: true }),
+      getComputedStyle: () => ({ visibility: 'visible', display: 'block', paddingBottom: '0px' }),
+      addEventListener: () => {},
+    };
+
+    try {
+      const view = new FakeElement('div', doc);
+      view.setAttribute('data-testid', 'conversation-view');
+      view.setAttribute('data-cascade-id', 'cascade-composer-text');
+      view.setAttribute('data-conversation-id', 'conv-composer-text-1');
+
+      const composer = new FakeElement('div', doc);
+      composer.className = 'surface-composer';
+
+      const editor = new FakeElement('div', doc);
+      editor.setAttribute('contenteditable', 'true');
+      const editorParagraph = new FakeElement('p', doc);
+      editor.appendChild(editorParagraph);
+      const editorTextNode = { nodeType: 3, parentNode: editorParagraph, parentElement: editorParagraph, data: 'hello' };
+
+      const modelBtn = new FakeElement('button', doc);
+      modelBtn.setAttribute('data-testid', 'model-selector-trigger');
+      const modelLabelSpan = new FakeElement('span', doc);
+      modelBtn.appendChild(modelLabelSpan);
+      modelBtn.textContent = 'Claude Sonnet 4.5';
+      const modelTextNode = { nodeType: 3, parentNode: modelLabelSpan, parentElement: modelLabelSpan, data: 'Claude Sonnet 4.5' };
+
+      const hudHostInner = new FakeElement('div', doc);
+      hudHostInner.className = '__gravitybox_hud_host__';
+      const hudTextNode = { nodeType: 3, parentNode: hudHostInner, parentElement: hudHostInner, data: '46%' };
+
+      composer.appendChild(editor);
+      composer.appendChild(modelBtn);
+      composer.appendChild(hudHostInner);
+      view.appendChild(composer);
+      doc.body.appendChild(view);
+
+      const bridgeEvents = [];
+      const manager = new AntigravityHudManager({
+        onBridgeEvent: (e) => bridgeEvents.push(e),
+      });
+      manager.start();
+
+      // 1. 验证 document.body subtree observer 依然没有 characterData / style / class
+      const bodySubtreeObs = observers.find((o) =>
+        o.records.some((r) => r.target === doc.body && r.opts?.subtree === true)
+      );
+      assert.ok(bodySubtreeObs, '应存在 document.body subtree observer');
+      const bodySubtreeOpts = bodySubtreeObs.records.find((r) => r.target === doc.body && r.opts?.subtree === true).opts;
+      assert.equal(Boolean(bodySubtreeOpts.characterData), false, 'document.body subtree observer 不得开启 characterData');
+      assert.equal(bodySubtreeOpts.attributeFilter.includes('style'), false, 'document.body subtree observer 不得监听 style');
+      assert.equal(bodySubtreeOpts.attributeFilter.includes('class'), false, 'document.body subtree observer 不得监听 class');
+
+      // 2. 验证 scoped composer observer 已挂载且仅对 composer 启用 characterData + subtree
+      const composerObs = manager.composerTextObservers.get(composer);
+      assert.ok(composerObs, '应为活跃 composer 创建 scoped characterData observer');
+      assert.deepEqual(composerObs.records[0], {
+        target: composer,
+        opts: { characterData: true, subtree: true },
+      });
+
+      let reconcileCallCount = 0;
+      const origReconcile = manager.reconcileMounts.bind(manager);
+      manager.reconcileMounts = (...args) => {
+        reconcileCallCount += 1;
+        return origReconcile(...args);
+      };
+
+      // 3. 验证 composer 内 [contenteditable="true"] 与 .__gravitybox_hud_host__ 的 characterData 变化不会触发 reconcileMounts
+      composerObs.cb([{ type: 'characterData', target: editorTextNode }]);
+      assert.equal(manager.reconcileTimer, null, '编辑器内 characterData 变化不得调度 reconcileTimer');
+      composerObs.cb([{ type: 'characterData', target: hudTextNode }]);
+      assert.equal(manager.reconcileTimer, null, 'HUD 宿主内 characterData 变化不得调度 reconcileTimer');
+      await new Promise((r) => setTimeout(r, 40));
+      assert.equal(reconcileCallCount, 0, '编辑器或 HUD 宿主内 characterData 变化不得触发 reconcileMounts');
+
+      // 4. 验证 model-selector-trigger 按钮内 TextNode 更新不等待 650ms routeTimer，在 20ms 调度后触发 reconcileMounts 并发出 MODEL_CHANGED
+      bridgeEvents.length = 0;
+      modelBtn.textContent = 'Orchestrator Gemini 4 Neon High';
+      modelTextNode.data = 'Orchestrator Gemini 4 Neon High';
+      const triggerAt = Date.now();
+      composerObs.cb([{ type: 'characterData', target: modelTextNode }]);
+      assert.notEqual(manager.reconcileTimer, null, '模型按钮 characterData 变化应立即调度 reconcileTimer');
+
+      while (Date.now() - triggerAt < 300) {
+        if (bridgeEvents.some((e) => e.type === 'MODEL_CHANGED')) break;
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      const elapsedMs = Date.now() - triggerAt;
+      const modelChanged = bridgeEvents.find((e) => e.type === 'MODEL_CHANGED');
+      assert.ok(modelChanged, '应发出 MODEL_CHANGED 事件');
+      assert.equal(modelChanged.modelId, 'Orchestrator Gemini 4 Neon High');
+      assert.ok(reconcileCallCount >= 1, '应已触发 reconcileMounts');
+      assert.ok(elapsedMs < 400, `应远快于 650ms routeTimer（实际 ${elapsedMs}ms）`);
+
+      // 5. 验证 setEnabled(false)、setRouteExcluded(true)、空 views 与 dispose() 均会断开并清空所有 scoped composer observers
+      manager.setEnabled(false);
+      assert.equal(composerObs.disconnected, true, 'setEnabled(false) 必须 disconnect scoped composer observer');
+      assert.equal(manager.composerTextObservers.size, 0, 'setEnabled(false) 必须清空 composerTextObservers');
+
+      manager.setEnabled(true);
+      const reattachedObs = manager.composerTextObservers.get(composer);
+      assert.ok(reattachedObs, '重新启用后应重新挂载 scoped composer observer');
+      assert.equal(reattachedObs.disconnected, false);
+
+      manager.setRouteExcluded(true);
+      assert.equal(reattachedObs.disconnected, true, 'setRouteExcluded(true) 必须 disconnect scoped composer observer');
+      assert.equal(manager.composerTextObservers.size, 0, 'setRouteExcluded(true) 必须清空 composerTextObservers');
+
+      manager.setRouteExcluded(false);
+      const thirdObs = manager.composerTextObservers.get(composer);
+      assert.ok(thirdObs, '解除路由排除后应重新挂载 scoped composer observer');
+      assert.equal(thirdObs.disconnected, false);
+
+      // 6. 验证空 views / 分栏移除时断开并清理已移除 composer 的 observer
+      origReconcile([]);
+      assert.equal(thirdObs.disconnected, true, '空 views 协调必须 disconnect scoped composer observer');
+      assert.equal(manager.composerTextObservers.size, 0, '空 views 协调必须清空 composerTextObservers');
+
+      origReconcile([view]);
+      const fourthObs = manager.composerTextObservers.get(composer);
+      assert.ok(fourthObs, '恢复分栏后应重新挂载 scoped composer observer');
+
+      manager.dispose();
+      assert.equal(fourthObs.disconnected, true, 'dispose() 必须 disconnect scoped composer observer');
+      assert.equal(manager.composerTextObservers.size, 0, 'dispose() 必须清空 composerTextObservers');
+    } finally {
+      globalThis.MutationObserver = OrigMO;
+      globalThis.ResizeObserver = OrigRO;
+      globalThis.document = origDoc;
+      globalThis.window = origWin;
+    }
+  });
+
+  it('P1-1 回归：流式运行中重挂 mount() 保留三组活体时钟锚点并触发 REQUEST_REFRESH，且 0 秒起步轮次 tickTurnClock 正常推进 turnHighWaterMark', () => {
+    const doc = new FakeElement('document');
+    doc.body = new FakeElement('body', doc);
+    doc.documentElement = new FakeElement('html', doc);
+    doc.hidden = false;
+    doc.visibilityState = 'visible';
+    doc.createElement = (tag) => new FakeElement(tag, doc);
+    doc.addEventListener = () => {};
+    doc.removeEventListener = () => {};
+    const origDoc = globalThis.document;
+    const origWin = globalThis.window;
+    globalThis.document = doc;
+    globalThis.window = {
+      innerWidth: 1280,
+      innerHeight: 800,
+      matchMedia: () => ({ matches: false }),
+      getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+      addEventListener: () => {},
+    };
+    try {
+      const bridgeEvents = [];
+      const composer = new FakeElement('div', doc);
+      composer.className = 'surface-composer';
+      doc.body.appendChild(composer);
+
+      const inst = new HudInstance('pane-p11', {
+        paneSlotId: 'pane-p11',
+        onBridgeEvent: (e) => bridgeEvents.push(e),
+      });
+      inst.mount(composer);
+      const rev = inst.switchConversation('conv-p11', 'gemini-3.8-flash', true, false, 0, null, 'generating');
+
+      // 0 秒起步轮次进入流式
+      inst.updateMetrics({
+        conversationId: 'conv-p11',
+        paneSlotId: 'pane-p11',
+        sessionRevision: rev,
+        metricsSequence: 1,
+        updatedAt: Date.now(),
+        availability: 'ready',
+        isStreaming: true,
+        activityPhase: 'generating',
+        session: {
+          turns: 1,
+          steps: 2,
+          modelDurationSeconds: 0,
+          inFlightModelDurationSeconds: 0,
+          activeModelStepCount: 1,
+          toolDurationSeconds: 0,
+          inFlightToolDurationSeconds: 0,
+          activeToolStepCount: 0,
+          currentTurnDurationSeconds: 0,
+        },
+      });
+      assert.equal(inst.turnHighWaterMark?.seconds, 0);
+
+      // 模拟时钟向前推进 45 秒后触发 tickTurnClock：0 秒起步轮次也必须推进 turnHighWaterMark
+      const pastMs = Date.now() - 45_000;
+      inst.turnClockAnchor.anchorMs = pastMs;
+      inst.modelClockAnchor.anchorMs = pastMs;
+      inst.tickTurnClock();
+      assert.ok(
+        (inst.turnHighWaterMark?.seconds ?? 0) >= 44,
+        `0 秒起步轮次 tickTurnClock 必须更新 turnHighWaterMark，实际=${inst.turnHighWaterMark?.seconds}`
+      );
+
+      // 模拟 DOM 重绘导致 host 脱离后触发 reconcile -> mount()，验证三组时钟锚点保留且不倒退并触发 REQUEST_REFRESH
+      bridgeEvents.length = 0;
+      const newComposer = new FakeElement('div', doc);
+      newComposer.className = 'surface-composer';
+      doc.body.appendChild(newComposer);
+      inst.host.remove();
+      inst.reconcile(newComposer);
+
+      assert.ok(inst.turnClockAnchor, '重挂后必须保留 turnClockAnchor');
+      assert.ok(inst.modelClockAnchor, '重挂后必须保留 modelClockAnchor');
+      const liveTurnAfterRemount =
+        inst.turnClockAnchor.baseSeconds + (Date.now() - inst.turnClockAnchor.anchorMs) / 1000;
+      const liveModelAfterRemount = inst.getLiveClockSeconds(inst.modelClockAnchor, Date.now());
+      assert.ok(liveTurnAfterRemount >= 44, `重挂后本轮用时不得归零倒退，实际=${liveTurnAfterRemount}`);
+      assert.ok(liveModelAfterRemount >= 44, `重挂后模型用时不得归零倒退，实际=${liveModelAfterRemount}`);
+      assert.ok(
+        bridgeEvents.some((e) => e.type === 'REQUEST_REFRESH' && e.conversationId === 'conv-p11'),
+        '活跃重挂后应发出 REQUEST_REFRESH 向后端校准'
+      );
+      inst.dispose();
+    } finally {
+      globalThis.document = origDoc;
+      globalThis.window = origWin;
+    }
+  });
+
+  it('P1-3 回归：remote_unbridged 卡片 #val-turn-dur 正确展示观测耗时、idle 保留高水位，并在下轮流式重启时清零重计', () => {
+    const inst = new HudInstance('pane-p13', {
+      paneSlotId: 'pane-p13',
+      locale: 'zh-Hans',
+      languageMode: 'zh',
+    });
+    const host = new FakeElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    host.shadowRoot = shadow;
+    inst.host = host;
+    inst.shadow = shadow;
+    shadow.innerHTML = inst.buildHudHtml();
+
+    const rev = inst.switchConversation('conv-ssh-p13', 'gemini-3.8-flash', true, false, 0, null, 'generating');
+    inst.updateMetrics({
+      conversationId: 'conv-ssh-p13',
+      paneSlotId: 'pane-p13',
+      sessionRevision: rev,
+      metricsSequence: 1,
+      updatedAt: Date.now(),
+      availability: 'remote_unbridged',
+      sourceKind: 'remote',
+      remoteHostLabel: 'prod-box',
+      isStreaming: true,
+      activityPhase: 'generating',
+      session: { turns: 0, steps: 0, currentTurnDurationSeconds: 0 },
+    });
+
+    // 模拟已运行 15 秒并再次收到 remote_unbridged 流式快照：卡片 #val-turn-dur 不得被抹成 '—'
+    inst.turnClockAnchor.anchorMs = Date.now() - 15_000;
+    inst.tickTurnClock();
+    inst.updateMetrics({
+      conversationId: 'conv-ssh-p13',
+      paneSlotId: 'pane-p13',
+      sessionRevision: rev,
+      metricsSequence: 2,
+      updatedAt: Date.now(),
+      availability: 'remote_unbridged',
+      sourceKind: 'remote',
+      remoteHostLabel: 'prod-box',
+      isStreaming: true,
+      activityPhase: 'generating',
+      session: { turns: 0, steps: 0, currentTurnDurationSeconds: 0 },
+    });
+    assert.match(shadow.querySelector('#val-turn-dur').textContent, /1[56]秒/, '流式期卡片 #val-turn-dur 必须展示观测耗时而非 —');
+    assert.match(shadow.querySelector('#hud-txt-session .hud-turn-dur').textContent, /已观测.*1[56]s/);
+
+    // 流式结束收到 idle 包：必须保留最近一次观测高水位而不归零
+    inst.notifyModelOrStreamingChange('gemini-3.8-flash', false, false, 0, null, 'idle');
+    inst.updateMetrics({
+      conversationId: 'conv-ssh-p13',
+      paneSlotId: 'pane-p13',
+      sessionRevision: rev,
+      metricsSequence: 3,
+      updatedAt: Date.now(),
+      availability: 'remote_unbridged',
+      sourceKind: 'remote',
+      remoteHostLabel: 'prod-box',
+      isStreaming: false,
+      activityPhase: 'idle',
+      session: { turns: 0, steps: 0, currentTurnDurationSeconds: 0 },
+    });
+    assert.ok((inst.turnHighWaterMark?.seconds ?? 0) >= 14, 'idle 后 remote_unbridged 必须保留观测高水位');
+    assert.match(shadow.querySelector('#val-turn-dur').textContent, /1[56]秒/, 'idle 后卡片 #val-turn-dur 应保留观测耗时');
+    assert.match(shadow.querySelector('#hud-txt-session .hud-turn-dur').textContent, /已观测.*1[56]s/);
+
+    // 下一轮流式重启时应清零旧高水位，从 0 秒重新开始观测计时
+    inst.notifyModelOrStreamingChange('gemini-3.8-flash', true, false, 0, null, 'generating');
+    assert.ok((inst.turnClockAnchor?.baseSeconds ?? 99) < 2, '下轮 remote_unbridged 流式重启应从 0 秒重新计时');
+    inst.dispose();
+  });
+
+  it('P2-2 回归：tickTurnClock 推进模型/工具计时更新 #hud-popover-session 的 data-exact-summary 时保留 compactions 字段', () => {
+    const inst = new HudInstance('pane-p22', {
+      paneSlotId: 'pane-p22',
+      locale: 'zh-Hans',
+      languageMode: 'zh',
+    });
+    const host = new FakeElement('div');
+    const shadow = host.attachShadow({ mode: 'open' });
+    host.shadowRoot = shadow;
+    inst.host = host;
+    inst.shadow = shadow;
+    shadow.innerHTML = inst.buildHudHtml();
+
+    const rev = inst.switchConversation('conv-p22', 'gemini-3.8-flash', true, false, 0, null, 'generating');
+    inst.updateMetrics({
+      conversationId: 'conv-p22',
+      paneSlotId: 'pane-p22',
+      sessionRevision: rev,
+      metricsSequence: 1,
+      updatedAt: Date.now(),
+      availability: 'live',
+      isStreaming: true,
+      activityPhase: 'generating',
+      session: {
+        turns: 4,
+        steps: 12,
+        compactionCount: 3,
+        modelDurationSeconds: 10,
+        toolDurationSeconds: 5,
+        inFlightModelDurationSeconds: 1,
+        inFlightToolDurationSeconds: 0,
+        activeModelStepCount: 1,
+        activeToolStepCount: 0,
+        currentTurnDurationSeconds: 1,
+        averageTtftSeconds: 1.25,
+        outputTps: 65.5,
+      },
+      tokens: { totalTokens: 5000, cacheHitRate: 0.5 },
+      context: { hasUsageData: true, usedTokens: 5000, capacityTokens: 1000000, usedRatio: 0.005 },
+    });
+
+    const popSession = shadow.querySelector('#hud-popover-session');
+    assert.match(popSession.getAttribute('data-exact-summary') || '', /compactions=3/, '初始渲染应含 compactions=3');
+
+    // 模拟 3 秒后 tickTurnClock 推进模型时钟
+    inst.modelClockAnchor.anchorMs = Date.now() - 3_000;
+    inst.tickTurnClock();
+    const afterTick = popSession.getAttribute('data-exact-summary') || '';
+    assert.match(afterTick, /turns=4; steps=12;/);
+    assert.match(afterTick, /compactions=3$/, 'tickTurnClock 更新 data-exact-summary 不得丢失 compactions 字段');
+    inst.dispose();
   });
 });

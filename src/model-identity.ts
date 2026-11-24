@@ -26,6 +26,6 @@ export function normalizeModelId(name: string): string {
     .replace(/^claude-((?!thinking|preview|trial|latest|high|medium|low|max|minimal|xhigh|extra|tiered|fast|batch|exp)[a-z]{3,16})-(\d+)\.(\d+)/, 'claude-$1-$2-$3')
     .replace(/^claude-3\.([57])-(sonnet|haiku)/, 'claude-3-$1-$2')
     .replace(/^claude-(3)-(5|7)-(sonnet|haiku)/, 'claude-$1-$2-$3')
-    .replace(/^claude-([4-9])\.(\d+)-((?!thinking|preview|trial|latest|high|medium|low|max|minimal|xhigh|extra|tiered|fast|batch|exp)[a-z]{3,16})/, 'claude-$3-$1-$2')
+    .replace(/^claude-([4-9]|[1-9]\d+)\.(\d+)-((?!thinking|preview|trial|latest|high|medium|low|max|minimal|xhigh|extra|tiered|fast|batch|exp)[a-z]{3,16})/, 'claude-$3-$1-$2')
     .replace(/^claude-3\.([57])-/, 'claude-3-$1-');
 }

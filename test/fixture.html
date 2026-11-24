@@ -24,4 +24,32 @@
 <div data-testid="plugin-card" id="plugin-card"><h3 id="plugin-card-title">History</h3><button id="plugin-install">Install</button></div>
 <button id="brand-gemini">Gemini</button><button id="brand-claude">Claude</button>
 </section></div><footer>验收：改译 / 删词 / 原子保存 / 无效 JSON 回退 / 受保护内容 / 多窗口 / 刷新 / 撤销 / 交互语义</footer></div>
+<template id="ssh-modal-fixture">
+  <div id="ssh-fixture-root" data-testid="project-selector-modal">
+    <div role="dialog" aria-label="Connect to SSH Host">
+      <h2 id="ssh-dlg-title">Connect to SSH Host</h2>
+      <p id="ssh-dlg-prompt">Enter [user@]host[:port], or pick a host from your SSH config.<span></span></p>
+      <p id="ssh-dlg-prompt-two-nodes"></p>
+      <div role="group" data-testid="ssh-config-file">
+        <span id="ssh-cfg-lbl">SSH config: </span>
+        <span data-testid="ssh-config-file-name" id="ssh-cfg-val">~/.ssh/config (default)</span>
+        <button data-testid="ssh-config-file-choose" id="ssh-cfg-choose">Choose File…</button>
+      </div>
+      <div data-testid="ssh-connect-progress" id="ssh-progress">Connecting to the running server on demo-host…</div>
+      <div data-testid="ssh-connect-error" id="ssh-err-box">
+        <span class="whitespace-pre-line" id="ssh-err-text"><span class="font-mono">CONNECTION_FAILED: </span>Couldn't connect to the SSH host. Try ssh to it in a terminal, and see the Antigravity log for details.
+demo-host reported: ssh: connect to host demo-host port 22: Operation timed out
+Logs: /Users/demo/Library/Logs/Antigravity/main.log</span>
+      </div>
+      <div data-testid="ssh-host-project-item" id="ssh-user-alias">demo-ssh-host</div>
+      <div id="ssh-hidden-count">2 hidden hosts</div>
+    </div>
+    <div data-testid="toast-notification" data-notification-tag="ssh-connect-failed" id="ssh-toast">
+      <div id="ssh-toast-title">Connected to demo-host</div>
+      <div id="ssh-toast-msg">SSH_CONFIG_INVALID: SSH can't use your SSH config file. Fix the problem ssh reports, or choose another config file.
+demo-host reported: bad configuration option
+Logs: /Users/demo/Library/Logs/Antigravity/main.log</div>
+    </div>
+  </div>
+</template>
 <script>document.querySelector('#shadow').attachShadow({mode:'open'}).innerHTML='<button id="shadow-settings">Settings</button>';</script></html>

@@ -3,12 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { AccountSwitchService, DatabaseTransaction } from '../dist/account-switch.js';
 import { AccountsManager, MockKeychainAdapter } from '../dist/accounts.js';
-
-const run = promisify(execFile);
+import { sqliteExec, sqliteQueryAll } from './test-ipc.mjs';
 
 function makeAccount(id, email, opts = {}) {
   return {
@@ -30,7 +28,7 @@ async function setupSandbox() {
   await mkdir(join(profile, 'User', 'globalStorage'), { recursive: true });
 
   const db = join(profile, 'User', 'globalStorage', 'state.vscdb');
-  await run('/usr/bin/sqlite3', [db, 'CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);']);
+  sqliteExec(db, 'CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);');
 
   const manager = new AccountsManager(stateDir);
   await manager.init();
@@ -141,7 +139,7 @@ test('S3 切号事务: 从带有企业项目偏好的账号切换至个人账号
   const env = await setupSandbox();
   try {
     // 预先在数据库中插入包含企业项目行的 ItemTable 数据
-    await run('/usr/bin/sqlite3', [env.db, `INSERT INTO ItemTable VALUES('antigravityUnifiedStateSync.enterprisePreferences','old-enterprise-proj');`]);
+    sqliteExec(env.db, `INSERT INTO ItemTable VALUES('antigravityUnifiedStateSync.enterprisePreferences','old-enterprise-proj');`);
 
     const personalAcc = await env.manager.upsertAccount(makeAccount('pers-1', 'myuser@example.test', { projectId: null }));
 
@@ -156,8 +154,7 @@ test('S3 切号事务: 从带有企业项目偏好的账号切换至个人账号
     const switchRes = await service.switchAccount(personalAcc.id);
     assert.equal(switchRes.switchedTo, 'myuser@example.test');
 
-    const raw = (await run('/usr/bin/sqlite3', ['-json', env.db, "SELECT key,value FROM ItemTable WHERE key='antigravityUnifiedStateSync.enterprisePreferences';"])).stdout.trim();
-    const dbRows = raw ? JSON.parse(raw) : [];
+    const dbRows = sqliteQueryAll(env.db, "SELECT key,value FROM ItemTable WHERE key='antigravityUnifiedStateSync.enterprisePreferences';");
     assert.equal(dbRows.length, 0, '切换至个人账号后，企业项目行必须被清理删除');
   } finally {
     await rm(env.root, { recursive: true, force: true });
@@ -511,5 +508,179 @@ test('v1.1.3 Issue #19 & 合规切号: 同源 agy CLI 凭据非侵入同步、�
     await rm(env.root, { recursive: true, force: true });
   }
 });
+
+test('P1-42: 切号归档与回滚日志采用白名单脱敏，agentManagerInitState 等非白名单行全部脱敏为 [REDACTED_STATE_ROW]', async () => {
+  const env = await setupSandbox();
+  try {
+    const dbPath = join(env.profile, 'User', 'globalStorage', 'state.vscdb');
+    const initDb = new DatabaseSync(dbPath);
+    try {
+      initDb.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(
+        'jetskiStateSync.agentManagerInitState',
+        'sensitive-init-state-payload'
+      );
+      initDb.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(
+        'antigravityOnboarding',
+        'true'
+      );
+    } finally {
+      initDb.close();
+    }
+
+    const acc = await env.manager.upsertAccount(makeAccount('acc-wl', 'whitelist-redact@example.invalid'));
+    const service = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      keychain: env.keychain,
+      isRunning: async () => false,
+    });
+    await service.switchAccount(acc.id);
+    await service.rollback();
+
+    const journalPath = join(env.stateDir, 'account-switch-journal-stable.json');
+    const raw = await readFile(journalPath, 'utf8');
+    const journal = JSON.parse(raw);
+    assert.equal(journal.status, 'rolled-back');
+    assert.equal(raw.includes('sensitive-init-state-payload'), false, '归档/回滚日志绝不能保留 agentManagerInitState 明文');
+    assert.equal(journal.before['jetskiStateSync.agentManagerInitState'], '[REDACTED_STATE_ROW]');
+    assert.equal(journal.before['antigravityOnboarding'], 'true');
+    assert.equal(journal.after['antigravityUnifiedStateSync.oauthToken'], '[REDACTED_OAUTH_TOKEN]');
+    assert.equal(journal.after['antigravityUnifiedStateSync.userStatus'], '[REDACTED_STATE_ROW]');
+  } finally {
+    await rm(env.root, { recursive: true, force: true });
+  }
+});
+
+test('P0-02: 切入无 project_id 账号仅移除 enterpriseGcpProjectId，逐字节保留无关企业偏好并在撤销时完整还原', async () => {
+  const env = await setupSandbox();
+  try {
+    const { replaceTopicRow } = await import('../dist/account-state.js');
+    const { ProtobufWriter } = await import('../dist/protobuf.js');
+
+    // 1. 纯 base64 形态：同时含无关 sentinel 与 enterpriseGcpProjectId
+    const unrelatedPayload = Buffer.from('keep-unrelated-enterprise-pref-bytes', 'utf8');
+    let mixedRaw = replaceTopicRow(undefined, 'unrelatedEnterprisePref', unrelatedPayload);
+    mixedRaw = replaceTopicRow(mixedRaw, 'enterpriseGcpProjectId', ProtobufWriter.encodeString(3, 'proj-ent-1'));
+
+    // 也验证 JSON wrapper 形态
+    const wrappedMixed = JSON.stringify({ version: 1, data: mixedRaw });
+    const dbConn = new DatabaseSync(env.db);
+    try {
+      dbConn.prepare('INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)').run(
+        'antigravityUnifiedStateSync.enterprisePreferences',
+        wrappedMixed
+      );
+    } finally {
+      dbConn.close();
+    }
+
+    const personalAcc = await env.manager.upsertAccount(makeAccount('pers-keep', 'pers-keep@example.test', { projectId: null }));
+    const service = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      keychain: env.keychain,
+      isRunning: async () => false,
+    });
+
+    await service.switchAccount(personalAcc.id);
+    const dbCheck = new DatabaseSync(env.db);
+    let afterVal = '';
+    try {
+      const row = dbCheck.prepare("SELECT value FROM ItemTable WHERE key='antigravityUnifiedStateSync.enterprisePreferences'").get();
+      assert.ok(row && typeof row.value === 'string', '存在无关偏好字段时，enterprisePreferences 行必须保留');
+      afterVal = row.value;
+    } finally {
+      dbCheck.close();
+    }
+
+    const parsedAfter = JSON.parse(afterVal);
+    assert.equal(parsedAfter.version, 1, 'JSON wrapper 其他属性必须保留');
+    const { decodeTopicRow } = await import('../dist/account-state.js');
+    assert.equal(decodeTopicRow(afterVal, 'enterpriseGcpProjectId'), null, 'enterpriseGcpProjectId 必须已被移除');
+    assert.deepEqual(decodeTopicRow(afterVal, 'unrelatedEnterprisePref'), unrelatedPayload, '无关偏好字段必须逐字节相等');
+
+    await service.rollback();
+    const dbAfterRb = new DatabaseSync(env.db);
+    try {
+      const row = dbAfterRb.prepare("SELECT value FROM ItemTable WHERE key='antigravityUnifiedStateSync.enterprisePreferences'").get();
+      assert.equal(row?.value, wrappedMixed, '撤销切号后必须逐字节还原完整原值');
+    } finally {
+      dbAfterRb.close();
+    }
+  } finally {
+    await rm(env.root, { recursive: true, force: true });
+  }
+});
+
+test('P0-03 & P1-09: 首次切号/双 CLI 不同账号恢复、外部重登冲突不阻断回滚、以及常规刷新配额/备注后仍可撤销', async () => {
+  const env = await setupSandbox();
+  const geminiDir = join(env.root, '.gemini');
+  const agyCliTokenPath = join(geminiDir, 'antigravity-cli', 'antigravity-oauth-token');
+  const jetskiTokenPath = join(geminiDir, 'jetski-standalone-oauth-token');
+
+  try {
+    // 模拟首次切号：桌面钥匙串为空，accounts.json 尚无 current_account_id
+    await env.keychain.deletePassword('gemini', 'antigravity');
+    await mkdir(join(geminiDir, 'antigravity-cli'), { recursive: true });
+    const cliInitialA1 = '{"token":{"email":"cli-a1@example.test","refresh_token":"1//a1"}}\n';
+    const cliInitialA2 = '{"token":{"email":"cli-a2@example.test","refresh_token":"1//a2"}}\n';
+    await writeFile(agyCliTokenPath, cliInitialA1, { mode: 0o600 });
+    await writeFile(jetskiTokenPath, cliInitialA2, { mode: 0o600 });
+
+    const accB = await env.manager.upsertAccount(makeAccount('acc-b-cli', 'cli-b@example.test'));
+    const service = new AccountSwitchService(env.manager, {
+      stateDir: env.stateDir,
+      profile: env.profile,
+      geminiDir,
+      keychain: env.keychain,
+      isRunning: async () => false,
+    });
+
+    // 1. 首次切号到 B，再模拟期间只刷新了配额与自定义备注（P1-09）
+    await service.switchAccount(accB.id);
+    const updatedB = await env.manager.getAccount(accB.id);
+    updatedB.custom_label = '已刷新配额备注';
+    updatedB.quota = {
+      last_updated: Math.floor(Date.now() / 1000),
+      models: [{ name: 'gemini-3.8-flash', percentage: 88, percentage_known: true }],
+    };
+    await env.manager.saveAccount(updatedB);
+
+    // 撤销必须成功（不被配额/备注刷新阻断），且两个 CLI 分别还原各自原本的不同账号，同时保留新配额与备注
+    const rb1 = await service.rollback();
+    assert.ok(rb1.message.includes('已恢复'));
+    assert.equal(await readFile(agyCliTokenPath, 'utf8'), cliInitialA1, '第一个 CLI 必须精确恢复为原账号 A1');
+    assert.equal(await readFile(jetskiTokenPath, 'utf8'), cliInitialA2, '第二个 CLI 必须精确恢复为原账号 A2');
+    assert.equal(await env.keychain.readPassword('gemini', 'antigravity'), null, '桌面钥匙串恢复为 null');
+    const bAfterRb = await env.manager.getAccount(accB.id);
+    assert.equal(bAfterRb.custom_label, '已刷新配额备注', '撤销必须保留期间刷新的备注');
+    assert.equal(bAfterRb.quota?.models?.[0]?.percentage, 88, '撤销必须保留期间刷新的配额');
+
+    // 2. 再次切入 B，然后用户在外部 CLI 重新登录了账号 C（冲突场景）
+    await service.switchAccount(accB.id);
+    const cliExternalC = JSON.stringify({
+      token: { email: 'cli-c-external@example.test', refresh_token: '1//c-ext', access_token: 'ya29.ext' },
+      id_token_email: 'cli-c-external@example.test',
+    }) + '\n';
+    await writeFile(agyCliTokenPath, cliExternalC, { mode: 0o600 });
+
+    const rb2 = await service.rollback();
+    assert.ok(rb2.message.includes('已恢复'), 'CLI 外部重登绝不可阻断桌面主凭据回滚');
+    assert.equal(await readFile(agyCliTokenPath, 'utf8'), cliExternalC, '外部重登的 CLI 文件 C 不得被静默覆盖');
+    assert.equal(await readFile(jetskiTokenPath, 'utf8'), cliInitialA2, '未冲突的第二个 CLI 文件仍应正常恢复');
+    assert.ok(Array.isArray(rb2.cliWarnings) && rb2.cliWarnings.some(w => w.includes('external')), '必须明确报告 CLI 外部变更冲突');
+
+    // 3. 若发生真实身份变更（修改 current_account_id），撤销仍必须拦截
+    await service.switchAccount(accB.id);
+    const idxPath = join(env.stateDir, 'accounts.json');
+    const idx = JSON.parse(await readFile(idxPath, 'utf8'));
+    idx.current_account_id = 'external-other-account';
+    await writeFile(idxPath, JSON.stringify(idx, null, 2));
+    await assert.rejects(service.rollback(), /变化|阻止|changed/i, '真实 current_account_id 变更仍须拦截回滚');
+  } finally {
+    await rm(env.root, { recursive: true, force: true });
+  }
+});
+
 
 

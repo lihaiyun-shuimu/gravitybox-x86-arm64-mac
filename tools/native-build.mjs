@@ -22,7 +22,7 @@ export async function nativeBuildArgs(root, output, { uiTest = false, typecheck 
     ...modeFlags,
     ...(uiTest ? ['-D', 'NATIVE_UI_TEST'] : []),
     '-parse-as-library', '-target', 'arm64-apple-macosx14.0',
-    ...['Cocoa', 'ServiceManagement', 'Security', 'ApplicationServices'].flatMap(name => ['-framework', name]),
+    ...['Cocoa', 'ServiceManagement', 'Security', 'ApplicationServices', 'CFNetwork'].flatMap(name => ['-framework', name]),
     ...sources,
     ...(uiTest ? [join(root, 'test/native-ui.swift')] : []),
     ...(typecheck || !output ? [] : ['-o', output]),

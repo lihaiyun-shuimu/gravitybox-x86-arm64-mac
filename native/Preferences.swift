@@ -1,22 +1,39 @@
 import Cocoa
 import ServiceManagement
 
-final class PreferencesController: NSObject {
+final class PreferencesController: NSObject, NSTextFieldDelegate {
     static let refreshIntervals = [0, 5, 10, 15, 30, 60]
 
     unowned let app: Assistant
     var view: NSView!
-    let languagePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let languagePopup = DesignPopUpButton(frame: .zero, pullsDown: false)
     private weak var languageSubtitleField: NSTextField?
     let hudSwitch = DesignSwitch()
+    let proxyModePopup = DesignPopUpButton(frame: .zero, pullsDown: false)
+    let proxySubtitleLabel = text("", size: 11, color: Design.secondary, wrap: true)
+    var proxyRelaunchBtn: NSButton!
+    let proxyManualContainer = NSView()
+    let proxyManualField = NSTextField()
+    var proxyManualApplyBtn: NSButton!
+    private weak var proxyTitleField: NSTextField?
+    private var editingManualProxyMode = false
+    private var proxyManualValidationError: String?
+    private var renderedProxyPopupLocale = ""
+    private let proxyInspectQueue = DispatchQueue(label: "local.gravitybox.proxy-inspect", qos: .utility)
+    private static let proxyProbeThrottleInterval: TimeInterval = 5.0
+    private var proxyInspectGeneration: UInt64 = 0
+    private var proxyInspectInFlight = false
+    private var lastProxyInspectTriggeredAt: Date = .distantPast
+    private var lastProxyResolution: (mode: AntigravityProxyMode, manualUrl: String, resolution: ProxyResolution, sampledAt: Date)?
+    private var lastInspectedProxyState: (resolution: ProxyResolution, state: RunningAntigravityProxyState)?
     let pricingSyncSwitch = DesignSwitch()
     var pricingSyncCheckBtn: InlineRefreshButton!
-    let refresh = NSPopUpButton(frame: .zero, pullsDown: false)
+    let refresh = DesignPopUpButton(frame: .zero, pullsDown: false)
     let login = DesignSwitch()
-    let syncLifecycleSwitch = DesignSwitch()
+    let launchAntigravityOnStartSwitch = DesignSwitch()
     let storageBadge = pillBadge("", color: Design.blue)
     static var defaultStorageSubtitle: String {
-        L10n.t("settings.storage.default_subtitle", fallback: "清理无损缓存与历史日志，保留核心数据")
+        L10n.t("settings.storage.default_subtitle", fallback: "一键释放运行缓存与超期日志，登录态与对话完好保留")
     }
     let storageSubtitleLabel = text(PreferencesController.defaultStorageSubtitle, size: 11, color: Design.secondary, wrap: true)
     var manageCacheBtn: NSButton!
@@ -43,10 +60,10 @@ final class PreferencesController: NSObject {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         login.target = self; login.action = #selector(toggleLogin); login.setAccessibilityLabel(L10n.t("settings.login.title", fallback: "登录时启动"))
 
-        syncLifecycleSwitch.controlSize = .small
-        syncLifecycleSwitch.state = app.configuration.value.syncAntigravityLifecycle ? .on : .off
-        syncLifecycleSwitch.target = self; syncLifecycleSwitch.action = #selector(toggleSyncLifecycle)
-        syncLifecycleSwitch.setAccessibilityLabel(L10n.t("settings.sync_lifecycle.title", fallback: "跟随 Antigravity 启停"))
+        launchAntigravityOnStartSwitch.controlSize = .small
+        launchAntigravityOnStartSwitch.state = app.configuration.value.launchAntigravityOnStart ? .on : .off
+        launchAntigravityOnStartSwitch.target = self; launchAntigravityOnStartSwitch.action = #selector(toggleLaunchAntigravityOnStart)
+        launchAntigravityOnStartSwitch.setAccessibilityLabel(L10n.t("settings.launch_antigravity.title", fallback: "启动时自动打开 Antigravity"))
 
         refresh.addItems(withTitles: [
             L10n.t("settings.refresh.manual", fallback: "手动刷新"),
@@ -75,17 +92,81 @@ final class PreferencesController: NSObject {
            let subField = captionsStack.arrangedSubviews.dropFirst().first as? NSTextField {
             languageSubtitleField = subField
         }
+
+        rebuildProxyModePopup()
+        proxyModePopup.target = self
+        proxyModePopup.action = #selector(proxyModeChanged)
+        proxyModePopup.setAccessibilityLabel(L10n.t("settings.proxy.title", fallback: "代理转发（免 TUN）"))
+        proxyModePopup.translatesAutoresizingMaskIntoConstraints = false
+
+        proxyRelaunchBtn = button(L10n.t("settings.proxy.relaunch_btn", fallback: "安全重启生效"), target: self, action: #selector(relaunchAntigravityForProxy))
+        proxyRelaunchBtn.bezelColor = Design.blue
+        proxyRelaunchBtn.isHidden = true
+        let proxyControlGroup = horizontal([proxyRelaunchBtn, proxyModePopup], spacing: 8)
+        proxyControlGroup.alignment = .centerY
+        proxyControlGroup.detachesHiddenViews = true
+
+        let proxyRow = settingRow(
+            icon: "network",
+            tint: Design.blue,
+            title: L10n.t("settings.proxy.title", fallback: "代理转发（免 TUN）"),
+            subtitle: "",
+            control: proxyControlGroup
+        )
+        proxySubtitleLabel.maximumNumberOfLines = 0
+        proxySubtitleLabel.lineBreakMode = .byWordWrapping
+        proxySubtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        if let rowStack = proxyRow as? NSStackView,
+           let captionsStack = rowStack.arrangedSubviews.dropFirst().first as? NSStackView {
+            proxyTitleField = captionsStack.arrangedSubviews.first as? NSTextField
+            captionsStack.addArrangedSubview(proxySubtitleLabel)
+        }
+
+        proxyManualField.isEditable = true
+        proxyManualField.isSelectable = true
+        proxyManualField.font = .systemFont(ofSize: 12)
+        proxyManualField.placeholderString = "http://127.0.0.1:7890"
+        proxyManualField.stringValue = app.configuration.value.antigravityProxyManualUrl
+        proxyManualField.target = self
+        proxyManualField.action = #selector(applyManualProxy)
+        proxyManualField.delegate = self
+        proxyManualField.setAccessibilityLabel(L10n.t("settings.proxy.manual_url_a11y", fallback: "手动代理地址"))
+        proxyManualField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        proxyManualField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        proxyManualApplyBtn = button(L10n.t("settings.proxy.apply_btn", fallback: "应用"), target: self, action: #selector(applyManualProxy))
+        proxyManualApplyBtn.setContentHuggingPriority(.required, for: .horizontal)
+        proxyManualApplyBtn.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let manualRow = horizontal([proxyManualField, proxyManualApplyBtn], spacing: 8)
+        manualRow.alignment = .centerY
+        proxyManualContainer.addSubview(manualRow)
+        manualRow.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            manualRow.leadingAnchor.constraint(equalTo: proxyManualContainer.leadingAnchor, constant: 39),
+            manualRow.trailingAnchor.constraint(equalTo: proxyManualContainer.trailingAnchor),
+            manualRow.topAnchor.constraint(equalTo: proxyManualContainer.topAnchor),
+            manualRow.bottomAnchor.constraint(equalTo: proxyManualContainer.bottomAnchor)
+        ])
+
+        let proxySection = vertical([proxyRow, proxyManualContainer], spacing: 8)
+        proxySection.detachesHiddenViews = true
+        fillWidth(proxyRow, in: proxySection)
+        fillWidth(proxyManualContainer, in: proxySection)
+
         let enhanceGroup = vertical([
             languageRow,
             divider(),
-            settingRow(icon: "chart.bar.xaxis", tint: .systemIndigo, title: L10n.t("settings.hud.title", fallback: "对话状态栏"), subtitle: L10n.t("settings.hud.subtitle", fallback: "在 Antigravity 输入框下方显示轮次、Token 与上下文"), control: hudSwitch)
+            settingRow(icon: "dock.rectangle", tint: .systemIndigo, title: L10n.t("settings.hud.title", fallback: "对话状态栏"), subtitle: L10n.t("settings.hud.subtitle", fallback: "在 Antigravity 输入框下方显示轮次、Token 与上下文"), control: hudSwitch),
+            divider(),
+            proxySection
         ], spacing: 12)
         for child in enhanceGroup.arrangedSubviews { fillWidth(child, in: enhanceGroup) }
 
         let dataSyncGroup = vertical([
-            settingRow(icon: "arrow.clockwise", tint: Design.blue, title: L10n.t("settings.refresh.title", fallback: "配额刷新间隔"), subtitle: L10n.t("settings.refresh.subtitle", fallback: "定时更新已保存账号的剩余配额"), control: refresh),
+            settingRow(icon: "timer", tint: Design.blue, title: L10n.t("settings.refresh.title", fallback: "配额刷新间隔"), subtitle: L10n.t("settings.refresh.subtitle", fallback: "定时刷新本机与 SSH 在线账号配额；备用账号令牌过期后需切换更新"), control: refresh),
             divider(),
-            settingRow(icon: "dollarsign.circle", tint: Design.blue, title: L10n.t("settings.pricing_sync.title", fallback: "自动更新价格基准"), subtitle: L10n.t("settings.pricing_sync.subtitle", fallback: "自动同步公开模型费率，每 24 小时检查一次"), control: pricingControlGroup)
+            settingRow(icon: "tag", tint: Design.blue, title: L10n.t("settings.pricing_sync.title", fallback: "自动更新价格基准"), subtitle: L10n.t("settings.pricing_sync.subtitle", fallback: "自动同步公开模型费率，每 24 小时检查一次"), control: pricingControlGroup)
         ], spacing: 12)
         for child in dataSyncGroup.arrangedSubviews { fillWidth(child, in: dataSyncGroup) }
 
@@ -110,7 +191,7 @@ final class PreferencesController: NSObject {
         let systemAndStorageGroup = vertical([
             settingRow(icon: "power", tint: .systemGray, title: L10n.t("settings.login.title", fallback: "登录时启动"), subtitle: L10n.t("settings.login.subtitle", fallback: "登录 macOS 时自动在菜单栏驻留"), control: login),
             divider(),
-            settingRow(icon: "link", tint: .systemTeal, title: L10n.t("settings.sync_lifecycle.title", fallback: "跟随 Antigravity 启停"), subtitle: L10n.t("settings.sync_lifecycle.subtitle", fallback: "随 Antigravity 自动启动并同步退出"), control: syncLifecycleSwitch),
+            settingRow(icon: "macwindow.badge.plus", tint: .systemTeal, title: L10n.t("settings.launch_antigravity.title", fallback: "启动时自动打开 Antigravity"), subtitle: L10n.t("settings.launch_antigravity.subtitle", fallback: "打开 GravityBox 时静默驻留菜单栏，并自动拉起带调试端口的 Antigravity"), control: launchAntigravityOnStartSwitch),
             divider(),
             storageRow
         ], spacing: 12)
@@ -137,6 +218,12 @@ final class PreferencesController: NSObject {
         root.addArrangedSubview(sectionGroup(L10n.t("settings.section.quota_pricing", fallback: "配额与计价"), card: dataSyncCard))
         root.addArrangedSubview(sectionGroup(L10n.t("settings.section.system_storage", fallback: "系统与存储"), card: systemAndStorageCard))
         view = scrollPage(root); Design.applyControls(view)
+        for popup in [languagePopup, proxyModePopup, refresh] {
+            (popup.cell as? DesignPopUpCell)?.fitsSelectedTitleOnly = true
+            Design.syncPopUpWidth(popup)
+        }
+        (proxyManualField.cell as? NSTextFieldCell)?.sendsActionOnEndEditing = false
+        refreshProxyRowState()
     }
 
     var maintenanceSheet: MaintenanceSheetController?
@@ -223,6 +310,7 @@ final class PreferencesController: NSObject {
     private var renderedLanguagePopupKey = ""
 
     private func rebuildLanguagePopup() {
+        guard (languagePopup.cell as? DesignPopUpCell)?.isTrackingMenu != true else { return }
         let configured = app.effectiveConfiguredLanguage()
         let localesKey = ([L10n.shared.currentLocale] + L10n.shared.supportedLocales.map(\.code)).joined(separator: "|")
         if renderedLanguagePopupKey != localesKey {
@@ -249,6 +337,284 @@ final class PreferencesController: NSObject {
         } else if languagePopup.indexOfSelectedItem != 0 {
             languagePopup.selectItem(at: 0)
         }
+        if languagePopup.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(languagePopup)
+        } else {
+            languagePopup.invalidateIntrinsicContentSize()
+        }
+    }
+
+    private func rebuildProxyModePopup() {
+        guard (proxyModePopup.cell as? DesignPopUpCell)?.isTrackingMenu != true else { return }
+        let localeKey = L10n.shared.currentLocale
+        let titles: [(AntigravityProxyMode, String)] = [
+            (.off, L10n.t("settings.proxy.mode.off", fallback: "关闭")),
+            (.system, L10n.t("settings.proxy.mode.system", fallback: "跟随系统代理")),
+            (.manual, L10n.t("settings.proxy.mode.manual", fallback: "手动指定"))
+        ]
+        if proxyModePopup.numberOfItems == 0 {
+            renderedProxyPopupLocale = localeKey
+            for (mode, title) in titles {
+                proxyModePopup.addItem(withTitle: title)
+                proxyModePopup.lastItem?.representedObject = mode.rawValue
+            }
+            if proxyModePopup.cell is DesignPopUpCell {
+                Design.syncPopUpWidth(proxyModePopup)
+            } else {
+                proxyModePopup.invalidateIntrinsicContentSize()
+            }
+        } else if renderedProxyPopupLocale != localeKey {
+            renderedProxyPopupLocale = localeKey
+            for (idx, (_, title)) in titles.enumerated() where idx < proxyModePopup.numberOfItems {
+                proxyModePopup.item(at: idx)?.title = title
+            }
+            if proxyModePopup.cell is DesignPopUpCell {
+                Design.syncPopUpWidth(proxyModePopup)
+            } else {
+                proxyModePopup.invalidateIntrinsicContentSize()
+            }
+        }
+        let displayedMode: AntigravityProxyMode = editingManualProxyMode ? .manual : app.effectiveProxyMode()
+        if let idx = proxyModePopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == displayedMode.rawValue }),
+           proxyModePopup.indexOfSelectedItem != idx {
+            proxyModePopup.selectItem(at: idx)
+        }
+        if proxyModePopup.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(proxyModePopup)
+        } else {
+            proxyModePopup.invalidateIntrinsicContentSize()
+        }
+    }
+
+    func refreshProxyRowState(force: Bool = true) {
+        proxyTitleField?.stringValue = L10n.t("settings.proxy.title", fallback: "代理转发（免 TUN）")
+        proxyModePopup.setAccessibilityLabel(L10n.t("settings.proxy.title", fallback: "代理转发（免 TUN）"))
+        proxyManualField.setAccessibilityLabel(L10n.t("settings.proxy.manual_url_a11y", fallback: "手动代理地址"))
+        proxyManualApplyBtn?.title = L10n.t("settings.proxy.apply_btn", fallback: "应用")
+        proxyManualApplyBtn?.setAccessibilityLabel(L10n.t("settings.proxy.apply_btn", fallback: "应用"))
+        proxyManualApplyBtn?.invalidateIntrinsicContentSize()
+        proxyRelaunchBtn?.title = L10n.t("settings.proxy.relaunch_btn", fallback: "安全重启生效")
+        proxyRelaunchBtn?.setAccessibilityLabel(L10n.t("settings.proxy.relaunch_btn", fallback: "安全重启生效"))
+        proxyRelaunchBtn?.invalidateIntrinsicContentSize()
+
+        rebuildProxyModePopup()
+        let displayedMode: AntigravityProxyMode = editingManualProxyMode ? .manual : app.effectiveProxyMode()
+        proxyManualContainer.isHidden = (displayedMode != .manual)
+        if !editingManualProxyMode && proxyManualField.currentEditor() == nil {
+            let savedUrl = app.configuration.value.antigravityProxyManualUrl
+            if proxyManualField.stringValue != savedUrl {
+                proxyManualField.stringValue = savedUrl
+            }
+        }
+
+        if editingManualProxyMode {
+            if let err = proxyManualValidationError, !err.isEmpty {
+                proxyInspectGeneration &+= 1
+                proxyInspectInFlight = false
+                lastProxyInspectTriggeredAt = .distantPast
+                lastInspectedProxyState = nil
+                proxySubtitleLabel.stringValue = err
+                proxySubtitleLabel.textColor = .systemRed
+                proxyRelaunchBtn.isHidden = true
+                return
+            }
+            if app.effectiveProxyMode() != .manual {
+                proxyInspectGeneration &+= 1
+                proxyInspectInFlight = false
+                lastProxyInspectTriggeredAt = .distantPast
+                lastInspectedProxyState = nil
+                proxySubtitleLabel.stringValue = L10n.t(
+                    "settings.proxy.status.manual_prompt",
+                    fallback: "请输入 HTTP/HTTPS 代理地址（如 http://127.0.0.1:7890），点击「应用」生效"
+                )
+                proxySubtitleLabel.textColor = Design.secondary
+                proxyRelaunchBtn.isHidden = true
+                return
+            }
+        }
+
+        let currentMode = app.effectiveProxyMode()
+        let currentManualUrl = app.configuration.value.antigravityProxyManualUrl
+        let now = Date()
+        let hasTestOverride = SystemProxyResolver.testSystemProxySettingsOverride != nil
+            || SystemProxyResolver.testRunningProxyStateOverride != nil
+        let shouldBypassThrottle = force || hasTestOverride
+
+        let resolution: ProxyResolution
+        if !shouldBypassThrottle,
+           let cached = lastProxyResolution,
+           cached.mode == currentMode,
+           cached.manualUrl == currentManualUrl,
+           now.timeIntervalSince(cached.sampledAt) < Self.proxyProbeThrottleInterval {
+            resolution = cached.resolution
+        } else {
+            let resolved = app.currentProxyResolution()
+            lastProxyResolution = (mode: currentMode, manualUrl: currentManualUrl, resolution: resolved, sampledAt: now)
+            resolution = resolved
+        }
+
+        switch resolution {
+        case .disabled:
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = false
+            lastProxyInspectTriggeredAt = .distantPast
+            lastInspectedProxyState = nil
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.disabled",
+                fallback: "为 Antigravity 与 GravityBox 共享 HTTP/HTTPS 代理，无需开启 TUN 模式"
+            )
+            proxySubtitleLabel.textColor = Design.secondary
+            proxyRelaunchBtn.isHidden = true
+        case .active(_, _, _, let displayUrl):
+            if SystemProxyResolver.testRunningProxyStateOverride != nil {
+                proxyInspectGeneration &+= 1
+                proxyInspectInFlight = false
+                let runningState = app.currentRunningProxyState(resolution: resolution)
+                lastInspectedProxyState = (resolution: resolution, state: runningState)
+                lastProxyInspectTriggeredAt = now
+                applyRunningProxyState(runningState, displayUrl: displayUrl)
+                return
+            }
+            if let cached = lastInspectedProxyState, cached.resolution == resolution {
+                applyRunningProxyState(cached.state, displayUrl: displayUrl)
+                if !shouldBypassThrottle, now.timeIntervalSince(lastProxyInspectTriggeredAt) < Self.proxyProbeThrottleInterval {
+                    return
+                }
+            } else {
+                applyRunningProxyState(.notRunning, displayUrl: displayUrl)
+                if !shouldBypassThrottle,
+                   proxyInspectInFlight,
+                   now.timeIntervalSince(lastProxyInspectTriggeredAt) < Self.proxyProbeThrottleInterval {
+                    return
+                }
+            }
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = true
+            lastProxyInspectTriggeredAt = now
+            let targetGeneration = proxyInspectGeneration
+            let expectedResolution = resolution
+            let expectedMode = currentMode
+            let expectedManualUrl = currentManualUrl
+            let appPath = app.targetApplication.path
+            proxyInspectQueue.async { [weak self] in
+                let runningState = SystemProxyResolver.inspectRunningAntigravity(
+                    expected: expectedResolution,
+                    appPath: appPath
+                )
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if self.proxyInspectGeneration == targetGeneration {
+                        self.proxyInspectInFlight = false
+                    }
+                    guard self.proxyInspectGeneration == targetGeneration,
+                          !self.editingManualProxyMode,
+                          self.app.effectiveProxyMode() == expectedMode,
+                          self.app.configuration.value.antigravityProxyManualUrl == expectedManualUrl,
+                          (self.lastProxyResolution?.resolution ?? expectedResolution) == expectedResolution else {
+                        return
+                    }
+                    self.lastInspectedProxyState = (resolution: expectedResolution, state: runningState)
+                    self.applyRunningProxyState(runningState, displayUrl: displayUrl)
+                }
+            }
+        case .systemNotConfigured:
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = false
+            lastProxyInspectTriggeredAt = .distantPast
+            lastInspectedProxyState = nil
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.system_not_configured",
+                fallback: "当前未检测到 macOS HTTP/HTTPS 系统代理，请先在代理工具开启系统代理或改用「手动指定」"
+            )
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = true
+        case .systemUnsupported(.pac):
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = false
+            lastProxyInspectTriggeredAt = .distantPast
+            lastInspectedProxyState = nil
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.system_pac",
+                fallback: "当前系统代理为 PAC 模式，暂不支持直接解析；建议改用「手动指定」填入本地 HTTP 端口"
+            )
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = true
+        case .systemUnsupported(.socksOnly):
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = false
+            lastProxyInspectTriggeredAt = .distantPast
+            lastInspectedProxyState = nil
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.system_socks_only",
+                fallback: "当前系统代理仅开启了 SOCKS5，建议开启代理工具的 HTTP 端口或改用「手动指定」"
+            )
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = true
+        case .invalidManual(let message):
+            proxyInspectGeneration &+= 1
+            proxyInspectInFlight = false
+            lastProxyInspectTriggeredAt = .distantPast
+            lastInspectedProxyState = nil
+            proxySubtitleLabel.stringValue = message.isEmpty
+                ? L10n.t("settings.proxy.status.invalid_manual", fallback: "代理地址格式无效，请输入 http://host:port 或 https://host:port")
+                : message
+            proxySubtitleLabel.textColor = .systemRed
+            proxyRelaunchBtn.isHidden = true
+        }
+    }
+
+    private func applyRunningProxyState(_ runningState: RunningAntigravityProxyState, displayUrl: String) {
+        switch runningState {
+        case .notRunning:
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.not_running",
+                ["url": displayUrl],
+                fallback: "目标代理：\(displayUrl) · 下次通过 GravityBox 启动生效"
+            )
+            proxySubtitleLabel.textColor = Design.secondary
+            proxyRelaunchBtn.isHidden = true
+        case .matched(let activeUrl):
+            let shown = activeUrl.isEmpty ? displayUrl : activeUrl
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.matched",
+                ["url": shown],
+                fallback: "当前生效：\(shown)（Antigravity 已走代理）"
+            )
+            proxySubtitleLabel.textColor = .systemGreen
+            proxyRelaunchBtn.isHidden = true
+        case .missing:
+            if app.effectiveProxyMode() == .manual {
+                proxySubtitleLabel.stringValue = L10n.t(
+                    "settings.proxy.status.missing_manual",
+                    ["url": displayUrl],
+                    fallback: "已配置代理 \(displayUrl)，但当前 Antigravity 未加载代理，点击安全重启生效"
+                )
+            } else {
+                proxySubtitleLabel.stringValue = L10n.t(
+                    "settings.proxy.status.missing_system",
+                    ["url": displayUrl],
+                    fallback: "检测到系统代理 \(displayUrl)，但当前 Antigravity 未加载代理，点击安全重启生效"
+                )
+            }
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = false
+        case .mismatch(let actualUrl, let expectedUrl):
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.mismatch",
+                ["expected": expectedUrl, "actual": actualUrl],
+                fallback: "代理已变更为 \(expectedUrl)（当前进程：\(actualUrl)），点击安全重启生效"
+            )
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = false
+        case .overriddenByShell(let lsActualUrl, _, let expectedUrl):
+            proxySubtitleLabel.stringValue = L10n.t(
+                "settings.proxy.status.overridden_by_shell",
+                ["actual": lsActualUrl, "expected": expectedUrl],
+                fallback: "检测到 Shell 配置（如 ~/.zshrc）覆盖了代理：\(lsActualUrl)（期望 \(expectedUrl)）"
+            )
+            proxySubtitleLabel.textColor = accessibleWarningColor()
+            proxyRelaunchBtn.isHidden = true
+        }
     }
 
     func update() {
@@ -258,24 +624,28 @@ final class PreferencesController: NSObject {
         languagePopup.isEnabled = app.statusValue.mode != "unsupported"
         hudSwitch.state = app.effectiveHudEnabled() ? .on : .off
         hudSwitch.isEnabled = app.reachable && app.statusValue.mode != "unsupported"
+        refreshProxyRowState(force: false)
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        syncLifecycleSwitch.state = app.configuration.value.syncAntigravityLifecycle ? .on : .off
-        let refreshTitles = [
-            L10n.t("settings.refresh.manual", fallback: "手动刷新"),
-            L10n.t("settings.refresh.5m", fallback: "每 5 分钟"),
-            L10n.t("settings.refresh.10m", fallback: "每 10 分钟"),
-            L10n.t("settings.refresh.15m", fallback: "每 15 分钟"),
-            L10n.t("settings.refresh.30m", fallback: "每 30 分钟"),
-            L10n.t("settings.refresh.60m", fallback: "每 60 分钟")
-        ]
-        for (idx, itemTitle) in refreshTitles.enumerated() where idx < refresh.numberOfItems {
-            refresh.item(at: idx)?.title = itemTitle
-        }
-        refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: app.configuration.value.quotaRefreshMinutes) ?? 0)
-        if refresh.cell is DesignPopUpCell {
-            Design.syncPopUpWidth(refresh)
-        } else {
-            refresh.invalidateIntrinsicContentSize()
+        launchAntigravityOnStartSwitch.state = app.configuration.value.launchAntigravityOnStart ? .on : .off
+        launchAntigravityOnStartSwitch.setAccessibilityLabel(L10n.t("settings.launch_antigravity.title", fallback: "启动时自动打开 Antigravity"))
+        if (refresh.cell as? DesignPopUpCell)?.isTrackingMenu != true {
+            let refreshTitles = [
+                L10n.t("settings.refresh.manual", fallback: "手动刷新"),
+                L10n.t("settings.refresh.5m", fallback: "每 5 分钟"),
+                L10n.t("settings.refresh.10m", fallback: "每 10 分钟"),
+                L10n.t("settings.refresh.15m", fallback: "每 15 分钟"),
+                L10n.t("settings.refresh.30m", fallback: "每 30 分钟"),
+                L10n.t("settings.refresh.60m", fallback: "每 60 分钟")
+            ]
+            for (idx, itemTitle) in refreshTitles.enumerated() where idx < refresh.numberOfItems {
+                refresh.item(at: idx)?.title = itemTitle
+            }
+            refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: app.configuration.value.quotaRefreshMinutes) ?? 0)
+            if refresh.cell is DesignPopUpCell {
+                Design.syncPopUpWidth(refresh)
+            } else {
+                refresh.invalidateIntrinsicContentSize()
+            }
         }
         manageCacheBtn?.title = L10n.t("settings.storage.manage_btn", fallback: "管理存储…")
         if let cachedScan = app.lastMaintenanceScanPayload {
@@ -295,6 +665,9 @@ final class PreferencesController: NSObject {
     }
 
     @objc func languageChanged() {
+        if languagePopup.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(languagePopup)
+        }
         guard let selected = languagePopup.selectedItem?.representedObject as? String else { return }
         DispatchQueue.main.async { [weak self] in
             self?.app.setGlobalLanguage(selected)
@@ -363,16 +736,113 @@ final class PreferencesController: NSObject {
         app.setHudEnabled(target)
     }
 
-    @objc func toggleSyncLifecycle() {
-        let previous = app.configuration.value.syncAntigravityLifecycle
-        let next = syncLifecycleSwitch.state == .on
-        app.configuration.value.syncAntigravityLifecycle = next
+    @objc func proxyModeChanged() {
+        if proxyModePopup.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(proxyModePopup)
+        }
+        guard let rawMode = proxyModePopup.selectedItem?.representedObject as? String,
+              let mode = AntigravityProxyMode(rawValue: rawMode) else { return }
+        switch mode {
+        case .off, .system:
+            editingManualProxyMode = false
+            proxyManualValidationError = nil
+            do {
+                try app.applyProxyConfiguration(mode: mode, manualUrl: app.configuration.value.antigravityProxyManualUrl)
+            } catch {
+                showError(error)
+            }
+            refreshProxyRowState(force: true)
+            if view?.window != nil {
+                view.layoutSubtreeIfNeeded()
+            }
+        case .manual:
+            let candidate = proxyManualField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if candidate.isEmpty {
+                editingManualProxyMode = true
+                proxyManualValidationError = nil
+                refreshProxyRowState(force: true)
+                if view?.window != nil {
+                    view.layoutSubtreeIfNeeded()
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.editingManualProxyMode,
+                          !self.proxyManualContainer.isHidden,
+                          let window = self.view?.window,
+                          self.proxyManualField.window === window else { return }
+                    #if NATIVE_UI_TEST
+                    if !Assistant.headlessOffscreenUI {
+                        window.makeFirstResponder(self.proxyManualField)
+                    }
+                    #else
+                    window.makeFirstResponder(self.proxyManualField)
+                    #endif
+                }
+                return
+            }
+            do {
+                try app.applyProxyConfiguration(mode: .manual, manualUrl: candidate)
+                editingManualProxyMode = false
+                proxyManualValidationError = nil
+                proxyManualField.stringValue = app.configuration.value.antigravityProxyManualUrl
+            } catch {
+                editingManualProxyMode = true
+                proxyManualValidationError = error.localizedDescription
+            }
+            refreshProxyRowState(force: true)
+            if view?.window != nil {
+                view.layoutSubtreeIfNeeded()
+            }
+        }
+    }
+
+    @objc func applyManualProxy() {
+        let raw = proxyManualField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try app.applyProxyConfiguration(mode: .manual, manualUrl: raw)
+            editingManualProxyMode = false
+            proxyManualValidationError = nil
+            proxyManualField.stringValue = app.configuration.value.antigravityProxyManualUrl
+        } catch {
+            editingManualProxyMode = true
+            proxyManualValidationError = error.localizedDescription
+        }
+        refreshProxyRowState(force: true)
+    }
+
+    @objc func relaunchAntigravityForProxy() {
+        app.safeRelaunchAntigravityForProxy()
+    }
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        if obj.object as? NSTextField === proxyManualField {
+            proxyManualField.needsDisplay = true
+        }
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        if obj.object as? NSTextField === proxyManualField {
+            proxyManualField.needsDisplay = true
+        }
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if control === proxyManualField, commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            applyManualProxy()
+            return true
+        }
+        return false
+    }
+
+    @objc func toggleLaunchAntigravityOnStart() {
+        let previous = app.configuration.value.launchAntigravityOnStart
+        let next = launchAntigravityOnStartSwitch.state == .on
+        app.configuration.value.launchAntigravityOnStart = next
         do {
             try app.configuration.save()
-            app.syncLifecycleAgentRegistration()
         } catch {
-            app.configuration.value.syncAntigravityLifecycle = previous
-            syncLifecycleSwitch.state = previous ? .on : .off
+            app.configuration.value.launchAntigravityOnStart = previous
+            launchAntigravityOnStartSwitch.state = previous ? .on : .off
             showError(error)
         }
     }
@@ -381,6 +851,9 @@ final class PreferencesController: NSObject {
         let previous = app.configuration.value.quotaRefreshMinutes
         let idx = max(0, min(Self.refreshIntervals.count - 1, refresh.indexOfSelectedItem))
         app.configuration.value.quotaRefreshMinutes = Self.refreshIntervals[idx]
+        if refresh.cell is DesignPopUpCell {
+            Design.syncPopUpWidth(refresh)
+        }
         do {
             try app.configuration.save()
             app.configureQuotaRefreshTimer()
@@ -391,6 +864,9 @@ final class PreferencesController: NSObject {
         catch {
             app.configuration.value.quotaRefreshMinutes = previous
             refresh.selectItem(at: Self.refreshIntervals.firstIndex(of: previous) ?? 0)
+            if refresh.cell is DesignPopUpCell {
+                Design.syncPopUpWidth(refresh)
+            }
             showError(error)
         }
     }

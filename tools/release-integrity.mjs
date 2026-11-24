@@ -9,17 +9,30 @@ export function includeDictionaryPath(path) {
   return parts[0] !== 'dict' || !parts.slice(1).some(part => part.startsWith('.'));
 }
 
-/** Excludes Finder metadata and README screenshot previews from the code release digest. */
+/** Excludes Finder/Explorer metadata and README screenshot previews from the macOS/core code release digest. */
 export function includeSourceDigestPath(relativePath) {
   const normalized = relativePath.replaceAll('\\', '/');
   const parts = normalized.split('/');
-  if (parts.includes('.DS_Store')) return false;
+  if (parts[0] === 'windows') return false;
+  if (parts.includes('.DS_Store') || parts.includes('Thumbs.db')) return false;
   if (normalized === 'assets/screenshots' || normalized.startsWith('assets/screenshots/')) return false;
   return includeDictionaryPath(normalized);
 }
 
+/** Filters Windows-specific source files for the decoupled Windows release digest, excluding regenerable caches. */
+export function includeWindowsSourceDigestPath(relativePath) {
+  const normalized = relativePath.replaceAll('\\', '/');
+  const parts = normalized.split('/');
+  if (parts[0] !== 'windows') return false;
+  if (parts.includes('.DS_Store') || parts.includes('Thumbs.db')) return false;
+  if (parts.includes('target') || parts.includes('node_modules') || parts.includes('.vite')) return false;
+  if (normalized === 'windows/app/dist' || normalized.startsWith('windows/app/dist/')) return false;
+  if (normalized === 'windows/app/src-tauri/gen' || normalized.startsWith('windows/app/src-tauri/gen/')) return false;
+  return true;
+}
+
 /**
- * 源码摘要：发布门禁的唯一真源。
+ * 源码摘要：macOS 与跨平台核心发布门禁的唯一真源（严格排除 `windows/`，与 Windows 发行指纹解耦）。
  * 注意：tools/ 与 test/ 也计入，修改发布脚本本身同样会让旧 .cache/verified-release.json 失效，
  * 必须重新执行 `npm run verify` 才能再次打包（失败关闭，而不是静默放行）。
  */
@@ -34,7 +47,6 @@ export async function sourceDigest(root) {
     }
   }
   for (const directory of ['src','runtime','native','tools','test','dict','ui-strings','assets','licenses']) await walk(directory);
-  if (await exists(join(root, 'vendor'))) await walk('vendor');
   files.push('package.json','package-lock.json','tsconfig.json','README.md','THIRD_PARTY_NOTICES.md');
   for (const doc of [
     'LICENSE',
@@ -43,7 +55,6 @@ export async function sourceDigest(root) {
     'README_EN.md',
     'CHANGELOG.md',
     'PROJECT.md',
-    '.env.example',
   ]) {
     if (await exists(join(root, doc))) files.push(doc);
   }
@@ -52,6 +63,80 @@ export async function sourceDigest(root) {
   }
   const uniqueFiles = [...new Set(files)].sort();
   const hash = createHash('sha256'); for (const file of uniqueFiles) hash.update(file).update('\0').update(await readFile(join(root,file))).update('\0'); return hash.digest('hex');
+}
+
+/**
+ * Windows 发行源码摘要（与 macOS `sourceDigest` 解耦）：
+ * 绑定核心 `sourceDigest(root)` 及 `windows/` 原生源码树（存在时），确保修改 `windows/` 会使 Windows 验证记录失效，
+ * 同时绝不影响 macOS 的 `sourceDigest(root)` 与发布一致性。
+ */
+export async function windowsSourceDigest(root) {
+  const coreDigest = await sourceDigest(root);
+  const hash = createHash('sha256');
+  hash.update('core\0').update(coreDigest).update('\0');
+  if (await exists(join(root, 'windows'))) {
+    const winFiles = [];
+    async function walkWindows(relative) {
+      for (const entry of await readdir(join(root, relative), { withFileTypes: true })) {
+        const path = join(relative, entry.name);
+        if (!includeWindowsSourceDigestPath(path)) continue;
+        if (entry.isDirectory()) await walkWindows(path);
+        else if (entry.isFile()) winFiles.push(path.replaceAll('\\', '/'));
+      }
+    }
+    await walkWindows('windows');
+    for (const file of [...new Set(winFiles)].sort()) {
+      hash.update(file).update('\0').update(await readFile(join(root, ...file.split('/')))).update('\0');
+    }
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * 本地官方包证据指纹（与源码发布摘要 sourceDigest 解耦）：
+ * 仅在本地存在 `vendor/` 时汇总其确定性 SHA-256 与分版本文件校验和，记录到 `.cache/verified-release.json`。
+ */
+export async function vendorEvidence(root) {
+  if (!(await exists(join(root, 'vendor')))) {
+    return { present: false, digest: null, versions: {} };
+  }
+  const files = [];
+  async function walkVendor(relative) {
+    for (const entry of await readdir(join(root, relative), { withFileTypes: true })) {
+      const path = join(relative, entry.name);
+      if (entry.name === '.DS_Store') continue;
+      if (entry.isDirectory()) await walkVendor(path);
+      else if (entry.isFile()) files.push(path.replaceAll('\\', '/'));
+    }
+  }
+  await walkVendor('vendor');
+  const uniqueFiles = [...new Set(files)].sort();
+  if (uniqueFiles.length === 0) {
+    return { present: false, digest: null, versions: {} };
+  }
+  const overallHash = createHash('sha256');
+  const perVersion = new Map();
+  for (const file of uniqueFiles) {
+    const content = await readFile(join(root, file));
+    overallHash.update(file).update('\0').update(content).update('\0');
+    const verMatch = /^vendor\/antigravity\/([^/]+)\//.exec(file);
+    if (verMatch) {
+      const ver = verMatch[1];
+      let bucket = perVersion.get(ver);
+      if (!bucket) {
+        bucket = { count: 0, hash: createHash('sha256') };
+        perVersion.set(ver, bucket);
+      }
+      bucket.count += 1;
+      bucket.hash.update(file).update('\0').update(content).update('\0');
+    }
+  }
+  const versions = {};
+  for (const ver of [...perVersion.keys()].sort()) {
+    const bucket = perVersion.get(ver);
+    versions[ver] = { files: bucket.count, sha256: bucket.hash.digest('hex') };
+  }
+  return { present: true, digest: overallHash.digest('hex'), versions };
 }
 
 async function exists(path) { try { await stat(path); return true; } catch (error) { if (error?.code === 'ENOENT') return false; throw error; } }

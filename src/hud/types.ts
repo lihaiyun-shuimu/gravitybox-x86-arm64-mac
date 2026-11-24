@@ -3,8 +3,16 @@
  * 指标来源、统计范围与缺失值遵循 CONVERSATION_STATUS_HUD_ARCHITECTURE.md。
  */
 
+export type HudPaneKind = 'main' | 'subagent' | 'btw';
 export type HudActivityPhase = 'idle' | 'generating' | 'executing';
-export type HudDataAvailability = 'loading' | 'ready' | 'partial' | 'cached' | 'unavailable';
+export type HudDataAvailability =
+  | 'loading'
+  | 'ready'
+  | 'partial'
+  | 'cached'
+  | 'unavailable'
+  | 'remote_unbridged'
+  | 'remote_stale';
 export type HudCapacitySource = 'explicit' | 'reference' | 'unknown';
 export type HudContextStageRole = 'planner' | 'executor' | 'model';
 
@@ -44,6 +52,10 @@ export interface ConversationHudMetrics {
   metricsSequence?: number;
   /** 数据可信度与可用性状态 */
   availability?: HudDataAvailability;
+  /** 指标来源环境（缺省或 'local' 为本机，'remote' 为 SSH 远程主机） */
+  sourceKind?: 'local' | 'remote';
+  /** 脱敏后的远程主机展示标签 */
+  remoteHostLabel?: string;
   /** 底层数据库/WAL 真实观测毫秒时间戳 (读失败回退旧缓存时不刷新) */
   observedAt?: number | null;
   /** 最近一次成功读取底层数据库的毫秒时间戳 */
@@ -84,6 +96,8 @@ export interface ConversationHudMetrics {
     hasSubagentInTurn?: boolean;
     /** 当前会话是否为独立子智能体轨迹 */
     isSubagentTrajectory?: boolean;
+    /** 当前会话是否为 BTW (Side Question) 独立轨迹 */
+    isBtwTrajectory?: boolean;
     /** 前台流式轮次是否处于等待下一步落库的衔接阶段（非工具审批暂停） */
     awaitingFirstTurnStep?: boolean;
     /** 当前轮次末步是否因用户停止或异常而终止 */
@@ -249,7 +263,7 @@ export interface ConversationHudMetrics {
     isFallbackCapacity?: boolean;
     /** 容量来源分类：explicit=数据库明确返回，reference=模型族参考阈值，unknown=未知模型默认参考 */
     capacitySource?: HudCapacitySource;
-    /** 当前上下文占有效容量比例 (0.0 ~ 1.0 夹紧值) */
+    /** 当前上下文占有效容量比例（原始比值，文本展示允许超过 1.0，图形绘制层夹紧至 0.0 ~ 1.0） */
     usedRatio: number;
     /** 上下文占比格式化 (如 "88%") */
     usedRatioFormatted: string;
@@ -381,6 +395,7 @@ export type HudClientEvent =
       conversationId: string;
       cascadeId: string;
       paneSlotId?: string;
+      paneKind?: HudPaneKind;
       sessionRevision?: number;
       modelId?: string;
       modelCapacity?: number;
@@ -396,6 +411,7 @@ export type HudClientEvent =
       conversationId: string;
       cascadeId: string;
       paneSlotId?: string;
+      paneKind?: HudPaneKind;
       sessionRevision?: number;
       timestamp: number;
     }
@@ -404,6 +420,7 @@ export type HudClientEvent =
       conversationId: string;
       cascadeId: string;
       paneSlotId?: string;
+      paneKind?: HudPaneKind;
       sessionRevision?: number;
       modelId?: string;
       modelCapacity?: number;
@@ -419,6 +436,7 @@ export type HudClientEvent =
       conversationId: string;
       cascadeId: string;
       paneSlotId?: string;
+      paneKind?: HudPaneKind;
       sessionRevision?: number;
       modelId: string;
       modelCapacity?: number;
@@ -434,6 +452,7 @@ export type HudClientEvent =
       conversationId: string;
       cascadeId: string;
       paneSlotId?: string;
+      paneKind?: HudPaneKind;
       sessionRevision?: number;
       modelId?: string;
       modelCapacity?: number;

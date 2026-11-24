@@ -30,7 +30,6 @@ final class AddAccountSheet: NSObject {
     private var exportSubLabel: NSTextField!
     private var saveEmailCopyTitle: NSTextField?
     private var contentViewRef: NSView?
-    var closing = false
     var saved: () -> Void
     var onDismiss: (() -> Void)?
     var filePickerHook: (() -> [URL]?)?
@@ -506,7 +505,7 @@ final class AddAccountSheet: NSObject {
     }
 
     @objc func cancel() {
-        guard cancelButton.isEnabled, !closing else { return }
+        guard cancelButton.isEnabled else { return }
         dismiss()
     }
 

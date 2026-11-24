@@ -12,7 +12,7 @@
  * - carryover 按语义 family+window 匹配，fresh 覆盖；旧值单独带 observedAt/stale，不冒充新采样。
  */
 
-import { bt, getActiveLocale, translate } from './i18n.js';
+import { bt } from './i18n.js';
 
 export type WindowKind = '5h' | 'daily' | 'weekly' | 'unspecified';
 export type Family = 'gemini' | 'claude' | 'argon' | 'carbon' | 'other';
@@ -37,11 +37,17 @@ export interface GroupWindowEntry {
   status: WindowStatus;
 }
 
+export interface FamilyWindowSet {
+  fiveHour: WindowStatus | null;
+  daily?: WindowStatus | null;
+  weekly: WindowStatus | null;
+}
+
 export interface FamilyWindows {
-  gemini: { fiveHour: WindowStatus | null; weekly: WindowStatus | null };
-  claude: { fiveHour: WindowStatus | null; weekly: WindowStatus | null };
-  argon: { fiveHour: WindowStatus | null; weekly: WindowStatus | null };
-  carbon: { fiveHour: WindowStatus | null; weekly: WindowStatus | null };
+  gemini: FamilyWindowSet;
+  claude: FamilyWindowSet;
+  argon: FamilyWindowSet;
+  carbon: FamilyWindowSet;
 }
 
 export interface ArgonStatus {
@@ -167,10 +173,11 @@ export function normalizeResetTime(value: unknown): string | null {
 }
 
 export function classifyWindow(rawWindow: unknown, bucketId?: unknown, displayName?: unknown): WindowKind {
-  const text = `${String(rawWindow ?? '')} ${String(bucketId ?? '')} ${String(displayName ?? '')}`.toLowerCase();
-  if (/5\s*[-_]?\s*h(our)?s?\b|five[ _-]?hour|fivehour/.test(text)) return '5h';
-  if (/\bdaily\b|\b24\s*[-_]?\s*h(our)?s?\b|\b1\s*[-_]?\s*d(ay)?\b|per[ _-]?day/.test(text)) return 'daily';
-  if (/week|7\s*d|seven[ _-]?day/.test(text)) return 'weekly';
+  const raw = `${String(rawWindow ?? '')} ${String(bucketId ?? '')} ${String(displayName ?? '')}`.toLowerCase();
+  const text = raw.replace(/[_-]+/g, ' ');
+  if (/5\s*h(?:our)?s?\b|\bfive\s*hours?\b|fivehour/.test(text)) return '5h';
+  if (/\bdaily\b|\b24\s*h(?:our)?s?\b|\b1\s*d(?:ay)?\b|\bper\s*day\b/.test(text)) return 'daily';
+  if (/week|7\s*d|seven\s*day/.test(text)) return 'weekly';
   return 'unspecified';
 }
 
@@ -545,10 +552,12 @@ export function normalizeLiveModels(
   const models: NormalizedModel[] = [];
   for (const cfg of Array.isArray(clientConfigs) ? clientConfigs : []) {
     if (!cfg || typeof cfg !== 'object') continue;
-    const id = String(cfg.modelId ?? cfg.id ?? '');
+    const modelOrAlias = typeof cfg.modelOrAlias?.model === 'string' && cfg.modelOrAlias.model.trim()
+      ? cfg.modelOrAlias.model.trim()
+      : null;
+    const id = String(cfg.modelId ?? cfg.id ?? modelOrAlias ?? '').trim();
     if (!id) continue;
     const displayName = typeof (cfg.label ?? cfg.displayName) === 'string' ? String(cfg.label ?? cfg.displayName) : null;
-    const modelOrAlias = typeof cfg.modelOrAlias?.model === 'string' ? cfg.modelOrAlias.model : null;
     const rawProvider = cfg.modelProvider ?? cfg.model_provider ?? cfg.provider ?? '';
     const modelProvider = typeof rawProvider === 'string' && rawProvider.trim() ? rawProvider.trim() : null;
     const rawBucketName =
@@ -1037,7 +1046,7 @@ export function familyWindowsFromGroups(
     carbon: { fiveHour: null, weekly: null },
   };
   for (const family of ['gemini', 'claude', 'argon', 'carbon'] as const) {
-    for (const window of ['5h', 'weekly'] as const) {
+    for (const window of ['5h', 'daily', 'weekly'] as const) {
       const candidates = groups
         .filter(group => group.family === family)
         .flatMap(group => group.buckets.filter(bucket => bucket.disabled !== true && bucket.window === window))
@@ -1048,9 +1057,10 @@ export function familyWindowsFromGroups(
       // 新鲜优先；同 window 多桶取更保守（remaining 更小）的已知值。
       const fresh = candidates.filter(bucket => !bucket.stale && bucket.remaining_fraction_known);
       const pool = fresh.length > 0 ? fresh : candidates.filter(bucket => bucket.remaining_fraction_known);
+      const targetKey = window === '5h' ? 'fiveHour' : window === 'daily' ? 'daily' : 'weekly';
       if (pool.length === 0) {
         const any = candidates[0]!;
-        windows[family][window === '5h' ? 'fiveHour' : 'weekly'] = {
+        windows[family][targetKey] = {
           remaining: null,
           known: false,
           stale: candidates.every(bucket => bucket.stale),
@@ -1061,7 +1071,7 @@ export function familyWindowsFromGroups(
         continue;
       }
       const chosen = pool.reduce((left, right) => (left.remaining_fraction! <= right.remaining_fraction! ? left : right));
-      windows[family][window === '5h' ? 'fiveHour' : 'weekly'] = {
+      windows[family][targetKey] = {
         remaining: chosen.remaining_fraction,
         known: true,
         stale: chosen.stale,
@@ -1096,8 +1106,9 @@ export function applyFamilyWindows(models: NormalizedModel[], windows: FamilyWin
     const family = model.family === 'other' || hasNonCoreExplicitBucket ? null : model.family;
     const familyWindowSet = family ? windows[family] : null;
     const family5h = familyWindowSet ? familyWindowSet.fiveHour : null;
+    const familyDaily = familyWindowSet?.daily ?? null;
     const familyWeekly = familyWindowSet ? familyWindowSet.weekly : null;
-    const freshWindows = [family5h, familyWeekly].filter((status): status is WindowStatus => !!status && status.known && !status.stale);
+    const freshWindows = [family5h, familyDaily, familyWeekly].filter((status): status is WindowStatus => !!status && status.known && !status.stale);
     const usable: number[] = [];
     if (!model.disabled && model.own_percentage_known && !model.own_stale && model.own_percentage !== null) usable.push(model.own_percentage / 100);
     if (!model.disabled) for (const status of freshWindows) if (status.remaining !== null) usable.push(status.remaining);
@@ -1109,7 +1120,7 @@ export function applyFamilyWindows(models: NormalizedModel[], windows: FamilyWin
         limitingReset = model.own_reset_time;
         limitingBucket = model.model_id;
       }
-      const windowOrder: [WindowStatus | null, string][] = [[family5h, '5h'], [familyWeekly, 'weekly']];
+      const windowOrder: [WindowStatus | null, string][] = [[family5h, '5h'], [familyDaily, 'daily'], [familyWeekly, 'weekly']];
       for (const [status, name] of windowOrder) {
         if (status?.known && !status.stale && status.remaining !== null && Math.abs(status.remaining - effective) < 1e-9) {
           limitingReset = status.resetTime ?? limitingReset;
@@ -1135,15 +1146,7 @@ export function applyFamilyWindows(models: NormalizedModel[], windows: FamilyWin
 function formatStandaloneKnownMessage(period: ArgonPeriod, shortLabel: string, pct: number): string {
   if (period === 'weekly') return bt('quota.standalone.weekly_known', { shortLabel, pct });
   if (period === '5h') return bt('quota.standalone.5h_known', { shortLabel, pct });
-  if (period === 'daily') {
-    const locale = getActiveLocale();
-    return translate(locale, 'quota.standalone.daily_known', { shortLabel, pct }, {
-      namespace: 'backend',
-      fallback: locale === 'en'
-        ? `${shortLabel} daily quota retrieved (${pct}% remaining)`
-        : `${shortLabel} 每日配额已取得（剩余 ${pct}%）`,
-    });
-  }
+  if (period === 'daily') return bt('quota.standalone.daily_known', { shortLabel, pct });
   return bt('quota.standalone.unspecified_known', { shortLabel, pct });
 }
 
@@ -1441,7 +1444,16 @@ export function matchModelToSharedPool(
     }
   }
 
-  if (isUltra && hasGeminiGroup && (model.family === 'argon' || model.family === 'carbon')) {
+  // Ultra 兼容共享池兜底：仅在无显式独立桶名（rawBucketName 已在上方早退）、无官方独立分组且无同采样核心对照冲突时，
+  // 将 Ultra 下缺少独立证据的 Argon/Carbon 归并至 Gemini 共享池，避免误吞并真实独立桶或破坏 Ultra 共享池契约。
+  const hasOfficialStandaloneGroup = groups.some(g => g.family === model.family && !isGroupAllDisabled(g));
+  if (
+    isUltra
+    && hasGeminiGroup
+    && !rawBucketName
+    && !hasOfficialStandaloneGroup
+    && (model.family === 'argon' || model.family === 'carbon')
+  ) {
     if (!model.own_percentage_known || model.own_percentage === null || coSampledCoreGeminiPeers.length === 0) {
       return pickBestGeminiPoolCandidate(allowedCandidates, model);
     }
@@ -1828,11 +1840,32 @@ export function mergeWindowStatuses(...statuses: (WindowStatus | null)[]): Windo
 }
 
 /** Independent quota endpoint buckets are metering evidence, not model-list defaults. */
-export function normalizeIndependentArgonQuota(payload: any, observedAt: number): NormalizedModel[] {
+export function normalizeIndependentArgonQuota(
+  payload: any,
+  observedAt: number,
+  options?: { allowedModelIds?: ReadonlySet<string> }
+): NormalizedModel[] {
+  const allowedNormalized = options?.allowedModelIds && options.allowedModelIds.size > 0
+    ? new Set(
+        Array.from(options.allowedModelIds)
+          .flatMap(id => {
+            const raw = id.trim().toLowerCase();
+            const base = normalizeBaseModelKey(id).toLowerCase();
+            return [raw, base];
+          })
+          .filter(Boolean)
+      )
+    : null;
   const rows = (Array.isArray(payload?.buckets) ? payload.buckets : []).filter((b: any) => {
     if (typeof b?.modelId !== 'string' || normalizeFraction(b.remainingFraction) === null) return false;
     if (isOrchestratorMetaModel(b.modelId, b.displayName)) return false;
-    return /argon|carbon/i.test(b.modelId);
+    const rawId = b.modelId.trim().toLowerCase();
+    const baseKey = normalizeBaseModelKey(b.modelId).toLowerCase();
+    if (allowedNormalized && (allowedNormalized.has(rawId) || allowedNormalized.has(baseKey))) {
+      return true;
+    }
+    const family = classifyFamily({ modelId: b.modelId, displayName: b.displayName });
+    return family !== 'gemini' && family !== 'claude';
   });
   return normalizeCloudModels(
     {

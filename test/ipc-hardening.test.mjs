@@ -2,21 +2,39 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { mkdtemp, mkdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveClientIpcTarget } from '../dist/platform/index.js';
+import { stopBackendChild } from './test-ipc.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Raw socket round-trip: the caller decides how the request is sliced. */
-function exchange(directory, chunks, { timeout = 5000 } = {}) {
+async function exchange(directory, chunks, { timeout = 5000 } = {}) {
+  const target = await resolveClientIpcTarget(directory);
+  if (!target) throw new Error('IPC 端点未就绪');
+  let wireChunks = chunks;
+  if (target.authToken && chunks.every(c => typeof c === 'string')) {
+    const joined = chunks.join('');
+    if (joined.endsWith('\n')) {
+      try {
+        const parsed = JSON.parse(joined.slice(0, -1));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && parsed.authToken === undefined) {
+          const withAuth = JSON.stringify({ ...parsed, authToken: target.authToken }) + '\n';
+          wireChunks = chunks.length > 1 ? [withAuth.slice(0, 9), withAuth.slice(9)] : [withAuth];
+        }
+      } catch {}
+    }
+  }
   return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
+    const socket = createConnection(target.endpoint);
     let value = '';
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('IPC 超时')); }, timeout);
     const finish = error => { clearTimeout(timer); socket.destroy(); error ? reject(error) : resolve(value); };
     socket.on('connect', async () => {
-      for (const chunk of chunks) { socket.write(chunk); await sleep(60); }
+      for (const chunk of wireChunks) { socket.write(chunk); await sleep(60); }
     });
     socket.on('data', chunk => {
       value += chunk;
@@ -28,17 +46,25 @@ function exchange(directory, chunks, { timeout = 5000 } = {}) {
 }
 
 async function startBackend() {
-  const directory = await mkdtemp('/tmp/gb-ipc-hard-');
+  const directory = await mkdtemp(join(tmpdir(), 'gb-ipc-hard-'));
   await mkdir(join(directory, '词典'));
   const child = spawn(process.execPath, [
     fileURLToPath(new URL('../dist/main.js', import.meta.url)),
-    '--state-dir', directory, '--app', '/nonexistent', '--profile', '/tmp/gb-nonexistent-profile',
+    '--state-dir', directory, '--app', '/nonexistent', '--profile', join(directory, 'nonexistent-profile'),
     '--gemini-dir', join(directory, 'gemini'),
     '--home-dir',directory,'--app-support-dir',directory,
   ], { stdio: ['ignore', 'ignore', 'pipe'],env:{...process.env,GRAVITYBOX_PROBE_LS:'false'} });
   let errors = '';
   child.stderr.on('data', bytes => { errors += bytes; });
-  return { directory, child, errors: () => errors };
+  return {
+    directory,
+    child,
+    errors: () => errors,
+    cleanup: async () => {
+      await stopBackendChild(child);
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
 }
 
 async function waitForStatus(directory) {

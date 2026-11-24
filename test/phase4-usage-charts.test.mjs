@@ -1,16 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { DatabaseSync } from 'node:sqlite';
 import { UsageStatsManager } from '../dist/usage.js';
 import { calculateEstimatedUsd } from '../dist/pricing.js';
 import { ProtobufWriter } from '../dist/protobuf.js';
 
-const execFileAsync = promisify(execFile);
+const execSql = (dbPath, sql) => { const d = new DatabaseSync(dbPath); try { d.exec(sql); } finally { d.close(); } };
 
 test('N07: 微量费用高精度保留与 IPC 透传 priced 状态（杜绝 1 Token 误标未计价）', async () => {
   const pricing = { input: 0.075, output: 0.30, cached: 0.01875 };
@@ -35,12 +33,12 @@ test('N08: 趋势日期采用本地时区、连续 30 天自然日补齐并与 K
   const dbPath = join(convDir, 'session1.db');
 
   try {
-    await execFileAsync('/bin/mkdir', ['-p', convDir]);
-    await execFileAsync('/usr/bin/sqlite3', [
+    await mkdir(convDir, { recursive: true });
+    execSql(
       dbPath,
       `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);`,
-    ]);
+    );
 
     const now = new Date();
     const todaySec = Math.floor(now.getTime() / 1000);
@@ -65,13 +63,13 @@ test('N08: 趋势日期采用本地时区、连续 30 天自然日补齐并与 K
     const blob2 = buildEventBlob(300, todaySec - 3 * 86400); // 3 天前
     const blob3 = buildEventBlob(200, todaySec - 8 * 86400); // 8 天前
 
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `INSERT INTO gen_metadata (idx, data) VALUES 
        (1, x'${blob1.toString('hex')}'), 
        (2, x'${blob2.toString('hex')}'),
        (3, x'${blob3.toString('hex')}');`,
-    ]);
+    );
 
     const uMgr = new UsageStatsManager({ stateDir: sandbox, geminiDir });
     const summary = await uMgr.getUsageSummary(true);

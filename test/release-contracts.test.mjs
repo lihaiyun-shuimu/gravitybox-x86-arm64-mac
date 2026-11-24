@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sourceDigest, includeSourceDigestPath, collectReleaseArtifacts, assertReleaseArtifacts } from "../tools/release-integrity.mjs";
+import { sourceDigest, vendorEvidence, includeSourceDigestPath, collectReleaseArtifacts, assertReleaseArtifacts } from "../tools/release-integrity.mjs";
 import { checkDocs } from "../tools/check-docs.mjs";
 import { includePackagedAssetPath, escapeXml, computeMacBuildNumber, validateLocalizations } from "../tools/package-mac.mjs";
 
@@ -130,5 +130,35 @@ describeContractGroup("发行完整性 · release-1.1.1-contracts", { concurrenc
     assert.deepEqual(validateLocalizations(['en', 'zh-Hans', 'en']), ['en', 'zh-Hans']);
     assert.throws(() => validateLocalizations([]), /不能为空/);
     assert.throws(() => validateLocalizations(['en<script>']), /无效/);
+  });
+
+  test('P1-29: sourceDigest 在有无 vendor/ 目录时完全一致，vendorEvidence 独立记录官方包校验和', async t => {
+    const d = await makeFixture(t);
+    for (const dirName of ['src', 'runtime', 'native', 'tools', 'test', 'dict', 'ui-strings', 'assets', 'licenses']) {
+      await mkdir(join(d, dirName), { recursive: true });
+    }
+    for (const fileName of ['package.json', 'package-lock.json', 'tsconfig.json', 'README.md', 'THIRD_PARTY_NOTICES.md']) {
+      await writeFile(join(d, fileName), 'fixture');
+    }
+
+    const digestWithoutVendor = await sourceDigest(d);
+    const evBefore = await vendorEvidence(d);
+    assert.equal(evBefore.present, false);
+    assert.equal(evBefore.digest, null);
+
+    await mkdir(join(d, 'vendor/antigravity/2.34.0'), { recursive: true });
+    await writeFile(join(d, 'vendor/antigravity/2.34.0/main.js'), 'official bundle v1');
+    assert.equal(await sourceDigest(d), digestWithoutVendor, '增加 vendor 官方包不得改变 sourceDigest');
+
+    const evV1 = await vendorEvidence(d);
+    assert.equal(evV1.present, true);
+    assert.ok(evV1.versions['2.34.0']);
+    assert.equal(evV1.versions['2.34.0'].files, 1);
+
+    await writeFile(join(d, 'vendor/antigravity/2.34.0/main.js'), 'official bundle v2');
+    assert.equal(await sourceDigest(d), digestWithoutVendor);
+    const evV2 = await vendorEvidence(d);
+    assert.notEqual(evV2.digest, evV1.digest, 'vendor 变动应反映在 vendorEvidence.digest 中');
+    assert.notEqual(evV2.versions['2.34.0'].sha256, evV1.versions['2.34.0'].sha256);
   });
 });

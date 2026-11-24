@@ -93,6 +93,8 @@ export async function checkDocs({
   readmeEnPath = join(root, 'README_EN.md'),
   changelogPath = join(root, 'CHANGELOG.md'),
   projectPath = join(root, 'PROJECT.md'),
+  securityPath = join(root, 'SECURITY.md'),
+  bundlePath = join(root, 'src', 'bundle.ts'),
   screenshotsReadmePath = join(root, 'assets/screenshots/README.md'),
   installedApp = '/Applications/GravityBox.app',
   accountsPath = join(homedir(), 'Library', 'Application Support', 'GravityBox', 'accounts.json'),
@@ -124,7 +126,16 @@ export async function checkDocs({
         verify('error', 'SUMMARY_DMG_MISMATCH', summaryFile, null, `dmgSHA256 ${shorten(summary.dmgSHA256)} ≠ 实际 ${shorten(actual)}`, summary.dmgSHA256.toLowerCase() === actual);
       }
       if (facts.installedFiles !== null && typeof summary.installedFilesVerified === 'number') verify('error', 'SUMMARY_INSTALLED_FILES_MISMATCH', summaryFile, null, `installedFilesVerified ${summary.installedFilesVerified} ≠ 实机 ${facts.installedFiles}`, summary.installedFilesVerified === facts.installedFiles);
-      if (facts.unit?.tests != null && summary.automated?.unitIntegrationPassed != null) verify('error', 'SUMMARY_UNIT_COUNT_MISMATCH', summaryFile, null, `automated.unitIntegrationPassed ${summary.automated.unitIntegrationPassed} ≠ 日志 ${facts.unit.tests}`, summary.automated.unitIntegrationPassed === facts.unit.tests);
+      const expectedPassed = facts.unit?.pass ?? facts.unit?.tests ?? null;
+      if (expectedPassed != null && summary.automated?.unitIntegrationPassed != null) verify('error', 'SUMMARY_UNIT_COUNT_MISMATCH', summaryFile, null, `automated.unitIntegrationPassed ${summary.automated.unitIntegrationPassed} ≠ 通过数 ${expectedPassed}`, summary.automated.unitIntegrationPassed === expectedPassed);
+      if (facts.unit?.tests != null && summary.automated?.unitIntegrationTotal != null) verify('error', 'SUMMARY_UNIT_TOTAL_MISMATCH', summaryFile, null, `automated.unitIntegrationTotal ${summary.automated.unitIntegrationTotal} ≠ 总数 ${facts.unit.tests}`, summary.automated.unitIntegrationTotal === facts.unit.tests);
+      if (facts.unit?.skipped != null && summary.automated?.unitIntegrationSkipped != null) verify('error', 'SUMMARY_UNIT_SKIPPED_MISMATCH', summaryFile, null, `automated.unitIntegrationSkipped ${summary.automated.unitIntegrationSkipped} ≠ 跳过数 ${facts.unit.skipped}`, summary.automated.unitIntegrationSkipped === facts.unit.skipped);
+      if ((facts.unit?.fail ?? 0) > 0 || (summary.automated?.unitIntegrationFailed ?? 0) > 0) {
+        verify('error', 'SUMMARY_UNIT_FAILED', summaryFile, null, `单元与集成存在失败用例（fail=${facts.unit?.fail ?? summary.automated?.unitIntegrationFailed}）`, false);
+      }
+      if (summary.manualAcceptanceStatus === 'stale' || (summary.manualAcceptanceDmgSHA256 && summary.dmgSHA256 && String(summary.manualAcceptanceDmgSHA256).toLowerCase() !== String(summary.dmgSHA256).toLowerCase())) {
+        verify('error', 'SUMMARY_MANUAL_ACCEPTANCE_STALE', summaryFile, null, `人工验收记录绑定的 DMG 哈希与当前成品不一致（status=${summary.manualAcceptanceStatus ?? 'mismatch'}），需重新实机验收`, false);
+      }
       if (facts.browser?.passed != null && summary.automated?.browserPassed != null) verify('error', 'SUMMARY_BROWSER_COUNT_MISMATCH', summaryFile, null, `automated.browserPassed ${summary.automated.browserPassed} ≠ 日志 ${facts.browser.passed}`, summary.automated.browserPassed === facts.browser.passed);
       if (Array.isArray(summary.automated?.dictionaryGates) && facts.gates.length) {
         const actual = facts.gates.filter(gate => gate.pass === true).map(gate => gate.version).sort().join(',');
@@ -153,9 +164,11 @@ export async function checkDocs({
     if (!sourceOnly) {
       // 测试数（只看最近一次声明，兼容历史段落）
       const unitClaim = lastClaim(text, /(\d+)\/(\d+)\s*单元与集成/g);
-      if (unitClaim && facts.unit?.tests != null) {
+      if (unitClaim && (facts.unit?.pass != null || facts.unit?.tests != null)) {
         const claimed = Number(unitClaim.groups[0]);
-        verify('error', 'DOC_UNIT_COUNT_STALE', file, unitClaim.line, `最近声明 ${unitClaim.text.trim()} ≠ 日志 ${facts.unit.tests}`, claimed === facts.unit.tests && Number(unitClaim.groups[1]) === facts.unit.tests);
+        const expectedPass = facts.unit.pass ?? facts.unit.tests;
+        const expectedTotal = facts.unit.tests ?? expectedPass;
+        verify('error', 'DOC_UNIT_COUNT_STALE', file, unitClaim.line, `最近声明 ${unitClaim.text.trim()} ≠ 日志 ${expectedPass}/${expectedTotal}`, claimed === expectedPass && Number(unitClaim.groups[1]) === expectedTotal);
       }
       const browserClaim = lastClaim(text, /(\d+)\/(\d+)\s*(?:独立)?浏览器/g);
       if (browserClaim && facts.browser?.passed != null) {
@@ -177,9 +190,47 @@ export async function checkDocs({
     }
   };
 
+  let latestSupportedBundle = null;
+  if (existsSync(bundlePath)) {
+    const bundleSource = await readText(bundlePath);
+    const bundleBlock = bundleSource?.match(/export const SUPPORTED_BUNDLES\s*=\s*new Map\(\[([\s\S]*?)\]\);/)?.[1] ?? '';
+    const bundleVersions = [...bundleBlock.matchAll(/\['(\d+\.\d+\.\d+)'\s*,/g)].map(match => match[1]);
+    if (bundleVersions.length > 0) {
+      bundleVersions.sort((a, b) => {
+        const pa = a.split('.').map(Number);
+        const pb = b.split('.').map(Number);
+        for (let i = 0; i < 3; i++) {
+          if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+        }
+        return 0;
+      });
+      latestSupportedBundle = bundleVersions[bundleVersions.length - 1];
+    }
+  }
+
+  const checkSupportedBundleRange = (file, text) => {
+    if (!latestSupportedBundle || !text) return;
+    for (const match of text.matchAll(/(?:`?2\.23\.0`?)\s*(?:–|—|~|～|-)\s*`?(\d+\.\d+\.\d+)`?/g)) {
+      const upper = match[1];
+      const line = text.slice(0, match.index).split('\n').length;
+      verify(
+        'error',
+        'DOC_SUPPORTED_BUNDLE_STALE',
+        file,
+        line,
+        `受支持 Antigravity 版本上限 ${upper} ≠ SUPPORTED_BUNDLES 最新版本 ${latestSupportedBundle}`,
+        upper === latestSupportedBundle,
+      );
+    }
+  };
+
   if (existsSync(agentsPath)) await checkDocFile('AGENTS.md', agentsPath);
   await checkDocFile('README.md', readmePath);
-  if (existsSync(readmeZhPath)) await checkDocFile('README.zh-CN.md', readmeZhPath);
+  checkSupportedBundleRange('README.md', await readText(readmePath));
+  if (existsSync(readmeZhPath)) {
+    await checkDocFile('README.zh-CN.md', readmeZhPath);
+    checkSupportedBundleRange('README.zh-CN.md', await readText(readmeZhPath));
+  }
   if (existsSync(readmeEnPath)) await checkDocFile('README_EN.md', readmeEnPath);
 
   if (existsSync(changelogPath) && facts.version) {
@@ -215,6 +266,24 @@ export async function checkDocs({
       } else {
         verify('error', 'DOC_VERSION_MISSING', 'PROJECT.md', null, `PROJECT.md 未声明当前版本 ${facts.version}`, false);
       }
+      checkSupportedBundleRange('PROJECT.md', projectText);
+    }
+  }
+
+  if (existsSync(securityPath) && facts.version) {
+    const securityText = await readText(securityPath);
+    const minorMatch = /^(\d+)\.(\d+)\.\d+$/.exec(facts.version);
+    if (securityText !== null && minorMatch) {
+      const minorSeries = `${minorMatch[1]}.${minorMatch[2]}.x`;
+      const hasCurrentSeries = new RegExp(`^\\|\\s*\`?${escapeRegExp(minorSeries)}\`?\\s*\\|[^\\n]*(?:white_check_mark|当前维护|supported)`, 'mi').test(securityText);
+      verify(
+        'error',
+        'SECURITY_VERSION_STALE',
+        'SECURITY.md',
+        null,
+        `SECURITY.md 受支持版本表缺少当前维护系列 ${minorSeries}`,
+        hasCurrentSeries,
+      );
     }
   }
 

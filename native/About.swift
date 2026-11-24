@@ -155,7 +155,7 @@ final class AboutPage: NSObject {
         dataRight.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let specsInner = vertical([
-            specRow(icon: "cpu", tint: .systemIndigo, key: L10n.t("about.target_app", fallback: "目标应用"), right: versionSpecLabel),
+            specRow(icon: "macwindow", tint: .systemIndigo, key: L10n.t("about.target_app", fallback: "目标应用"), right: versionSpecLabel),
             divider(),
             specRow(icon: "folder", tint: .systemOrange, key: L10n.t("about.data_dir", fallback: "GravityBox 数据目录"), right: dataRight)
         ], spacing: 11)
@@ -197,6 +197,10 @@ final class AboutPage: NSObject {
     }
 
     private var cachedBuildSummary: String?
+    private static let antigravityVersionCacheTTL: TimeInterval = 10.0
+    private var cachedAntigravityBundleVersion: String?
+    private var cachedAntigravityBundleVersionAt: Date = .distantPast
+    private var cachedAntigravityLiveVersion: String = ""
 
     private func resolvedBuildSummary() -> String {
         if let cachedBuildSummary { return cachedBuildSummary }
@@ -224,13 +228,25 @@ final class AboutPage: NSObject {
     }
 
     private func resolvedAntigravityDisplay() -> String {
-        let bundleVer = (Bundle(path: DesktopApplicationTarget().path)?
-            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let liveVer = app.statusValue.appVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = Date()
+        let bundleVer: String
+        if let cached = cachedAntigravityBundleVersion,
+           cachedAntigravityLiveVersion == liveVer,
+           now.timeIntervalSince(cachedAntigravityBundleVersionAt) < Self.antigravityVersionCacheTTL {
+            bundleVer = cached
+        } else {
+            let readVer = (Bundle(path: DesktopApplicationTarget().path)?
+                .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            cachedAntigravityBundleVersion = readVer
+            cachedAntigravityBundleVersionAt = now
+            cachedAntigravityLiveVersion = liveVer
+            bundleVer = readVer
+        }
         if !bundleVer.isEmpty {
             return "Antigravity \(bundleVer)"
         }
-        let liveVer = app.statusValue.appVersion.trimmingCharacters(in: .whitespacesAndNewlines)
         if !liveVer.isEmpty && liveVer != "fixture" {
             return "Antigravity \(liveVer)"
         }
@@ -299,7 +315,7 @@ final class AboutPage: NSObject {
             releaseNotesBtn.isHidden = true
         case .updateAvailable(let release):
             statusLine.isHidden = false
-            updateStatusIcon.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)
+            updateStatusIcon.image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
             updateStatusLabel.stringValue = L10n.t("about.status.available", ["tag": release.tagName], fallback: "发现新版本 \(release.tagName)")
@@ -330,7 +346,7 @@ final class AboutPage: NSObject {
             releaseNotesBtn.isHidden = false
         case .readyToInstall(let release, _):
             statusLine.isHidden = false
-            updateStatusIcon.image = NSImage(systemSymbolName: "checkmark.shield.fill", accessibilityDescription: nil)
+            updateStatusIcon.image = NSImage(systemSymbolName: "checkmark.diamond.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = .systemGreen
             updateStatusLabel.textColor = .labelColor
             updateStatusLabel.stringValue = L10n.t("about.status.ready", ["tag": release.tagName], fallback: "\(release.tagName) 更新包已就绪")
@@ -344,7 +360,7 @@ final class AboutPage: NSObject {
             releaseNotesBtn.isHidden = false
         case .installing(let release):
             statusLine.isHidden = false
-            updateStatusIcon.image = NSImage(systemSymbolName: "gearshape.2.fill", accessibilityDescription: nil)
+            updateStatusIcon.image = NSImage(systemSymbolName: "wrench.and.screwdriver.fill", accessibilityDescription: nil)
             updateStatusIcon.contentTintColor = Design.blue
             updateStatusLabel.textColor = .labelColor
             updateStatusLabel.stringValue = L10n.t("about.status.installing", ["tag": release.tagName], fallback: "正在准备安装 \(release.tagName)…")
@@ -395,10 +411,17 @@ final class AboutPage: NSObject {
     }
 
     @objc func toggleAutoUpdate() {
+        let previous = app.configuration.value.autoUpdateEnabled
         let enabled = autoUpdateSwitch.state == .on
         app.configuration.value.autoUpdateEnabled = enabled
-        try? app.configuration.save()
-        app.configureAutoUpdateTimer()
+        do {
+            try app.configuration.save()
+            app.configureAutoUpdateTimer()
+        } catch {
+            app.configuration.value.autoUpdateEnabled = previous
+            autoUpdateSwitch.state = previous ? .on : .off
+            app.showMessage(error.localizedDescription, error: true)
+        }
     }
 
     @objc func revealDataFolder() {

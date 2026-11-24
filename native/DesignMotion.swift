@@ -38,7 +38,6 @@ final class DesignMotion: NSObject {
         case hover      // 130ms cubic-out
         case press      // 140ms snappy critically-damped tactile press/release
         case slide      // 180ms spring-out
-        case expand     // 200ms ease-in-out
         case sweep      // 260ms cubic-out
         case spring     // 320ms ProMotion damped spring
         case breathe    // 1200ms gentle sinusoidal breathing pulse
@@ -48,7 +47,6 @@ final class DesignMotion: NSObject {
             case .hover: return 0.13
             case .press: return 0.14
             case .slide: return 0.18
-            case .expand: return 0.20
             case .sweep: return 0.26
             case .spring: return 0.32
             case .breathe: return 1.20
@@ -62,8 +60,6 @@ final class DesignMotion: NSObject {
                 return CGFloat(1.0 - pow(1.0 - p, 3.0))
             case .slide:
                 return CGFloat(1.0 - pow(1.0 - p, 3.4))
-            case .expand:
-                return CGFloat(p < 0.5 ? 4.0 * p * p * p : 1.0 - pow(-2.0 * p + 2.0, 3.0) / 2.0)
             case .spring:
                 return CGFloat(1.0 - exp(-6.0 * p) * cos(7.0 * p))
             case .breathe:

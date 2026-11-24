@@ -18,10 +18,10 @@ test('默认测试范围完整分区：保留原生行为，浏览器与完整�
   assert.equal(new Set([...fast, ...native]).size, fast.length + native.length);
   assert.deepEqual([...fast, ...native].sort(), all);
   assert.deepEqual(all, entries.filter(name => name.endsWith('.test.mjs')).sort().map(name => join('test', name)));
-  assert.ok(!all.includes('test/browser.mjs'));
+  assert.ok(!all.includes(join('test', 'browser.mjs')));
   assert.ok(entries.includes('native-ui.mjs'));
-  assert.ok(!all.includes('test/native-ui.mjs'));
-  assert.ok(native.includes('test/native-quota.test.mjs') && native.includes('test/native-repair.test.mjs') && native.includes('test/native-update.test.mjs'));
+  assert.ok(!all.includes(join('test', 'native-ui.mjs')));
+  assert.ok(native.includes(join('test', 'native-quota.test.mjs')) && native.includes(join('test', 'native-repair.test.mjs')) && native.includes(join('test', 'native-update.test.mjs')));
   assert.throws(() => selectTestFiles(entries, 'typo'), /未知测试范围/);
 });
 

@@ -2,11 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createConnection, createServer } from 'node:net';
+import { createServer } from 'node:net';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  cleanupIpcSession,
+  createWindowsIpcSession,
+  isWindows,
+  writeIpcSession,
+} from '../dist/platform/index.js';
+import { sendBackendRpc } from './test-ipc.mjs';
 
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -22,29 +29,15 @@ async function until(fn, timeout = 10000) {
   throw new Error('测试等待超时');
 }
 
-/** 测试用 IPC 客户端：整包累积 Buffer 后一次性 UTF-8 解码，与生产 CLI 的流式解码相互独立。 */
+/** 测试用 IPC 客户端：复用跨平台 IPC 目标解析（Windows 自动读取 ipc-session.json 并携带 authToken）。 */
 function rpc(directory, payload) {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
-    const chunks = [];
-    socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('IPC 超时')); });
-    socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'));
-    socket.on('error', reject);
-    socket.on('data', chunk => {
-      chunks.push(chunk);
-      const buffer = Buffer.concat(chunks);
-      if (!buffer.includes(0x0a)) return;
-      socket.end();
-      try { resolve(JSON.parse(buffer.toString('utf8').split('\n')[0])); } catch { reject(new Error('响应格式错误')); }
-    });
-  });
+  return sendBackendRpc(directory, payload, { timeoutMs: 5000 });
 }
 
 // I04: CLI --command 必须按 UTF-8 流解码。以下用本地 socket mock 把“导”字（3 字节）从字节中间切开，
 // 旧实现逐 chunk toString() 会产生 U+FFFD 并损坏 coverage_report / dictionary_export 的 JSON。
 test('I04: CLI --command 在多字节 chunk 边界不产生 U+FFFD', { timeout: 60000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'gb-p2-cli-'));
-  const socketPath = join(directory, 'control.sock');
   const payload = {
     ok: true,
     report: {
@@ -59,6 +52,8 @@ test('I04: CLI --command 在多字节 chunk 边界不产生 U+FFFD', { timeout: 
   const splits = [firstChinese + 1, firstChinese + 2];
   try {
     for (const split of splits) {
+      const winSession = isWindows() ? createWindowsIpcSession(directory, process.pid) : null;
+      const socketPath = winSession ? winSession.pipeName : join(directory, 'control.sock');
       const server = createServer(socket => {
         socket.on('error', () => {});
         socket.resume(); // 消费客户端命令字节，确保 FIN 后服务端连接能被关闭。
@@ -66,12 +61,14 @@ test('I04: CLI --command 在多字节 chunk 边界不产生 U+FFFD', { timeout: 
         setTimeout(() => { socket.write(bytes.subarray(split)); socket.end(); }, 30);
       });
       await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
+      if (winSession) await writeIpcSession(directory, winSession);
       try {
         const { stdout } = await exec(process.execPath, [join(root, 'dist/main.js'), '--state-dir', directory, '--command', 'coverage_report'], { timeout: 20000, maxBuffer: 4_000_000 });
         assert.equal(stdout.includes('\uFFFD'), false, `切分点 ${split}：CLI 输出不得包含替换符`);
         assert.deepEqual(JSON.parse(stdout.trim()), payload);
       } finally {
         await new Promise(resolve => server.close(resolve));
+        if (winSession) await cleanupIpcSession(directory, process.pid);
       }
     }
   } finally {

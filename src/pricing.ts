@@ -599,6 +599,28 @@ const CATALOG_TIER_ORDER: Record<string, number> = {
   FREE: 5,
 };
 
+const NON_COMMERCIAL_TIER_SENTINELS_RE =
+  /^(?:unknown|none|null|undefined|unspecified|default|n\/a|na|empty|other)$/i;
+const INTERNAL_NON_TIER_WORD_RE = /\b(?:prototype|internal|debug|test)\b/i;
+
+export function sanitizeFallbackTierLabel(rawTier: unknown): string {
+  const raw = typeof rawTier === 'string' ? rawTier.trim() : '';
+  if (!raw || raw.length > 48) return '';
+  if (INTERNAL_NON_TIER_WORD_RE.test(raw)) return '';
+  const cleaned = raw
+    .replace(/^(?:g1|agy|google[\s_-]*ai|google[\s_-]*one|antigravity)[\s_-]+/i, '')
+    .replace(/[\s_-]+(?:tier|plan)$/i, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned || cleaned.length > 32 || !/[a-z]/i.test(cleaned)) return '';
+  if (cleaned.split(' ').length > 3) return '';
+  if (NON_COMMERCIAL_TIER_SENTINELS_RE.test(cleaned) || INTERNAL_NON_TIER_WORD_RE.test(cleaned)) {
+    return '';
+  }
+  return cleaned.toUpperCase();
+}
+
 export function normalizeCatalogTierLabel(rawTier: unknown): string {
   const text = typeof rawTier === 'string' ? rawTier.trim() : '';
   if (!text) return '';
@@ -606,12 +628,12 @@ export function normalizeCatalogTierLabel(rawTier: unknown): string {
   if (/enterprise/i.test(text)) return 'ENTERPRISE';
   if (/\b(?:team|teams|business|workspace)\b/i.test(text)) return 'TEAM';
   if (/\bplus\b/i.test(text)) return 'PLUS';
-  if (/\bpro\b/i.test(text)) return 'PRO';
+  if (/\b(?:pro|ai\s+premium)\b/i.test(text)) return 'PRO';
   if (/\b(?:free|starter|trial)\b/i.test(text)) return 'FREE';
-  return '';
+  return sanitizeFallbackTierLabel(text);
 }
 
-function compareCatalogTiers(a: string, b: string): number {
+export function compareCatalogTiers(a: string, b: string): number {
   const ra = CATALOG_TIER_ORDER[a] ?? 99;
   const rb = CATALOG_TIER_ORDER[b] ?? 99;
   return ra !== rb ? ra - rb : a.localeCompare(b);
@@ -695,21 +717,23 @@ function foldUnpricedLiveCandidate(
       isOrchestratorVariant: true,
     };
   }
-  if (/^(?:gemini|claude|gpt|o[1-9])/.test(canonicalKey)) {
+  if (canonicalKey && !/^(?:chat_|tab_|model_placeholder_)/i.test(canonicalKey)) {
     const suffixMatch = canonicalKey.match(
       /^(.+?)(?:-tiered)?-(extra-high|extra-low|xhigh|extra|high|medium|low|minimal|max|thinking)$/i
     );
     if (suffixMatch) {
       const baseKey = suffixMatch[1]!;
-      const rawSuffix = suffixMatch[2]!.toLowerCase();
-      return {
-        canonicalKey: baseKey,
-        displayName: stripDisplayTierSuffix(rawDisplayName),
-        variantLabel: UNPRICED_THINKING_SUFFIX_LABELS[rawSuffix] ?? rawSuffix,
-      };
+      if (baseKey.length >= 2 && /[a-z0-9]/i.test(baseKey)) {
+        const rawSuffix = suffixMatch[2]!.toLowerCase();
+        return {
+          canonicalKey: baseKey,
+          displayName: stripDisplayTierSuffix(rawDisplayName),
+          variantLabel: UNPRICED_THINKING_SUFFIX_LABELS[rawSuffix] ?? rawSuffix,
+        };
+      }
     }
     const bareTieredMatch = canonicalKey.match(/^(.+)-tiered$/i);
-    if (bareTieredMatch) {
+    if (bareTieredMatch && bareTieredMatch[1]!.length >= 2 && /[a-z0-9]/i.test(bareTieredMatch[1]!)) {
       return {
         canonicalKey: bareTieredMatch[1]!,
         displayName: stripDisplayTierSuffix(rawDisplayName),
@@ -801,10 +825,18 @@ function extractCatalogModels(
       continue;
     }
     const isPricedFlashLite = isPricedCatalogFlashLiteModel(baseId, initialKey, knownPricedKeys);
+    const nonTieredBaseId = stripModelProviderPrefix(baseId)
+      .trim()
+      .replace(/[-_]tiered(?=$|[-_])/gi, '');
+    const isFallbackTieredChatModel =
+      (rawInSelector === undefined || rawInSelector === null) &&
+      Boolean(nonTieredBaseId) &&
+      !isInternalNonChatModelId(nonTieredBaseId);
     const isActiveTieredVariant = isTieredVariantModelId(baseId) && (
       effectiveActiveSet.has(initialKey) ||
       Boolean(resolvedPricing) ||
-      explicitlyInSelector
+      explicitlyInSelector ||
+      isFallbackTieredChatModel
     );
     if (
       !effectiveActiveSet.has(normBase) &&
@@ -836,7 +868,7 @@ function extractCatalogModels(
   }
 
   const isOpenAiFamily = (key: string): boolean =>
-    key.startsWith('gpt-') || /^o[1-9](?:$|[-_])/.test(key);
+    key.startsWith('gpt-') || /^o(?:[1-9]|[1-9]\d+)(?:$|[-_])/.test(key);
   const hasEnabledActiveClaude = parsed.some(
     (c) => !c.disabled && c.canonicalKey.startsWith('claude-') && effectiveActiveSet.has(c.canonicalKey)
   );

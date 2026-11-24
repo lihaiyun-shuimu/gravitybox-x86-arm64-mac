@@ -1,13 +1,22 @@
 import { createHash } from 'node:crypto';
-import { formatLocalDate } from './usage-aggregate.js';
+import {
+  buildAvailableEnvironments,
+  buildPeriodEnvironmentBreakdown,
+  calculateLockedEventUsd,
+  formatLocalDate,
+  type EnvAggregateCounters,
+} from './usage-aggregate.js';
 import { matchPricingKeys, priceStatus, type ApiPricing, type ApiPricingEntry } from './pricing.js';
 import { bt } from './i18n.js';
+import { cleanHostLabel } from './ssh-context.js';
 import {
+  normalizeEventEnvironment,
   resolveDatabaseModelFullName,
   type AvailableAccountUsageOption,
   type DailyTokenUsage,
   type GenerationEvent,
   type HourlyTokenUsage,
+  type KnownEnvironmentContext,
   type ModelTokenUsage,
   type TokenUsagePeriod,
   type TokenUsageSummary,
@@ -42,6 +51,10 @@ export interface BuildUsageReportInput {
   archivedUnavailable: boolean;
   storageWarnings: Set<string>;
   pricingWarnings: string[];
+  environmentId?: string;
+  environments?: KnownEnvironmentContext[];
+  remoteSyncRevision?: number;
+  receiptSyncTimes?: ReadonlyMap<string, number>;
 }
 
 export function classifyUsageWarningCode(message: string): string {
@@ -91,15 +104,40 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     archivedUnavailable,
     storageWarnings,
     pricingWarnings,
+    environmentId,
+    environments,
+    remoteSyncRevision,
+    receiptSyncTimes,
   } = input;
 
   // 局部浅拷贝防止本次计算的临时告警（如 receipts_unmatched）永久污染调用方的持久 storageWarnings 集合
   const reportStorageWarnings = new Set(storageWarnings);
 
+  const selectedEnvId = environmentId && environmentId.trim() ? environmentId.trim() : 'all';
+  const selectedAccountId = accountId && accountId.trim() ? accountId.trim() : 'all';
+  const targetAccountOpt = selectedAccountId !== 'all' ? accountMap.get(selectedAccountId) : undefined;
+  const targetEmail =
+    targetAccountOpt?.email?.toLowerCase() ??
+    (selectedAccountId.includes('@') ? selectedAccountId.toLowerCase() : '');
+  const matchesAccount = (ev: GenerationEvent): boolean => {
+    if (selectedAccountId === 'all') return true;
+    if (selectedAccountId === 'unattributed') return !ev.account_id && !ev.account_email;
+    if (ev.account_id && ev.account_id === selectedAccountId) return true;
+    if (targetEmail && ev.account_email && ev.account_email.toLowerCase() === targetEmail) return true;
+    return false;
+  };
+  const matchesEnv = (ev: GenerationEvent): boolean =>
+    selectedEnvId === 'all' || normalizeEventEnvironment(ev).id === selectedEnvId;
+
+  const filteredEffectiveEvents =
+    selectedEnvId === 'all' && selectedAccountId === 'all'
+      ? effectiveEvents
+      : effectiveEvents.filter(ev => matchesAccount(ev) && matchesEnv(ev));
+
   let alreadyOrdered = true;
-  for (let i = 1; i < effectiveEvents.length; i += 1) {
-    const prev = effectiveEvents[i - 1]!;
-    const curr = effectiveEvents[i]!;
+  for (let i = 1; i < filteredEffectiveEvents.length; i += 1) {
+    const prev = filteredEffectiveEvents[i - 1]!;
+    const curr = filteredEffectiveEvents[i]!;
     const cmp = prev.timestamp_seconds - curr.timestamp_seconds;
     if (cmp > 0 || (cmp === 0 && (prev.event_key ?? '').localeCompare(curr.event_key ?? '') > 0)) {
       alreadyOrdered = false;
@@ -107,8 +145,8 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     }
   }
   const orderedEvents = alreadyOrdered
-    ? effectiveEvents
-    : [...effectiveEvents].sort(
+    ? filteredEffectiveEvents
+    : [...filteredEffectiveEvents].sort(
         (a, b) => a.timestamp_seconds - b.timestamp_seconds || (a.event_key ?? '').localeCompare(b.event_key ?? '')
       );
   const anchorMs = Number.isFinite(now) && now > 0 ? now * 1000 : Date.now();
@@ -146,6 +184,12 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     totalAll: number;
     totalCount: number;
     periodUsd: number;
+    localTokens: number;
+    sshTokens: number;
+    localRequests: number;
+    sshRequests: number;
+    localUsd: number;
+    sshUsd: number;
   };
   const makePeriodBucket = (): PeriodBucket => ({
     modelMap: new Map(),
@@ -156,14 +200,35 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     totalAll: 0,
     totalCount: 0,
     periodUsd: 0,
+    localTokens: 0,
+    sshTokens: 0,
+    localRequests: 0,
+    sshRequests: 0,
+    localUsd: 0,
+    sshUsd: 0,
   });
-  const recordToBucket = (bucket: PeriodBucket, ev: GenerationEvent, evCost: number | null, modelName: string) => {
+  const recordToBucket = (
+    bucket: PeriodBucket,
+    ev: GenerationEvent,
+    evCost: number | null,
+    modelName: string,
+    envKind: 'local' | 'ssh'
+  ) => {
     bucket.totalIn += ev.input_tokens;
     bucket.totalOut += ev.output_tokens;
     bucket.totalCached += ev.cached_tokens;
     bucket.totalWrite += ev.cache_write_tokens ?? 0;
     bucket.totalAll += ev.total_tokens;
     bucket.totalCount++;
+    if (envKind === 'ssh') {
+      bucket.sshTokens += ev.total_tokens;
+      bucket.sshRequests++;
+      if (evCost !== null) bucket.sshUsd += evCost;
+    } else {
+      bucket.localTokens += ev.total_tokens;
+      bucket.localRequests++;
+      if (evCost !== null) bucket.localUsd += evCost;
+    }
     let entry = bucket.modelMap.get(modelName);
     if (!entry) {
       entry = { in: 0, out: 0, cached: 0, write: 0, total: 0, count: 0, cost: 0, unpricedTokens: 0 };
@@ -197,14 +262,122 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
   let unknownTimeRecords = 0;
   let unknownTimeTokens = 0;
 
+  const envStats = new Map<string, EnvAggregateCounters>();
+  const allSshEnvsSeen = new Map<string, string>();
+  const recordEnvStat = (evEnv: { kind: 'local' | 'ssh'; id: string; label: string }, tokens: number, usd: number | null) => {
+    const prev = envStats.get(evEnv.id) ?? {
+      kind: evEnv.kind,
+      hostLabel: evEnv.label,
+      totalTokens: 0,
+      requestCount: 0,
+      estimatedUsd: 0,
+    };
+    if (evEnv.label && (!prev.hostLabel || prev.hostLabel === evEnv.id)) {
+      prev.hostLabel = evEnv.label;
+    }
+    prev.totalTokens += tokens;
+    prev.requestCount += 1;
+    prev.estimatedUsd += usd ?? 0;
+    envStats.set(evEnv.id, prev);
+  };
+  const readOnlyEventCost = (ev: GenerationEvent): number | null => {
+    if (ev.timestamp_seconds <= 0) return null;
+    const locked = ev.event_key ? rateLocks[ev.event_key] : undefined;
+    if (locked?.price) {
+      const lockedCostVal = calculateLockedEventUsd(ev, locked.price);
+      if (lockedCostVal !== null) return lockedCostVal;
+    }
+    const modelName = resolveDatabaseModelFullName(ev.model, null);
+    return calculateLockedEventUsd(ev, resolvePricing(rawPricing, modelName, ev.timestamp_seconds));
+  };
+
+  let effectiveAccountMap = accountMap;
+  let effectiveUnattributedRequests = unattributedRequests;
+  let effectiveUnattributedTokens = unattributedTokens;
+  let emailToAccountKey: Map<string, string> | null = null;
+  if (selectedEnvId !== 'all') {
+    effectiveAccountMap = new Map<string, AvailableAccountUsageOption>();
+    emailToAccountKey = new Map<string, string>();
+    for (const [k, opt] of accountMap.entries()) {
+      effectiveAccountMap.set(k, { ...opt, total_tokens: 0, request_count: 0 });
+      if (k !== 'all' && opt.email) {
+        emailToAccountKey.set(opt.email.toLowerCase(), k);
+      }
+    }
+    if (!effectiveAccountMap.has('all')) {
+      effectiveAccountMap.set('all', { id: 'all', label: bt('usage.all_accounts'), type: 'all', total_tokens: 0, request_count: 0 });
+    }
+    effectiveUnattributedRequests = 0;
+    effectiveUnattributedTokens = 0;
+  }
+
+  for (const ev of allEvents) {
+    const evEnv = normalizeEventEnvironment(ev);
+    if (evEnv.kind === 'ssh') {
+      const cleanedLabel = cleanHostLabel(evEnv.label) || evEnv.label;
+      const prevLabel = allSshEnvsSeen.get(evEnv.id);
+      if (!prevLabel || (prevLabel === evEnv.id && cleanedLabel !== evEnv.id)) {
+        allSshEnvsSeen.set(evEnv.id, cleanedLabel);
+      }
+    }
+    const envHit = selectedEnvId === 'all' || evEnv.id === selectedEnvId;
+    if (selectedEnvId !== 'all' && envHit) {
+      const allOpt = effectiveAccountMap.get('all')!;
+      allOpt.total_tokens = (allOpt.total_tokens ?? 0) + ev.total_tokens;
+      allOpt.request_count = (allOpt.request_count ?? 0) + 1;
+      if (!ev.account_id && !ev.account_email) {
+        effectiveUnattributedRequests++;
+        effectiveUnattributedTokens += ev.total_tokens;
+      } else {
+        let targetKey: string | null = null;
+        if (ev.account_id && effectiveAccountMap.has(ev.account_id)) {
+          targetKey = ev.account_id;
+        } else if (ev.account_email && emailToAccountKey) {
+          targetKey = emailToAccountKey.get(ev.account_email.toLowerCase()) ?? null;
+        }
+        if (!targetKey) {
+          const newKey = ev.account_id || ev.account_email!;
+          effectiveAccountMap.set(newKey, {
+            id: newKey,
+            label: ev.account_email || ev.account_id!,
+            email: ev.account_email,
+            type: 'account',
+            total_tokens: 0,
+            request_count: 0,
+          });
+          if (ev.account_email && emailToAccountKey) {
+            emailToAccountKey.set(ev.account_email.toLowerCase(), newKey);
+          }
+          targetKey = newKey;
+        }
+        const item = effectiveAccountMap.get(targetKey)!;
+        item.total_tokens = (item.total_tokens ?? 0) + ev.total_tokens;
+        item.request_count = (item.request_count ?? 0) + 1;
+      }
+    }
+    // 非当前选定环境（被 environmentId 筛选排除）且符合当前账号的事件：只读补齐环境分布计数，不触发 rateLocks 写副作用
+    if (!envHit && matchesAccount(ev)) {
+      recordEnvStat(evEnv, ev.total_tokens, readOnlyEventCost(ev));
+    }
+  }
+
   // 单遍分桶聚合：同时产出全部周期、每日趋势、今日分时与未知时间统计，且每条事件只查一次价/锁费率
   for (const ev of orderedEvents) {
+    const evEnv = normalizeEventEnvironment(ev);
+    if (evEnv.kind === 'ssh') {
+      const cleanedLabel = cleanHostLabel(evEnv.label) || evEnv.label;
+      const prevLabel = allSshEnvsSeen.get(evEnv.id);
+      if (!prevLabel || (prevLabel === evEnv.id && cleanedLabel !== evEnv.id)) {
+        allSshEnvsSeen.set(evEnv.id, cleanedLabel);
+      }
+    }
     const modelName = resolveDatabaseModelFullName(ev.model, null);
     const ts = ev.timestamp_seconds;
     const evCost = ts > 0
       ? lockedCost(ev, resolvePricing(rawPricing, modelName, ts))
       : null;
-    recordToBucket(allTimeBucket, ev, evCost, modelName);
+    recordEnvStat(evEnv, ev.total_tokens, evCost);
+    recordToBucket(allTimeBucket, ev, evCost, modelName, evEnv.kind);
 
     if (ts <= 0) {
       unknownTimeRecords++;
@@ -244,11 +417,11 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     }
 
     if (ts >= thirtyDaysStart && ts < tomorrowStart) {
-      recordToBucket(thirtyDaysBucket, ev, evCost, modelName);
+      recordToBucket(thirtyDaysBucket, ev, evCost, modelName, evEnv.kind);
       if (ts >= sevenDaysStart) {
-        recordToBucket(sevenDaysBucket, ev, evCost, modelName);
+        recordToBucket(sevenDaysBucket, ev, evCost, modelName, evEnv.kind);
         if (ts >= todayStart) {
-          recordToBucket(todayBucket, ev, evCost, modelName);
+          recordToBucket(todayBucket, ev, evCost, modelName, evEnv.kind);
           const dateStr = formatLocalDate(d);
           const hourStr = `${dateStr} ${String(d.getHours()).padStart(2, '0')}:00`;
           let hEntry = hourlyMap.get(hourStr);
@@ -288,6 +461,13 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
       });
     }
   }
+
+  const { availableEnvironments, offlineSshHosts } = buildAvailableEnvironments(
+    envStats,
+    allSshEnvsSeen,
+    environments,
+    receiptSyncTimes
+  );
 
   const rawPricingKeys = Object.keys(rawPricing);
   const currentModelMetaCache = new Map<string, { currentPrice: ApiPricing | null; canonicalKey: string | null }>();
@@ -362,6 +542,15 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
       by_model: byModel,
       priced_models: pricedCount,
       unpriced_models: unpricedCount,
+      environment_breakdown: buildPeriodEnvironmentBreakdown(
+        bucket.localTokens,
+        bucket.sshTokens,
+        bucket.localRequests,
+        bucket.sshRequests,
+        bucket.localUsd,
+        bucket.sshUsd,
+        offlineSshHosts
+      ),
     };
   };
 
@@ -380,13 +569,17 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     last_7_days: sevenDaysPeriod,
     last_30_days: thirtyDaysPeriod,
     all_time: allTimePeriod,
-    unattributed_requests: unattributedRequests,
-    unattributed_tokens: unattributedTokens,
+    unattributed_requests: effectiveUnattributedRequests,
+    unattributed_tokens: effectiveUnattributedTokens,
     historical_amount_receipts: { unmatchedCount: unmatchedReceipts.length, unmatchedUsd: unmatchedReceipts.reduce((sum, [, receipt]) => sum + receipt.usd, 0) },
     daily_trends: [...dailyMap.values()].sort((a, b) => a.date.localeCompare(b.date)),
     today_hourly: [...hourlyMap.values()].sort((a, b) => a.hour.localeCompare(b.hour)),
-    available_accounts: [...accountMap.values()],
-    selected_account_id: accountId || 'all',
+    available_accounts: [...effectiveAccountMap.values()],
+    selected_account_id: selectedAccountId,
+    available_environments: availableEnvironments,
+    selected_environment_id: selectedEnvId,
+    environment_breakdown: allTimePeriod.environment_breakdown,
+    ...(remoteSyncRevision !== undefined ? { remote_sync_revision: remoteSyncRevision } : {}),
     databases_scanned: totalScanned,
     databases_discovered: totalDiscovered,
     scan_scope_description: totalDiscovered > totalScanned
@@ -410,6 +603,7 @@ export function buildUsageSummaryReport(input: BuildUsageReportInput): TokenUsag
     snapshot_id: (() => {
       const hash = createHash('sha256');
       hash.update(`account:${accKey}\n`);
+      if (selectedEnvId !== 'all') hash.update(`env:${selectedEnvId}\n`);
       for (const ev of allEvents) {
         hash.update(`${ev.model}|${ev.timestamp_seconds}|${ev.input_tokens}|${ev.output_tokens}|${ev.cached_tokens}|${ev.cache_write_tokens ?? 0}|${ev.total_tokens}\n`);
         hash.update(`locked-cost:${ev.event_key ? rateLocks[ev.event_key]?.usd ?? 'unpriced' : 'unpriced'}\n`);

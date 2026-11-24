@@ -160,6 +160,15 @@ export function detectSystemLocales(): string[] {
     }
   }
 
+  if (process.platform === 'win32') {
+    try {
+      const intlLocale = Intl.DateTimeFormat().resolvedOptions().locale;
+      if (intlLocale) pushUnique(intlLocale);
+    } catch {
+      // ignore
+    }
+  }
+
   const envLang = process.env.LC_ALL || process.env.LC_MESSAGES || process.env.LANG;
   if (envLang) {
     const clean = envLang.split('.')[0];

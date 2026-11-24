@@ -28,22 +28,22 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     static let catalogSpecByName: [String: (prefix: String, icon: String)] = [
-        "Cache": ("maintenance.catalog.cache", "internaldrive"),
-        "Code Cache": ("maintenance.catalog.code_cache", "cpu"),
-        "GPUCache": ("maintenance.catalog.gpu_cache", "sparkles.tv"),
+        "Cache": ("maintenance.catalog.cache", "tray.full"),
+        "Code Cache": ("maintenance.catalog.code_cache", "chevron.left.forwardslash.chevron.right"),
+        "GPUCache": ("maintenance.catalog.gpu_cache", "display"),
         "DawnCache": ("maintenance.catalog.dawn_cache", "cube.transparent"),
         "DawnWebGPUCache": ("maintenance.catalog.dawn_webgpu_cache", "cube"),
         "DawnGraphiteCache": ("maintenance.catalog.dawn_graphite_cache", "paintbrush.pointed"),
         "GraphiteDawnCache": ("maintenance.catalog.graphite_dawn_cache", "wand.and.rays"),
         "ShaderCache": ("maintenance.catalog.shader_cache", "circle.hexagongrid"),
-        "CachedData": ("maintenance.catalog.cached_data", "memorychip"),
+        "CachedData": ("maintenance.catalog.cached_data", "doc.zipper"),
         "CachedExtensionVSIXs": ("maintenance.catalog.cached_vsix", "puzzlepiece.extension"),
         "CachedProfilesData": ("maintenance.catalog.cached_profiles", "person.crop.square"),
         "Crashpad": ("maintenance.catalog.crashpad", "waveform.path.ecg"),
         "logs": ("maintenance.catalog.logs", "doc.text"),
         "blob_storage": ("maintenance.catalog.blob_storage", "archivebox"),
         "PartitionsCache": ("maintenance.catalog.partitions_cache", "square.split.2x2"),
-        "AgentBrowserCache": ("maintenance.catalog.agent_browser_cache", "globe"),
+        "AgentBrowserCache": ("maintenance.catalog.agent_browser_cache", "safari"),
         "OrphanAgentData": ("maintenance.catalog.orphan_agent_data", "trash.slash"),
         "AgentTaskStepLogs": ("maintenance.catalog.task_step_logs", "terminal"),
         "AgentVerboseTranscripts": ("maintenance.catalog.verbose_transcripts", "doc.on.doc"),
@@ -51,9 +51,9 @@ final class CachePage: NSObject, NSPopoverDelegate {
         "Service Worker": ("maintenance.catalog.service_worker", "gearshape.2"),
         "Session Storage": ("maintenance.catalog.session_storage", "rectangle.stack"),
         "WebStorage": ("maintenance.catalog.web_storage", "externaldrive"),
-        "Local Storage": ("maintenance.catalog.local_storage", "internaldrive"),
+        "Local Storage": ("maintenance.catalog.local_storage", "cylinder"),
         "Cookies": ("maintenance.catalog.cookies", "key"),
-        "Network Persistent State": ("maintenance.catalog.network_state", "network")
+        "Network Persistent State": ("maintenance.catalog.network_state", "antenna.radiowaves.left.and.right")
     ]
 
     unowned let app: Assistant
@@ -86,7 +86,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
     let runtimeCacheSwitch = DesignSwitch()
 
     let historyTitleLabel = text(L10n.t("maintenance.simple.scope_history_title"), size: 13, weight: .semibold, color: .labelColor)
-    let retentionPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let retentionPopup = DesignPopUpButton(frame: .zero, pullsDown: false)
     let historyInfoButton: MaintenanceInfoButton
     let historySubtitleLabel = text(L10n.t("maintenance.simple.scope_history_sub", ["days": 7]), size: 11, color: Design.secondary)
     let historySizeLabel = text("0 B", size: 13, weight: .semibold, color: Design.secondary)
@@ -117,14 +117,11 @@ final class CachePage: NSObject, NSPopoverDelegate {
     private var userToggledHistorySwitch = false
     var hasCompletedScan = false
     var selectedRetentionDays: Int = 7
-    var scanToken = ""
     var runtimeBucketBytes: Int64 = 0
     var historyBucketBytes: Int64 = 0
     var runtimeBucketFileCount: Int = 0
     var historyBucketFileCount: Int = 0
     var historyBucketSubagentCount: Int = 0
-    var safeCacheBytes: Int64 = 0
-    var statefulCacheBytes: Int64 = 0
     var totalProtectedBytes: Int64 = 0
     var appRunning = false
     var browserBusy = false
@@ -132,6 +129,8 @@ final class CachePage: NSObject, NSPopoverDelegate {
     var usingFallbackTrash = false
     var scannedAt: Int = 0
     var busy = false
+    private var confirmDialogOpen = false
+    private var lastScanError: String? = nil
     private(set) var latestRestorableSnapshotId: String = ""
     var latestUndoSnapshot: [String: Any]?
     private var lastFetchTime: Date = .distantPast
@@ -316,7 +315,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
         historySizeLabel.setContentHuggingPriority(.required, for: .horizontal)
         historySizeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let runtimeIcon = Self.makeIconBadge(symbolName: "sparkles", tint: Design.blue)
+        let runtimeIcon = Self.makeIconBadge(symbolName: "memorychip", tint: Design.blue)
         runtimeTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
         runtimeTitleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         let runtimeTitleRow = horizontal([runtimeTitleLabel, runtimeInfoButton], spacing: 5)
@@ -333,7 +332,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
         runtimeRow.alignment = .centerY
 
         let amberTint = Design.color(0xD97706, 0xFBBF24)
-        let historyIcon = Self.makeIconBadge(symbolName: "clock.arrow.circlepath", tint: amberTint)
+        let historyIcon = Self.makeIconBadge(symbolName: "list.bullet.rectangle.portrait", tint: amberTint)
         historyTitleLabel.setContentHuggingPriority(.required, for: .horizontal)
         historyTitleLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         retentionPopup.setContentHuggingPriority(.required, for: .horizontal)
@@ -447,10 +446,14 @@ final class CachePage: NSObject, NSPopoverDelegate {
         }
 
         Design.applyControls(view)
+        (retentionPopup.cell as? DesignPopUpCell)?.fitsSelectedTitleOnly = true
+        _ = Design.syncPopUpWidth(retentionPopup)
         Self.stripTooltipsRecursively(view)
     }
 
     deinit {
+        detailPopover?.delegate = nil
+        detailPopover?.close()
         if let languageObserver {
             NotificationCenter.default.removeObserver(languageObserver)
         }
@@ -589,14 +592,14 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     func update(force: Bool = false) {
-        guard !busy else { return }
+        guard !busy, !confirmDialogOpen else { return }
         let expired = Date().timeIntervalSince(lastFetchTime) >= 60.0
         if !force && !expired && hasCompletedScan { return }
         fetch(force: force)
     }
 
     @objc func scanNow() {
-        guard !busy else { return }
+        guard !busy, !confirmDialogOpen else { return }
         dismissDetailPopover()
         feedbackLabel.isHidden = true
         fetch(force: true)
@@ -629,7 +632,8 @@ final class CachePage: NSObject, NSPopoverDelegate {
         }
     }
 
-    func fetch(force: Bool = false) {
+    func fetch(force: Bool = false, rollbackRetentionDays: Int? = nil) {
+        guard !confirmDialogOpen else { return }
         if !force && !hasCompletedScan,
            let cached = app.lastMaintenanceScanPayload,
            intVal(cached, "retentionDays", fallback: 7) == selectedRetentionDays,
@@ -667,18 +671,28 @@ final class CachePage: NSObject, NSPopoverDelegate {
         }
         app.bridge.send(["command": "maintenance_scan", "retentionDays": selectedRetentionDays]) { [weak self] response in
             guard let self else { return }
-            self.setBusy(false)
             let now = Date()
             self.lastFetchTime = now
             switch response {
             case .failure(let error):
+                self.lastScanError = error.localizedDescription
+                if let previousDays = rollbackRetentionDays {
+                    self.selectedRetentionDays = previousDays
+                    if let matchIdx = Self.retentionChoices.firstIndex(where: { $0.days == previousDays }) {
+                        self.retentionPopup.selectItem(at: matchIdx)
+                        _ = Design.syncPopUpWidth(self.retentionPopup)
+                    }
+                }
+                self.setBusy(false)
                 if !self.hasCompletedScan {
-                    reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
+                    self.reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
                 }
                 self.heroSubtitleLabel.stringValue = error.localizedDescription
                 self.heroSubtitleLabel.textColor = accessibleWarningColor()
                 self.clearButton.isEnabled = false
             case .success(let value):
+                self.lastScanError = nil
+                self.setBusy(false)
                 self.app.lastMaintenanceScanPayload = value
                 self.app.lastMaintenanceScanAt = now
                 self.applyScanPayload(value)
@@ -688,20 +702,26 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     @objc func retentionWindowChanged() {
-        guard !busy else {
+        guard !busy, !confirmDialogOpen, app.reachable else {
             if let matchIdx = Self.retentionChoices.firstIndex(where: { $0.days == selectedRetentionDays }) {
                 retentionPopup.selectItem(at: matchIdx)
+                _ = Design.syncPopUpWidth(retentionPopup)
             }
             return
         }
         let idx = max(0, min(Self.retentionChoices.count - 1, retentionPopup.indexOfSelectedItem))
         let nextDays = Self.retentionChoices[idx].days
-        guard nextDays != selectedRetentionDays else { return }
+        guard nextDays != selectedRetentionDays else {
+            _ = Design.syncPopUpWidth(retentionPopup)
+            return
+        }
         dismissDetailPopover()
+        let previousDays = selectedRetentionDays
         selectedRetentionDays = nextDays
+        _ = Design.syncPopUpWidth(retentionPopup)
         feedbackLabel.isHidden = true
         updateSummaryAndControls()
-        fetch(force: true)
+        fetch(force: true, rollbackRetentionDays: previousDays)
     }
 
     @objc func runtimeScopeToggled() {
@@ -727,7 +747,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     func applyScanPayload(_ value: [String: Any]) {
-        scanToken = value["token"] as? String ?? ""
+        lastScanError = nil
         appRunning = value["running"] as? Bool == true
         browserBusy = value["browserBusy"] as? Bool == true
         if let dir = value["trashDir"] as? String, !dir.isEmpty {
@@ -742,6 +762,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
                 if retentionPopup.indexOfSelectedItem != matchIdx {
                     retentionPopup.selectItem(at: matchIdx)
                 }
+                _ = Design.syncPopUpWidth(retentionPopup)
             }
         }
         scannedAt = intVal(value, "scannedAt", fallback: Int(Date().timeIntervalSince1970))
@@ -769,9 +790,6 @@ final class CachePage: NSObject, NSPopoverDelegate {
             historyBucketFileCount = fallbackHistoryFiles
             historyBucketSubagentCount = 0
         }
-
-        safeCacheBytes = runtimeBucketBytes
-        statefulCacheBytes = historyBucketBytes
 
         let rawProtected = value["protectedEntries"] as? [[String: Any]] ?? []
         protectedEntries = rawProtected
@@ -819,7 +837,15 @@ final class CachePage: NSObject, NSPopoverDelegate {
     private func updateSummaryAndControls() {
         let selectedBytes = selectedReclaimableBytes
         reclaimableTitleLabel.stringValue = L10n.t("maintenance.simple.hero_title")
-        if hasCompletedScan {
+        if let scanError = lastScanError {
+            if hasCompletedScan {
+                reclaimableValueLabel.stringValue = formatBytes(selectedBytes)
+            } else {
+                reclaimableValueLabel.stringValue = L10n.t("maintenance.hero.scan_failed")
+            }
+            heroSubtitleLabel.stringValue = scanError
+            heroSubtitleLabel.textColor = accessibleWarningColor()
+        } else if hasCompletedScan {
             reclaimableValueLabel.stringValue = formatBytes(selectedBytes)
             heroSubtitleLabel.stringValue = L10n.t("maintenance.simple.hero_subtitle")
             heroSubtitleLabel.textColor = Design.secondary
@@ -854,7 +880,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
         historySubtitleLabel.stringValue = resolvedHistorySubtitle(hasClearableBytes: canToggleHistory)
 
         // Primary CTA Button
-        let canClean = !busy && hasCompletedScan && selectedBytes > 0 && !selectedScopes.isEmpty
+        let canClean = !busy && hasCompletedScan && lastScanError == nil && selectedBytes > 0 && !selectedScopes.isEmpty
         clearButton.isEnabled = canClean
         let nextClearTitle = (!hasCompletedScan || selectedBytes > 0)
             ? L10n.t("maintenance.simple.btn_clean_now")
@@ -979,7 +1005,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     @objc func clearSelectedCaches() {
-        guard !busy, hasCompletedScan else { return }
+        guard !busy, !confirmDialogOpen, hasCompletedScan, lastScanError == nil else { return }
         dismissDetailPopover()
         syncLiveRunningState()
         let scopesToClear = selectedScopes
@@ -998,16 +1024,23 @@ final class CachePage: NSObject, NSPopoverDelegate {
                 switch preflightRes {
                 case .failure(let error):
                     self.showPreflightBlockedAlert(error.localizedDescription)
-                case .success:
+                case .success(let preflightPayload):
                     let confirm = NSAlert()
                     confirm.alertStyle = .informational
                     confirm.messageText = L10n.t("maintenance.simple.confirm_running_title", ["size": self.formatBytes(targetBytes)])
-                    confirm.informativeText = self.buildRunningClearConfirmationBody()
+                    let sshCount = preflightPayload["activeSshWindowsCount"] as? Int ?? 0
+                    let sshNote = sshCount > 0
+                        ? "\n\n" + L10n.t("ssh.maintenance.active_windows_note", ["count": sshCount])
+                        : ""
+                    confirm.informativeText = self.buildRunningClearConfirmationBody() + sshNote
                     confirm.addButton(withTitle: L10n.t("maintenance.simple.confirm_restart_and_clean"))
                     confirm.addButton(withTitle: L10n.t("common.cancel"))
 
+                    self.confirmDialogOpen = true
                     let handleChoice: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-                        guard let self, response == .alertFirstButtonReturn else { return }
+                        guard let self else { return }
+                        self.confirmDialogOpen = false
+                        guard !self.busy, response == .alertFirstButtonReturn else { return }
                         self.syncLiveRunningState()
                         if self.appRunning {
                             self.quitAntigravityAndSmartClear(scopes: scopesToClear)
@@ -1021,7 +1054,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
                     if let parentWindow, parentWindow.isVisible {
                         confirm.beginSheetModal(for: parentWindow) { handleChoice($0) }
                     } else {
-                        NSApp.activate(ignoringOtherApps: true)
+                        Design.activateApplicationForcingFront()
                         handleChoice(confirm.runModal())
                     }
                 }
@@ -1117,7 +1150,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
     }
 
     @objc func restoreLatestSnapshot() {
-        guard !busy, !latestRestorableSnapshotId.isEmpty else { return }
+        guard !busy, !confirmDialogOpen, !latestRestorableSnapshotId.isEmpty else { return }
         dismissDetailPopover()
         let snapshotId = latestRestorableSnapshotId
         syncLiveRunningState()
@@ -1133,15 +1166,22 @@ final class CachePage: NSObject, NSPopoverDelegate {
                 switch preflightRes {
                 case .failure(let error):
                     self.showPreflightBlockedAlert(error.localizedDescription)
-                case .success:
+                case .success(let preflightPayload):
                     let alert = NSAlert()
                     alert.alertStyle = .informational
                     alert.messageText = L10n.t("maintenance.simple.undo_running_title")
-                    alert.informativeText = L10n.t("maintenance.simple.undo_running_body")
+                    let sshCount = preflightPayload["activeSshWindowsCount"] as? Int ?? 0
+                    let sshNote = sshCount > 0
+                        ? "\n\n" + L10n.t("ssh.maintenance.active_windows_note", ["count": sshCount])
+                        : ""
+                    alert.informativeText = L10n.t("maintenance.simple.undo_running_body") + sshNote
                     alert.addButton(withTitle: L10n.t("maintenance.simple.confirm_restart_and_undo"))
                     alert.addButton(withTitle: L10n.t("common.cancel"))
+                    self.confirmDialogOpen = true
                     let handleRestoreChoice: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-                        guard let self, resp == .alertFirstButtonReturn else { return }
+                        guard let self else { return }
+                        self.confirmDialogOpen = false
+                        guard !self.busy, resp == .alertFirstButtonReturn else { return }
                         self.syncLiveRunningState()
                         if self.appRunning {
                             self.quitAntigravityAndRestore(snapshotId: snapshotId)
@@ -1154,7 +1194,7 @@ final class CachePage: NSObject, NSPopoverDelegate {
                     if let parentWindow, parentWindow.isVisible {
                         alert.beginSheetModal(for: parentWindow) { handleRestoreChoice($0) }
                     } else {
-                        NSApp.activate(ignoringOtherApps: true)
+                        Design.activateApplicationForcingFront()
                         handleRestoreChoice(alert.runModal())
                     }
                 }

@@ -15,6 +15,7 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
 import { createConnection } from "node:net";
 import { promisify } from "node:util";
+import { resolveOpensslBin, sendBackendRpc, stopBackendChild, waitForBackendReady } from "./test-ipc.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,14 +23,15 @@ const execFileAsync = promisify(execFile);
 describeContractGroup("连接与控制 · evolution", { concurrency: false }, async () => {
 test('连接缓存不保留源字符串，同实例复用；文件、进程、版本或来源变化重新计算',async()=>{
   const dir=await mkdtemp(join(tmpdir(),'gravity-cache-'));try{
-    await mkdir(join(dir,'Contents/Resources'),{recursive:true});await writeFile(join(dir,'Contents/Resources/app.asar'),'first');
+    const appDir=join(dir,'Antigravity.app');
+    await mkdir(join(appDir,'Contents/Resources'),{recursive:true});await writeFile(join(appDir,'Contents/Resources/app.asar'),'first');
     let reads=0;const fetcher=async()=>{await new Promise(r=>setTimeout(r,10));return {hash:`hash-${++reads}`,source:'example',bytes:7};};const cache=new BundleCache();
-    const first=await Promise.all([cache.read(dir,1,'2.23.1','http://127.0.0.1:1',fetcher),cache.read(dir,1,'2.23.1','http://127.0.0.1:1',fetcher)]);assert.equal(first.filter(r=>!r.cacheHit).length,1);assert.equal(reads,1);
-    const hit=await cache.read(dir,1,'2.23.1','http://127.0.0.1:1',fetcher);assert.equal(hit.source,undefined);assert.equal(reads,1);
-    await cache.read(dir,2,'2.23.1','http://127.0.0.1:1',fetcher);assert.equal(reads,2);
-    await cache.read(dir,2,'2.24.0','http://127.0.0.1:1',fetcher);assert.equal(reads,3);
-    await cache.read(dir,2,'2.24.0','http://127.0.0.1:2',fetcher);assert.equal(reads,4);
-    await writeFile(join(dir,'Contents/Resources/app.asar'),'changed size');await cache.read(dir,2,'2.24.0','http://127.0.0.1:2',fetcher);assert.equal(reads,5);
+    const first=await Promise.all([cache.read(appDir,1,'2.23.1','http://127.0.0.1:1',fetcher),cache.read(appDir,1,'2.23.1','http://127.0.0.1:1',fetcher)]);assert.equal(first.filter(r=>!r.cacheHit).length,1);assert.equal(reads,1);
+    const hit=await cache.read(appDir,1,'2.23.1','http://127.0.0.1:1',fetcher);assert.equal(hit.source,undefined);assert.equal(reads,1);
+    await cache.read(appDir,2,'2.23.1','http://127.0.0.1:1',fetcher);assert.equal(reads,2);
+    await cache.read(appDir,2,'2.24.0','http://127.0.0.1:1',fetcher);assert.equal(reads,3);
+    await cache.read(appDir,2,'2.24.0','http://127.0.0.1:2',fetcher);assert.equal(reads,4);
+    await writeFile(join(appDir,'Contents/Resources/app.asar'),'changed size');await cache.read(appDir,2,'2.24.0','http://127.0.0.1:2',fetcher);assert.equal(reads,5);
   }finally{await rm(dir,{recursive:true,force:true});}
 });
 test('未知指纹仅使用保守页面策略，受验证版本保留完整规则',()=>{
@@ -44,9 +46,9 @@ describeContractGroup("连接与控制 · optimization-20261022", { concurrency:
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const fixture=async fn=>{const dir=await mkdtemp(join(tmpdir(),'gb-opt-'));try{return await fn(dir);}finally{await rm(dir,{recursive:true,force:true,maxRetries:10,retryDelay:50});}};
 
-async function stop(child){if(!child||child.exitCode!==null)return;child.kill('SIGTERM');await Promise.race([once(child,'exit'),pause(3000)]);if(child.exitCode===null){child.kill('SIGKILL');await once(child,'exit');}}
-const rpc=(dir,p)=>new Promise((resolve,reject)=>{const s=createConnection(join(dir,'control.sock'));let b='';s.on('error',reject);s.on('connect',()=>s.write(JSON.stringify(p)+'\n'));s.setTimeout(10000,()=>{s.destroy();reject(new Error('timeout'));});s.on('data',c=>{b+=c;if(b.includes('\n')){s.end();resolve(JSON.parse(b.split('\n')[0]));}});});
-async function ready(dir){for(let i=0;i<300;i++){try{await access(join(dir,'control.sock'));await new Promise((res,rej)=>{const s=createConnection(join(dir,'control.sock'));s.once('connect',()=>{s.destroy();res();});s.once('error',rej);});return;}catch{}await pause(20);}throw Error('backend not ready');}
+const stop=(child)=>stopBackendChild(child);
+const rpc=(dir,p)=>sendBackendRpc(dir,p);
+const ready=(dir)=>waitForBackendReady(dir);
 
 test('已暂停的汉化在重新启动时保持暂停，不为更新自动注入目标应用',()=>fixture(async dir=>{
  await writeFile(join(dir,'runtime-preferences.json'),JSON.stringify({translationEnabled:false,hudEnabled:false}));
@@ -142,6 +144,7 @@ function createMockCdpBrowserServer(pageUrl, dictVersion) {
       `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     sockets.add(socket);
+    socket.on('error', () => {});
     const targetUrl = req.url || '';
     let buf = Buffer.alloc(0);
     socket.on('data', (chunk) => {
@@ -227,7 +230,7 @@ describeContractGroup("连接与控制 · debug-port-missing", { concurrency: fa
     await writeFile(join(fakeAppDir, 'Contents/Resources/app.asar'), 'mock-asar');
     const keyPath = join(profileDir, 'mock-key.pem');
     const certPath = join(profileDir, 'mock-cert.pem');
-    await execFileAsync('/usr/bin/openssl', [
+    await execFileAsync(resolveOpensslBin(), [
       'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
       '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=127.0.0.1',
     ]);
@@ -428,6 +431,57 @@ describeContractGroup("连接与控制 · debug-port-missing", { concurrency: fa
     assert.equal(mockSession.bootedConservative, false, '重载后不得降级为 conservative 模式');
     assert.equal(updateCalls, 1, '保持全量翻译时应热更新词典而非销毁重建为保守模式');
     assert.equal(lastBootSource, '', '未切换保守模式时不应触发重引导降级');
+  });
+
+  test('P1-47: probeRemoteSessions 遇到 RPC 异常时复位 probing 不中断批次；maintenancePreflight 容错已关页', async () => {
+    const mockEndpoint = { port: 19222, pid: process.pid, browserURL: 'ws://127.0.0.1:19222', appVersion: '2.34.0', legacyPatch: false };
+    const ctrl = new Controller({
+      appPath: '/Applications/Antigravity.app',
+      profile: '/tmp/gb-p1-47-profile',
+      dictionary: dictionaryFromEntries({ Settings: '设置' }),
+      discoverEndpoint: async () => mockEndpoint,
+      onStatus: () => {},
+    });
+
+    let maintenanceEvalCalls = 0;
+    const throwingSession = {
+      targetId: 'ssh-page-1',
+      url: 'https://127.0.0.1:19001/c/_new',
+      contextId: 11,
+      sourceKind: 'remote',
+      remoteKey: 'remote-err-1',
+      environmentId: 'ssh:err-host',
+      hostLabel: 'err-host',
+      detaching: false,
+      lastFocusedAt: Date.now(),
+      rpcClient: {
+        probeUserAndQuota: async () => {
+          throw new Error('synthetic rpc transport crash');
+        },
+      },
+      cdp: {
+        evaluate: async (expr) => {
+          if (String(expr).includes('maintenanceState')) {
+            maintenanceEvalCalls += 1;
+            throw new Error('target closed');
+          }
+          return { busy: false, checked: true };
+        },
+      },
+    };
+    ctrl.pages.set('ssh-page-1', throwingSession);
+
+    const snapshots = await ctrl.probeRemoteSessions({ force: true });
+    assert.equal(snapshots.length, 1);
+    assert.equal(snapshots[0].probing, false, 'RPC 抛错后 probing 必须复位为 false');
+    assert.equal(snapshots[0].lastError, 'rpc_error');
+
+    // maintenancePreflight: 真正进入逐页 maintenanceState 校验并容错已关闭页面抛错
+    ctrl.endpoint = mockEndpoint;
+    const preflight = await ctrl.maintenancePreflight();
+    assert.equal(preflight.ok, true);
+    assert.equal(preflight.pid, process.pid);
+    assert.equal(maintenanceEvalCalls, 1, '必须实际调用 maintenanceState 并容错抛错');
   });
 });
 

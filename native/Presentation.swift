@@ -270,6 +270,57 @@ enum InterfaceText {
     }
 }
 
+enum UsageMetricsPresentation {
+    struct CostSummary {
+        let displayUnpricedCount: Int
+        let effectiveUnpricedCount: Int
+        let isAllUnpriced: Bool
+        let isPartialCost: Bool
+    }
+
+    /// 统一模型行是否已完整计价的判定：缺 `priced` 字段时统一回退为 `estimatedUsd > 0`。
+    static func isModelRowPriced(_ row: [String: Any]) -> Bool {
+        if let priced = row["priced"] as? Bool {
+            return priced
+        }
+        let usd: Double
+        if let n = row["estimatedUsd"] as? NSNumber { usd = n.doubleValue }
+        else if let n = row["estimated_usd"] as? NSNumber { usd = n.doubleValue }
+        else if let s = row["estimatedUsd"] as? String, let v = Double(s) { usd = v }
+        else if let s = row["estimated_usd"] as? String, let v = Double(s) { usd = v }
+        else { usd = 0 }
+        return usd > 0
+    }
+
+    /// 统一缓存命中率文案：分母 <= 0 时统一展示 `"—"`，其余按一位小数百分比展示。
+    static func formatCacheHitRate(denom: Int, cacheHitRate: Double) -> String {
+        guard denom > 0, cacheHitRate.isFinite else { return "—" }
+        return String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), cacheHitRate)
+    }
+
+    /// 统一菜单栏与主应用用量页的费用未计价/部分计价口径（基于折叠后的模型列表）。
+    static func evaluateCost(
+        foldedModels: [[String: Any]],
+        pricedCount: Int,
+        unpricedCount: Int,
+        usd: Double
+    ) -> CostSummary {
+        let displayUnpricedCount = foldedModels.isEmpty
+            ? unpricedCount
+            : foldedModels.filter { !isModelRowPriced($0) }.count
+        let effectiveUnpricedCount = max(displayUnpricedCount, unpricedCount > 0 && foldedModels.isEmpty ? unpricedCount : 0)
+        let hasUnpriced = unpricedCount > 0 || displayUnpricedCount > 0
+        let isAllUnpriced = hasUnpriced && pricedCount == 0 && usd == 0
+        let isPartialCost = hasUnpriced && !isAllUnpriced
+        return CostSummary(
+            displayUnpricedCount: displayUnpricedCount,
+            effectiveUnpricedCount: effectiveUnpricedCount,
+            isAllUnpriced: isAllUnpriced,
+            isPartialCost: isPartialCost
+        )
+    }
+}
+
 enum ModelUsageFold {
     private static let thinkingSuffixRegex = try? NSRegularExpression(
         pattern: "(?:-(?:tiered|extra-high|extra-low|xhigh|extra|high|medium|low|minimal|thinking|max))+$",

@@ -253,3 +253,56 @@ test('check-docs CLI：差异 exit 1，一致 exit 0，--json 可解析', async 
     assert.match(sourceOnlyRun.stdout, /发现 0 处不一致/);
   } finally { await cleanup([consistent.root, stale.root]); }
 });
+
+test('P1-28: 分离 unit total/passed/skipped/fail 计数，且重编 DMG 后将旧人工验收标为 stale 并阻断 checkDocs', async () => {
+  const { root, dmg, installedApp, accountsPath } = await makeFixture();
+  try {
+    // 1) skipped 与 fail 分离统计：10 tests, 8 pass, 1 skipped, 1 fail
+    const reportDir = join(root, '质检报告', '0.9.0-改造验收');
+    await writeFile(join(reportDir, '单元与集成.log'), '# tests 10\n# pass 8\n# fail 1\n# cancelled 0\n# skipped 1\n# duration_ms 100.0\n');
+    const collected = await collectAcceptance({ root, installedApp, stagingApp: join(root, 'none'), signatureProbe: FAKE_SIGNATURE });
+    assert.equal(collected.automated.unitIntegrationTotal, 10);
+    assert.equal(collected.automated.unitIntegrationPassed, 8, 'passed 不能虚报为 total=10');
+    assert.equal(collected.automated.unitIntegrationSkipped, 1);
+    assert.equal(collected.automated.unitIntegrationFailed, 1);
+
+    // checkDocs 对 fail>0 及 passed != pass 报错
+    const summaryPath = join(root, '文档/当前版本验收摘要.json');
+    const badSummary = JSON.parse(await readFile(summaryPath, 'utf8'));
+    badSummary.automated.unitIntegrationPassed = 10;
+    await writeJson(summaryPath, badSummary);
+    const failRes = await checkDocs({
+      root,
+      installedApp,
+      accountsPath,
+      facts: { ...await collectDocFacts({ root, installedApp, accountsPath }), digest: DIGEST, verifiedDigest: DIGEST },
+    });
+    const failCodes = new Set(failRes.issues.map(i => i.code));
+    assert.ok(failCodes.has('SUMMARY_UNIT_COUNT_MISMATCH'));
+    assert.ok(failCodes.has('SUMMARY_UNIT_FAILED'));
+
+    // 2) 重编 DMG 后，updateAcceptance 保留原 manualAcceptanceDmgSHA256 并把 manualAcceptanceStatus 标为 stale
+    await writeFile(join(reportDir, '单元与集成.log'), '# tests 12\n# pass 12\n# fail 0\n# cancelled 0\n# skipped 0\n# duration_ms 100.0\n');
+    const cleanFixture = await makeFixture();
+    try {
+      const cleanSummaryPath = join(cleanFixture.root, '文档/当前版本验收摘要.json');
+      const oldHash = cleanFixture.dmgSHA256;
+      await writeFile(cleanFixture.dmg, 'rebuilt-dmg-bytes-v2');
+      const rebuilt = await updateAcceptance({ root: cleanFixture.root, out: cleanSummaryPath, dryRun: false, installedApp: cleanFixture.installedApp, stagingApp: join(cleanFixture.root, 'none'), signatureProbe: FAKE_SIGNATURE });
+      assert.equal(rebuilt.summary.manualAcceptanceDmgSHA256, oldHash);
+      assert.equal(rebuilt.summary.manualAcceptanceStatus, 'stale');
+      assert.ok(rebuilt.warnings.some(w => w.includes('stale')));
+
+      const staleManualCheck = await checkDocs({
+        root: cleanFixture.root,
+        installedApp: cleanFixture.installedApp,
+        accountsPath: cleanFixture.accountsPath,
+        facts: { ...await collectDocFacts({ root: cleanFixture.root, installedApp: cleanFixture.installedApp, accountsPath: cleanFixture.accountsPath }), digest: DIGEST, verifiedDigest: DIGEST },
+      });
+      assert.equal(staleManualCheck.ok, false);
+      assert.ok(staleManualCheck.issues.some(i => i.code === 'SUMMARY_MANUAL_ACCEPTANCE_STALE'));
+    } finally {
+      await cleanup([cleanFixture.root]);
+    }
+  } finally { await cleanup([root]); }
+});

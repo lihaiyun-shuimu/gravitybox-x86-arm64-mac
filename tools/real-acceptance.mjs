@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { CDP } from '../dist/cdp.js';
-import { discover, allowedTarget, verifyPageService } from '../dist/discovery.js';
+import { discover, allowedTarget, inspectPageService } from '../dist/discovery.js';
+import { verifyRemotePageWindow, sanitizeHostLabel } from '../dist/ssh-context.js';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const phase = process.argv[2] ?? 'sample'; if (!/^[A-Za-z0-9-]+$/.test(phase)) throw new Error('Invalid phase');
 const sampleCount = Math.min(11, Math.max(1, Number(process.argv[3]) || 1));
@@ -14,19 +15,82 @@ const baseline=baselineIndex<0?null:JSON.parse(await readFile(process.argv[basel
 const app = '/Applications/Antigravity.app', profile = join(homedir(), 'Library/Application Support/Antigravity');
 const endpoint = await discover(app, profile); if (!endpoint) throw new Error('应用未运行');
 const targets = await (await fetch(`http://127.0.0.1:${endpoint.port}/json/list`)).json();
+const browserContextByTargetId = new Map();
+if (endpoint.browserURL) {
+  let browserCdp = null;
+  try {
+    browserCdp = new CDP(endpoint.browserURL);
+    await browserCdp.connect();
+    const res = await browserCdp.send('Target.getTargets');
+    for (const info of res?.targetInfos ?? []) {
+      if (info?.targetId && info?.browserContextId) {
+        browserContextByTargetId.set(info.targetId, info.browserContextId);
+      }
+    }
+  } catch {
+    // 浏览器级 context 枚举失败不阻断只读采样主流程
+  } finally {
+    try { browserCdp?.close(); } catch {}
+  }
+}
+const inspectedTargets = [];
+const localBrowserContextIds = new Set();
+for (const target of targets.filter(t => allowedTarget(t))) {
+  const kind = await inspectPageService(target.url, app);
+  const browserContextId = browserContextByTargetId.get(target.id);
+  if (kind === 'local' && browserContextId) {
+    localBrowserContextIds.add(browserContextId);
+  }
+  inspectedTargets.push({ target, kind, browserContextId });
+}
 const clients = [];
 try {
-  for (const target of targets.filter(t => allowedTarget(t))) {
-    if (!await verifyPageService(target.url, app)) continue;
-    const cdp = new CDP(target.webSocketDebuggerUrl); await cdp.connect();
-    const tree = await cdp.send('Page.getFrameTree'); const context = await cdp.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
-    clients.push({ cdp, id: target.id, contextId: context.executionContextId });
+  for (const { target, kind, browserContextId } of inspectedTargets) {
+    if (kind === 'local') {
+      const cdp = new CDP(target.webSocketDebuggerUrl); await cdp.connect();
+      const tree = await cdp.send('Page.getFrameTree'); const context = await cdp.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
+      clients.push({ cdp, id: target.id, contextId: context.executionContextId, sourceKind: 'local', hostLabel: null });
+    } else if (kind === 'unlisted') {
+      const cdp = new CDP(target.webSocketDebuggerUrl);
+      let connected = false;
+      let accepted = false;
+      try {
+        await cdp.connect();
+        connected = true;
+        const verification = await verifyRemotePageWindow({
+          appVersion: endpoint.appVersion,
+          antigravityPid: endpoint.pid,
+          url: target.url,
+          cdp,
+          browserContextId,
+          localBrowserContextIds,
+        });
+        if (verification.status === 'verified') {
+          const tree = await cdp.send('Page.getFrameTree');
+          const context = await cdp.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
+          clients.push({
+            cdp,
+            id: target.id,
+            contextId: context.executionContextId,
+            sourceKind: 'remote',
+            hostLabel: sanitizeHostLabel(verification.identity.hostLabel) || null,
+          });
+          accepted = true;
+        }
+      } catch {
+        // 未验证或连接异常的 unlisted 页面静默跳过
+      } finally {
+        if (connected && !accepted) {
+          try { cdp.close(); } catch {}
+        }
+      }
+    }
   }
   if(!clients.length)throw new Error('无可验证页面，实机采样未完成；不能将空采样视为通过');
   const snapshots = [];
   for (let sample = 0; sample < sampleCount; sample++) {
     const pages = [];
-    for (const { cdp, id, contextId } of clients) {
+    for (const { cdp, id, contextId, sourceKind, hostLabel } of clients) {
       const values = await cdp.evaluate(`(async () => {
         const selectors = { editable: 'input,textarea,[contenteditable="true"]', titles:'[data-testid="conversation-row-sidebar"] span.truncate', content:'.markdown,.prose,[data-testid="planner-response-text"],[data-testid="user-input-step"]', codePreview:'.font-mono[style*="white-space"]' };
         const hashes = {};
@@ -42,7 +106,7 @@ try {
         return { protectedHashes: hashes, visibleSettings:!!settings, visibleUntranslatedKeys, validationLabels: labels.filter(v => v === '设置（验收）').length, chineseButtons: Array.from(document.querySelectorAll('button')).filter(e => /[\\u3400-\\u9fff]/.test(e.textContent)).length, style: !!document.getElementById('__gravitybox_micro_patch__') };
       })()`);
       const engine = await cdp.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__?.state() ?? null', contextId);
-      pages.push({ id, ...values, engine });
+      pages.push({ id, sourceKind, hostLabel, ...values, engine });
     }
     snapshots.push({ at: new Date().toISOString(), pages });
     if (sample + 1 < sampleCount) await new Promise(resolve => setTimeout(resolve, 1000));

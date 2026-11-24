@@ -20,6 +20,7 @@ final class CacheCompositionBar: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.progressIndicator)
         setAccessibilityLabel(L10n.t("maintenance.composition_a11y"))
+        syncAccessibilityValue()
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -28,7 +29,18 @@ final class CacheCompositionBar: NSView {
         motion.cancel()
     }
 
+    private func syncAccessibilityValue() {
+        let total = safeBytes + statefulBytes + protectedBytes
+        guard total > 0 else {
+            setAccessibilityValue("0%")
+            return
+        }
+        let clearablePercent = min(100, max(0, Int(round(Double(safeBytes + statefulBytes) / Double(total) * 100.0))))
+        setAccessibilityValue("\(clearablePercent)%")
+    }
+
     private func animateFractions() {
+        syncAccessibilityValue()
         let total = max(1, safeBytes + statefulBytes + protectedBytes)
         let targetSafe = safeBytes > 0 ? CGFloat(safeBytes) / CGFloat(total) : 0
         let targetStateful = statefulBytes > 0 ? CGFloat(statefulBytes) / CGFloat(total) : 0
@@ -115,6 +127,7 @@ final class CacheCompositionBar: NSView {
 // MARK: - Subtle HIG Info Disclosure Button & Zero-Inset Interactive Trigger Group
 final class MaintenanceInfoButton: NSButton {
     override var allowsVibrancy: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     var isActivePopover: Bool = false {
         didSet {
             if oldValue != isActivePopover { applyTint() }
@@ -138,7 +151,7 @@ final class MaintenanceInfoButton: NSButton {
         imagePosition = .imageOnly
         isBordered = false
         bezelStyle = .inline
-        focusRingType = .none
+        focusRingType = .exterior
         toolTip = nil
         setButtonType(.momentaryChange)
         image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil)
@@ -182,6 +195,12 @@ final class MaintenanceInfoButton: NSButton {
         if window == nil { hovered = false }
     }
 
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(ovalIn: bounds).fill()
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .pointingHand)
@@ -212,6 +231,7 @@ final class MaintenanceInteractiveGroup: NSView {
     init(content: NSView, accessibilityLabel: String, onActivate: ((NSView) -> Void)? = nil) {
         self.onActivate = onActivate
         super.init(frame: .zero)
+        focusRingType = .exterior
         translatesAutoresizingMaskIntoConstraints = false
         toolTip = nil
         addSubview(content)
@@ -235,6 +255,18 @@ final class MaintenanceInteractiveGroup: NSView {
 
     func performClick(_ sender: Any? = nil) {
         onActivate?(self)
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard !isHiddenOrHasHiddenAncestor, let onActivate else { return false }
+        onActivate(self)
+        return true
+    }
+
+    override var focusRingMaskBounds: NSRect { bounds }
+
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {

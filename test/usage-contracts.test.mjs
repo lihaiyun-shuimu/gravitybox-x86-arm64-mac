@@ -9,8 +9,7 @@ import { UsageStatsManager } from "../dist/usage.js";
 import { ProtobufWriter as W, ProtobufWriter, ProtobufReader } from "../dist/protobuf.js";
 import { matchPricingKeys, DEFAULT_API_PRICES, calculateEstimatedUsd } from "../dist/pricing.js";
 import { SqliteReadSnapshot } from "../dist/sqlite-read.js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+const execSql = (dbPath, sql) => { const d = new DatabaseSync(dbPath); try { d.exec(sql); } finally { d.close(); } };
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("用量与历史 · optimization-20261022", { concurrency: false }, async () => {
@@ -83,7 +82,6 @@ test('今日统计与明细采用自然日半开边界，未来一日不能归�
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("用量与历史 · phase1-credibility", { concurrency: false }, async () => {
-const execFileAsync = promisify(execFile);
 
 test('A03: 未知模型禁止套用默认价计费，统计未计价覆盖率', async () => {
   const sandbox = await mkdtemp(join(tmpdir(), 'gb-test-a03-'));
@@ -94,11 +92,11 @@ test('A03: 未知模型禁止套用默认价计费，统计未计价覆盖率', 
 
     // 构造测试 SQLite 数据库，包含一个未知模型和一个已知模型
     const dbPath = join(convDir, 'test_unknown_pricing.db');
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);`,
-    ]);
+    );
 
     // 构造已知模型 gemini-3.8-flash: 1000 in, 500 out, 100 cached
     const knownUsage = Buffer.concat([
@@ -125,11 +123,11 @@ test('A03: 未知模型禁止套用默认价计费，统计未计价覆盖率', 
     ]);
     const unknownBlob = ProtobufWriter.encodeField(1, 2, unknownWrapped);
 
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `INSERT INTO gen_metadata (idx, data) VALUES (1, x'${knownBlob.toString('hex')}');
        INSERT INTO gen_metadata (idx, data) VALUES (2, x'${unknownBlob.toString('hex')}');`,
-    ]);
+    );
 
     const mgr = new UsageStatsManager({ geminiDir });
     const summary = await mgr.getUsageSummary(true);
@@ -158,7 +156,7 @@ test('A04: 准确披露扫描范围与抽样上限 (杜绝隐藏 30 库上限自
     // 创建 35 个合法的空 SQLite 数据库
     for (let i = 1; i <= 35; i++) {
       const p = join(convDir, `conv_${String(i).padStart(3, '0')}.db`);
-      await execFileAsync('/usr/bin/sqlite3', [p, 'CREATE TABLE dummy (id INT);']);
+      execSql(p, 'CREATE TABLE dummy (id INT);');
     }
 
     const mgr = new UsageStatsManager({ geminiDir });
@@ -184,11 +182,11 @@ test('A05: 缺失时间戳保持为 0，不污染今日消耗与每小时分布'
     await mkdir(convDir, { recursive: true });
 
     const dbPath = join(convDir, 'zero_timestamp.db');
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);`,
-    ]);
+    );
 
     // 构造一个完全没有 timing 且 steps 无对应时间戳的记录 (100,000 tokens)
     const usage = Buffer.concat([
@@ -201,10 +199,10 @@ test('A05: 缺失时间戳保持为 0，不污染今日消耗与每小时分布'
     ]);
     const blob = ProtobufWriter.encodeField(1, 2, wrapped);
 
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `INSERT INTO gen_metadata (idx, data) VALUES (1, x'${blob.toString('hex')}');`,
-    ]);
+    );
 
     const mgr = new UsageStatsManager({ geminiDir });
     const scanResult = await mgr.scanDatabaseEvents(dbPath);
@@ -227,7 +225,6 @@ test('A05: 缺失时间戳保持为 0，不污染今日消耗与每小时分布'
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("用量与历史 · phase1-r-credibility", { concurrency: false }, async () => {
-const execFileAsync = promisify(execFile);
 
 test('R08: by_model 返回显式 priced: boolean 并区分近零计价与未计价', async () => {
   const sandbox = await mkdtemp(join(tmpdir(), 'gb-r08-test-'));
@@ -237,11 +234,11 @@ test('R08: by_model 返回显式 priced: boolean 并区分近零计价与未计�
     await mkdir(convDir, { recursive: true });
 
     const dbPath = join(convDir, 'test_pricing.db');
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);
        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);`,
-    ]);
+    );
 
     const nowSec = Math.floor(Date.now() / 1000);
     const innerTiming = ProtobufWriter.encodeField(1, 0, ProtobufWriter.encodeVarint(nowSec));
@@ -271,10 +268,10 @@ test('R08: by_model 返回显式 priced: boolean 并区分近零计价与未计�
     ]);
     const blobUnpriced = ProtobufWriter.encodeField(1, 2, wrappedUnpriced);
 
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbPath,
       `INSERT INTO gen_metadata (idx, data) VALUES (1, x'${blobPriced.toString('hex')}'), (2, x'${blobUnpriced.toString('hex')}');`,
-    ]);
+    );
 
     const uMgr = new UsageStatsManager({ stateDir: sandbox, geminiDir });
     const summary = await uMgr.getUsageSummary(true);
@@ -395,7 +392,10 @@ test('请求明细：本地自然日边界、搜索、倒序分页、未知时�
   assert.equal(unknown.rows[0].timestamp_seconds,0);
   assert.equal(unknown.rows[0].estimated_usd,null);
   assert.equal(unknown.rows[0].priced,false);
-  assert.deepEqual(Object.keys(unknown.rows[0]).sort(),['model','input_tokens','output_tokens','cached_tokens','total_tokens','timestamp_seconds','estimated_usd','priced'].sort());
+  assert.deepEqual(Object.keys(unknown.rows[0]).sort(),['model','input_tokens','output_tokens','cached_tokens','total_tokens','timestamp_seconds','estimated_usd','priced','environment_kind','environment_id','environment_label','account_email','account_confidence'].sort());
+  assert.equal(unknown.rows[0].environment_kind,'local');
+  assert.equal(unknown.rows[0].environment_id,'local');
+  assert.equal(unknown.rows[0].environment_label,'');
   assert.equal((await manager.getUsageEvents('today','custom')).total,0);
 });
 });
@@ -410,7 +410,6 @@ test('明细固定快照分页，跨午夜摘要失效但既有导出快照可�
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("用量与历史 · v090-engines", { concurrency: false }, async () => {
-const execFileAsync = promisify(execFile);
 
 // -------------------------------------------------------------
 // 2. UsageStatsManager 单元测试
@@ -458,13 +457,12 @@ test('UsageStatsManager: Protobuf 解码、SQLite 扫描与 API 价格估算', a
     const genBlob = ProtobufWriter.encodeLengthDelimited(1, wrapped);
     const hexBlob = genBlob.toString('hex');
 
-    // 使用系统 sqlite3 创建表并插入模拟生成记录
     const sqlInit = `
       CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
       CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
       INSERT INTO gen_metadata (idx, data) VALUES (1, X'${hexBlob}');
     `;
-    await execFileAsync('/usr/bin/sqlite3', [dbPath, sqlInit]);
+    execSql(dbPath, sqlInit);
 
     // 运行 UsageStatsManager
     const usageMgr = new UsageStatsManager({ geminiDir: sandbox, stateDir: sandbox });
@@ -493,12 +491,12 @@ test('UsageStatsManager: Protobuf 解码、SQLite 扫描与 API 价格估算', a
       field9,
     ]);
     const hexFull = ProtobufWriter.encodeLengthDelimited(1, wrappedFull).toString('hex');
-    await execFileAsync('/usr/bin/sqlite3', [
+    execSql(
       dbFull,
       `CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB, status INTEGER, step_payload BLOB);
        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
        INSERT INTO gen_metadata (idx, data) VALUES (1, X'${hexFull}');`,
-    ]);
+    );
     const summaryFull = await usageMgr.getUsageSummary(true);
     assert.ok(summaryFull.today.by_model.some(m => m.model === 'gemini-3.8-flash-n' && m.priced === true));
 

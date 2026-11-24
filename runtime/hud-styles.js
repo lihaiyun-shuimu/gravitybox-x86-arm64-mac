@@ -85,7 +85,7 @@ export const HUD_STYLES_CSS = `
   --hud-seg-shadow-hover: 0 1px 3px rgba(0, 0, 0, 0.35);
   --hud-text-primary: #F4F4F6;
   --hud-text-secondary: #A1A1AA;
-  --hud-text-muted: #71717A;
+  --hud-text-muted: #8E8E98;
   --hud-popover-bg: #16171B;
   --hud-popover-border: rgba(255, 255, 255, 0.10);
   --hud-popover-shadow: 0 16px 40px -6px rgba(0, 0, 0, 0.60), 0 6px 16px rgba(0, 0, 0, 0.40);
@@ -1080,16 +1080,6 @@ export const HUD_STYLES_CSS = `
   font-weight: 600;
   color: var(--hud-text-muted);
   margin-bottom: 6px;
-  line-height: 1.2;
-}
-
-.hud-ctx-history-title {
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--hud-text-muted);
-  margin-top: 4px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--hud-divider);
   line-height: 1.2;
 }
 

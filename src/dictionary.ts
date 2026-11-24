@@ -1,6 +1,6 @@
 import {withProcessLease} from './process-lock.js';
 import {decodeScopedKey} from './candidates.js';
-import { access, readFile, readdir, rename, lstat } from 'node:fs/promises';
+import { access, mkdir, readFile, readdir, rename, lstat } from 'node:fs/promises';
 import { watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -205,52 +205,57 @@ export async function removeIncrementalEntries(userDir: string, keys: string[], 
     if (typeof key !== 'string' || !key.trim()) throw new Error(bt('dictionary.err.remove_empty_key'));
     return normalize(key);
   }))];
-  const file = incrementalDictionaryPath(userDir);
-  const current = await readIncremental(userDir);
-  if (options.expectedDigest !== undefined) {
-    const currentDigest = current?.digest ?? textDigest('');
-    if (options.expectedDigest !== currentDigest) throw new Error(bt('dictionary.err.incremental_modified'));
-  }
-  const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
-  const removed: string[] = [];
-  const missing: string[] = [];
-  const removedEntries: Record<string, string> = Object.create(null);
-  for (const key of targets) {
-    if (!Object.hasOwn(entries, key)) { missing.push(key); continue; }
-    removedEntries[key] = entries[key]!;
-    delete entries[key];
-    removed.push(key);
-  }
-  const digest = textDigest(serialized(entries));
-  const write = !options.dryRun && removed.length > 0;
-  if (write && options.snapshotPath) {
-    const snapshot: IncrementalSnapshot = { schema: 1, at: new Date().toISOString(), ...(options.batchId ? { batchId: options.batchId } : {}), file, removed: removedEntries };
-    await atomicJson(options.snapshotPath, snapshot);
-  }
-  if (write) {
-    await atomicJson(file, sortedEntries(entries));
-    const writtenRaw = await readFile(file, 'utf8');
-    let checkBack: Record<string, string>;
-    try {
-      checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.incremental_write_check'));
-    } catch (error) {
-      throw new Error(bt('dictionary.err.write_check_failed', { error: (error as Error).message }));
+  const execute = async (): Promise<IncrementalRemoval> => {
+    const file = incrementalDictionaryPath(userDir);
+    const current = await readIncremental(userDir);
+    if (options.expectedDigest !== undefined) {
+      const currentDigest = current?.digest ?? textDigest('');
+      if (options.expectedDigest !== currentDigest) throw new Error(bt('dictionary.err.incremental_modified'));
     }
-    if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== digest) {
-      throw new Error(bt('dictionary.err.write_mismatch'));
+    const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
+    const removed: string[] = [];
+    const missing: string[] = [];
+    const removedEntries: Record<string, string> = Object.create(null);
+    for (const key of targets) {
+      if (!Object.hasOwn(entries, key)) { missing.push(key); continue; }
+      removedEntries[key] = entries[key]!;
+      delete entries[key];
+      removed.push(key);
     }
-    for (const key of removed) if (Object.hasOwn(checkBack, key)) throw new Error(bt('dictionary.err.still_present', { key }));
-  }
-  return {
-    ok: true,
-    file,
-    removed,
-    missing,
-    remaining: Object.keys(entries).length,
-    digest,
-    dryRun: !!options.dryRun,
-    ...(write && options.snapshotPath ? { snapshot: { path: options.snapshotPath, ...(options.batchId ? { batchId: options.batchId } : {}) } } : {}),
+    const digest = textDigest(serialized(entries));
+    const write = !options.dryRun && removed.length > 0;
+    if (write && options.snapshotPath) {
+      const snapshot: IncrementalSnapshot = { schema: 1, at: new Date().toISOString(), ...(options.batchId ? { batchId: options.batchId } : {}), file, removed: removedEntries };
+      await atomicJson(options.snapshotPath, snapshot);
+    }
+    if (write) {
+      await atomicJson(file, sortedEntries(entries));
+      const writtenRaw = await readFile(file, 'utf8');
+      let checkBack: Record<string, string>;
+      try {
+        checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.incremental_write_check'));
+      } catch (error) {
+        throw new Error(bt('dictionary.err.write_check_failed', { error: (error as Error).message }));
+      }
+      if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== digest) {
+        throw new Error(bt('dictionary.err.write_mismatch'));
+      }
+      for (const key of removed) if (Object.hasOwn(checkBack, key)) throw new Error(bt('dictionary.err.still_present', { key }));
+    }
+    return {
+      ok: true,
+      file,
+      removed,
+      missing,
+      remaining: Object.keys(entries).length,
+      digest,
+      dryRun: !!options.dryRun,
+      ...(write && options.snapshotPath ? { snapshot: { path: options.snapshotPath, ...(options.batchId ? { batchId: options.batchId } : {}) } } : {}),
+    };
   };
+  const dirExists = await lstat(userDir).then(st => st.isDirectory()).catch(() => false);
+  if (!dirExists) return execute();
+  return withProcessLease(join(userDir, 'incremental-write.lock'), execute);
 }
 
 /** 按补译批次删除：批次 = 一组 key + 可选批次标识，等价于带 batchId 的 removeIncrementalEntries。 */
@@ -277,24 +282,27 @@ export async function restoreIncrementalSnapshot(
     throw new Error(bt('dictionary.err.undo_invalid', { error: (error as Error).message }));
   }
   const incoming = validateEntries(snapshot.removed, bt('dictionary.label.undo_snapshot'));
-  const current = await readIncremental(userDir);
-  const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
-  const restored: string[] = [];
-  const skipped: string[] = [];
-  for (const [key, value] of Object.entries(incoming)) {
-    if (Object.hasOwn(entries, key) && entries[key] !== value && options.overwriteExisting === false) { skipped.push(key); continue; }
-    entries[key] = value;
-    restored.push(key);
-  }
-  if (restored.length) {
-    await atomicJson(incrementalDictionaryPath(userDir), sortedEntries(entries));
-    const writtenRaw = await readFile(incrementalDictionaryPath(userDir), 'utf8');
-    const checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.undo_check'));
-    if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== textDigest(serialized(entries))) {
-      throw new Error(bt('dictionary.err.undo_write_mismatch'));
+  await mkdir(userDir, { recursive: true, mode: 0o700 });
+  return withProcessLease(join(userDir, 'incremental-write.lock'), async () => {
+    const current = await readIncremental(userDir);
+    const entries: Record<string, string> = current ? { ...current.entries } : (Object.create(null) as Record<string, string>);
+    const restored: string[] = [];
+    const skipped: string[] = [];
+    for (const [key, value] of Object.entries(incoming)) {
+      if (Object.hasOwn(entries, key) && entries[key] !== value && options.overwriteExisting === false) { skipped.push(key); continue; }
+      entries[key] = value;
+      restored.push(key);
     }
-  }
-  return { restored: restored.sort(), skipped: skipped.sort(), remaining: Object.keys(entries).length };
+    if (restored.length) {
+      await atomicJson(incrementalDictionaryPath(userDir), sortedEntries(entries));
+      const writtenRaw = await readFile(incrementalDictionaryPath(userDir), 'utf8');
+      const checkBack = validateEntries(JSON.parse(writtenRaw), bt('dictionary.label.undo_check'));
+      if (Object.keys(checkBack).length !== Object.keys(entries).length || textDigest(writtenRaw) !== textDigest(serialized(entries))) {
+        throw new Error(bt('dictionary.err.undo_write_mismatch'));
+      }
+    }
+    return { restored: restored.sort(), skipped: skipped.sort(), remaining: Object.keys(entries).length };
+  });
 }
 
 /**
@@ -406,6 +414,7 @@ export function validateTemplateRules(data: unknown): DeclarativeTemplateRule[] 
     if (!key || key.length > 240 || !pattern || pattern.length > 320 || !pattern.startsWith('^') || !replacement || replacement.length > 400) continue;
     if (!/^[iu]*$/.test(flags)) continue;
     if (hasNestedQuantifiedGroup(pattern) || /(\([^)]*[+*][^)]*\))[+*?]/.test(pattern)) continue;
+    if (!/\{\d+\}/.test(key) && candidate.inlineOnly !== true && /\{\d+\}/.test(replacement)) continue;
     try {
       new RegExp(pattern, flags);
       out.push({
@@ -602,12 +611,32 @@ export class DictionaryStore extends EventEmitter {
   }
   private chain: Promise<void> = Promise.resolve();
   private sourceLocale = getActiveLocale();
+  private started = false;
   constructor(baseDir: string, readonly userDir?: string) { super(); this.baseDir = baseDir; }
+  private setupWatchers(): void {
+    for (const watcher of this.watchers) {
+      try { watcher.close(); } catch {}
+    }
+    this.watchers = [];
+    if (this.closed) return;
+    for (const dir of (this.userDir ? [this.baseDir, this.userDir] : [this.baseDir])) {
+      const watcher = watch(dir, () => {
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => void this.reload(), 150);
+      });
+      watcher.on('error', () => this.emit('invalid', bt('dictionary.err.watcher_failed')));
+      this.watchers.push(watcher);
+    }
+  }
   async setBaseDir(nextBaseDir: string): Promise<void> {
     const activeLocale = getActiveLocale();
-    if (nextBaseDir === this.baseDir && activeLocale === this.sourceLocale) return;
+    const dirChanged = nextBaseDir !== this.baseDir;
+    if (!dirChanged && activeLocale === this.sourceLocale) return;
     this.baseDir = nextBaseDir;
     this.sourceLocale = activeLocale;
+    if (dirChanged && this.started && !this.closed) {
+      this.setupWatchers();
+    }
     await this.reload();
   }
   async start(fallback?: Dictionary) {
@@ -625,14 +654,8 @@ export class DictionaryStore extends EventEmitter {
       for (const k of Object.keys(this.current.entries)) fakeSources[k] = bt('dictionary.source.cache_entry');
       this.acceptLayers({ dictionary: this.current, overrode: [], files: [bt('dictionary.source.cache_file')], sources: fakeSources });
     }
-    for (const dir of (this.userDir ? [this.baseDir, this.userDir] : [this.baseDir])) {
-      const watcher = watch(dir, () => {
-        clearTimeout(this.timer);
-        this.timer = setTimeout(() => void this.reload(), 150);
-      });
-      watcher.on('error', () => this.emit('invalid', bt('dictionary.err.watcher_failed')));
-      this.watchers.push(watcher);
-    }
+    this.started = true;
+    this.setupWatchers();
     // Reconcile once after registering native watchers. macOS can coalesce the first rename
     // into directory-creation events before a fresh FSEvents watch is fully active.
     this.timer = setTimeout(() => void this.reload(), 150);

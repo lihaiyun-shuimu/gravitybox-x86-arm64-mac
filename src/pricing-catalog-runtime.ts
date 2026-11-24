@@ -2,7 +2,11 @@ import { lstat, readFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
+import { resolveBundleLayout } from './application-target.js';
+import { openAsarArchive } from './asar.js';
+import { normalizePeVersionString } from './discovery.js';
 import { readOptionalJson } from './files.js';
+import { isOwnedByCurrentUser, isWindows, peVersion } from './platform/index.js';
 import type { AccountsManager, LiveLanguageServerStatus } from './accounts.js';
 import type { UsageStatsManager } from './usage.js';
 import {
@@ -103,7 +107,35 @@ export function registerObservedModelsFromSource(
 
 export async function readInstalledAppBundleVersion(appPath: string): Promise<string> {
   if (!appPath) return '';
-  const plistPath = join(appPath, 'Contents/Info.plist');
+  const layout = resolveBundleLayout(appPath);
+  if (isWindows() && !appPath.toLowerCase().endsWith('.app')) {
+    try {
+      const pe = await peVersion(layout.executablePath);
+      const fromPe = normalizePeVersionString(pe.fileVersion) || normalizePeVersionString(pe.productVersion);
+      if (fromPe) return fromPe;
+    } catch {
+      // Fall back to app.asar package.json
+    }
+    let archive: Awaited<ReturnType<typeof openAsarArchive>> | undefined;
+    try {
+      archive = await openAsarArchive(layout.asarPath, 16_000_000);
+      const pkgEntry = archive.header.files?.['package.json'];
+      if (pkgEntry && !pkgEntry.unpacked) {
+        const pkgBuf = await archive.readEntryBuffer(pkgEntry, 256_000, 1);
+        if (pkgBuf) {
+          const pkg = JSON.parse(pkgBuf.toString('utf8')) as { version?: unknown };
+          if (typeof pkg?.version === 'string' && pkg.version.trim()) return pkg.version.trim();
+        }
+      }
+    } catch {
+      return '';
+    } finally {
+      await archive?.close().catch(() => {});
+    }
+    return '';
+  }
+
+  const plistPath = layout.infoPlistPath ?? join(appPath, 'Contents/Info.plist');
   try {
     const raw = await readFile(plistPath, 'utf8');
     const match = raw.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
@@ -111,6 +143,7 @@ export async function readInstalledAppBundleVersion(appPath: string): Promise<st
   } catch {
     return '';
   }
+  if (isWindows()) return '';
   try {
     const { stdout } = await execFileAsync(
       '/usr/libexec/PlistBuddy',
@@ -187,7 +220,7 @@ export async function readValidLiveIdeModelsSnapshot(
   const cleanInstalled = String(installedAppVersion || '').trim();
   if (!cleanInstalled) return null;
   const info = await lstat(snapshotPath).catch(() => null);
-  if (!info || !info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) {
+  if (!info || !info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) {
     return null;
   }
   const data = await readOptionalJson<LiveIdeModelsSnapshot>(snapshotPath, 'live-ide-models.json');

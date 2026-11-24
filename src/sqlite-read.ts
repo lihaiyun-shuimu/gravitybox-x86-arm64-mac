@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads';
 import { randomUUID } from 'node:crypto';
 import type { HudWorkerScanRequest, HudWorkerScanResult, SummariesLookupRequest, SummariesLookupResult, UsageWorkerScanRequest, UsageWorkerScanResult } from './sqlite-worker.js';
+export type { HudWorkerScanRequest, HudWorkerScanResult, SummariesLookupRequest, SummariesLookupResult, UsageWorkerScanRequest, UsageWorkerScanResult };
 import { bt, getActiveLocale } from './i18n.js';
 
 const MAX_IDLE_WORKERS = 8;
@@ -127,12 +128,14 @@ export class SqliteReadSnapshot {
     });
   }
   async close() {
+    if (this.ended) return;
+    this.ended = true;
     this.signal?.removeEventListener('abort', this.abort);
     if (this.pending) {
       this.tainted = true;
       this.fail(bt('sqlite.err.connection_closed'));
     }
-    if (!this.ended && !this.tainted) {
+    if (!this.tainted) {
       const closeId = `close-${randomUUID()}`;
       let timer: NodeJS.Timeout | undefined;
       const closedPromise = new Promise<boolean>(resolve => {
@@ -143,7 +146,7 @@ export class SqliteReadSnapshot {
       const reusableOk = await closedPromise;
       clearTimeout(timer);
       this.detachListeners();
-      if (reusableOk && !this.ended && !this.tainted) {
+      if (reusableOk && !this.tainted) {
         releasePooledWorker(this.worker);
         return;
       }

@@ -3,8 +3,15 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as https from 'node:https';
 import * as http from 'node:http';
-import { applicationTarget, matchingTargetForLanguageServerCommand, type ApplicationTarget } from './application-target.js';
-import { resolveVerifiedLanguageServerPorts } from './discovery.js';
+import {
+  applicationTarget,
+  isLanguageServerCommandForTarget,
+  matchingTargetForLanguageServerCommand,
+  resolveBundleLayout,
+  type ApplicationTarget,
+} from './application-target.js';
+import { inspectBundle, resolveVerifiedLanguageServerPorts } from './discovery.js';
+import { isWindows, lsInspect, pathsEqual, type Win32LsProcess } from './platform/index.js';
 import { SqliteReadSnapshot } from './sqlite-read.js';
 import {
   applyFamilyWindows,
@@ -17,8 +24,11 @@ import {
   normalizeLiveGroups,
   normalizeLiveModels,
   resolveModelsWithGroupDescriptions,
+  type Family,
 } from './quota.js';
 import type { LiveLanguageServerStatus, ModelQuota, QuotaData, QuotaGroup } from './accounts.js';
+import { groupToQuotaGroup, modelQuotaFromNormalized } from './account-quota.js';
+import { sanitizeFallbackTierLabel } from './pricing.js';
 import { bt } from './i18n.js';
 
 const execFileAsync = promisify(execFile);
@@ -32,6 +42,7 @@ export type ExecFileLike = (
 export type ProbeLiveLanguageServerOptions = {
   forceRefresh?: boolean;
   execFileImpl?: ExecFileLike;
+  lsInspectImpl?: () => Promise<Win32LsProcess[]>;
 };
 
 export type LanguageServerCandidate = {
@@ -148,17 +159,19 @@ export type CloudProviderContext = { origin: string; userAgent: string; appVersi
 const CLOUD_ORIGINS = new Set(['https://cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.sandbox.googleapis.com']);
 
 export function cloudOriginFromCommand(command: string, target = applicationTarget()): string | null {
-  if (!command.startsWith(target.appPath + '/Contents/Resources/bin/language_server ')) return null;
-  const dataDirectory = command.match(/(?:^|\s)--app_data_dir(?:=|\s+)([^\s"]+)/)?.[1];
-  if (dataDirectory && dataDirectory !== target.dataDirectoryName) return null;
-  const value = command.match(/(?:^|\s)--cloud_code_endpoint(?:=|\s+)([^\s"]+)/)?.[1];
-  return value && CLOUD_ORIGINS.has(value.replace(/\/$/, '')) ? value.replace(/\/$/, '') : null;
+  if (!isLanguageServerCommandForTarget(command, target)) return null;
+  const value = command.match(/(?:^|\s)--cloud_code_endpoint(?:=|\s+)(?:"([^"]+)"|([^\s"]+))/);
+  const raw = value?.[1] ?? value?.[2];
+  return raw && CLOUD_ORIGINS.has(raw.replace(/\/$/, '')) ? raw.replace(/\/$/, '') : null;
 }
 
 /** The hub component is significant: omitting it makes CCPA return a different model/quota catalogue. */
 export function cloudProviderContextFromCommand(command: string, appVersion: string, target = applicationTarget()): CloudProviderContext | null {
   const origin = cloudOriginFromCommand(command, target);
-  const option = (name: string) => command.match(new RegExp('(?:^|\\s)--' + name + '(?:=|\\s+)([^\\s"]+)'))?.[1];
+  const option = (name: string) => {
+    const m = command.match(new RegExp('(?:^|\\s)--' + name + '(?:=|\\s+)(?:"([^"]+)"|([^\\s"]+))'));
+    return m?.[1] ?? m?.[2];
+  };
   const clientSubType = option('subclient_type') ?? '';
   if (!origin || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(appVersion)
     || (clientSubType !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(clientSubType))
@@ -177,7 +190,9 @@ export function validCachedCloudProviderContext(value: any, appVersion: string, 
   if (!value || value.identityVersion !== 2 || !CLOUD_ORIGINS.has(value.origin)
     || typeof value.clientSubType !== 'string'
     || (value.clientSubType !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(value.clientSubType))) return false;
-  const expected = cloudProviderContextFromCommand(target.appPath + '/Contents/Resources/bin/language_server --cloud_code_endpoint '
+  const lsPath = resolveBundleLayout(target.appPath).languageServerPath;
+  const commandPrefix = /\s/.test(lsPath) ? `"${lsPath}"` : lsPath;
+  const expected = cloudProviderContextFromCommand(commandPrefix + ' --cloud_code_endpoint '
     + value.origin + (value.clientSubType ? ' --subclient_type ' + value.clientSubType : ''), appVersion, target);
   return !!expected && value.appVersion === expected.appVersion && value.userAgent === expected.userAgent;
 }
@@ -367,7 +382,6 @@ export function resolveProbeSubscriptionTier(
     : [
         userStatus.userTier?.id,
         userStatus.userTier?.name,
-        userStatus.userTier?.description,
         userStatus.g1Tier,
         userStatus.g1_tier,
         userStatus.paidTier?.id,
@@ -379,17 +393,39 @@ export function resolveProbeSubscriptionTier(
         userStatus.planStatus?.planInfo?.planName,
         userStatus.planStatus?.planInfo?.teamsTier,
       ];
-  const allCandidates = [...primaryCandidates, ...fallbackCandidates];
-  if (allCandidates.some(v => typeof v === 'string' && /ultra/i.test(v))) {
+  const lowConfidenceCandidates = isEnterpriseVertex ? [] : [userStatus.userTier?.description];
+  if (primaryCandidates.some(v => typeof v === 'string' && /ultra/i.test(v))) {
     return 'ULTRA';
   }
   for (const candidate of primaryCandidates) {
     const resolved = classifySubscriptionTierCandidate(candidate);
     if (resolved) return resolved;
   }
+  if (fallbackCandidates.some(v => typeof v === 'string' && /ultra/i.test(v))) {
+    return 'ULTRA';
+  }
   for (const candidate of fallbackCandidates) {
     const resolved = classifySubscriptionTierCandidate(candidate);
     if (resolved) return resolved;
+  }
+  for (const candidate of lowConfidenceCandidates) {
+    const resolved = classifySubscriptionTierCandidate(candidate);
+    if (resolved) return resolved;
+  }
+  const rawFallbackCandidates = isEnterpriseVertex
+    ? primaryCandidates
+    : [
+        userStatus.userTier?.id,
+        userStatus.userTier?.name,
+        userStatus.g1Tier,
+        userStatus.g1_tier,
+        userStatus.paidTier?.id,
+        userStatus.paidTier?.name,
+        ...fallbackCandidates,
+      ];
+  for (const candidate of rawFallbackCandidates) {
+    const cleaned = sanitizeFallbackTierLabel(candidate);
+    if (cleaned) return cleaned;
   }
   return '';
 }
@@ -413,6 +449,92 @@ export function mergeSubscriptionTier(
     return saved || 'FREE';
   }
   return fresh;
+}
+
+export function buildLiveProbeResultFromRpc(
+  userStatusData: any,
+  quotaSummaryData: any,
+  mappers: {
+    modelQuotaFromNormalized: (model: ReturnType<typeof applyFamilyWindows>[number]) => ModelQuota;
+    groupToQuotaGroup: (group: ReturnType<typeof mergeGroupSets>[number]) => QuotaGroup;
+  } = { modelQuotaFromNormalized, groupToQuotaGroup },
+  options?: { sourcePrefix?: 'live' | 'remote_rpc'; quotaSummaryError?: string; projectId?: string | null }
+): LiveLanguageServerStatus | null {
+  try {
+    const userStatus = userStatusData?.userStatus ?? userStatusData;
+    if (!userStatus?.email) return null;
+    const prefix = options?.sourcePrefix ?? 'live';
+    const email = String(userStatus.email);
+    const name = userStatus.name ? String(userStatus.name) : null;
+    const userTierId = typeof userStatus.userTier?.id === 'string' ? userStatus.userTier.id : null;
+    const userTierName = typeof userStatus.userTier?.name === 'string' ? userStatus.userTier.name : null;
+    const isEnterpriseVertex = isEnterpriseVertexUserStatus(userStatus);
+    const accountType: 'consumer' | 'enterprise_vertex' = isEnterpriseVertex ? 'enterprise_vertex' : 'consumer';
+    const tier = resolveProbeSubscriptionTier(userStatus, isEnterpriseVertex);
+
+    const observedAt = Math.floor(Date.now() / 1000);
+    const cascadeData = userStatus.cascadeModelConfigData ?? {};
+    const clientConfigs = cascadeData.clientModelConfigs || cascadeData.client_model_configs || [];
+    const clientModelSorts = cascadeData.clientModelSorts ?? cascadeData.client_model_sorts;
+    const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
+    const models = resolveModelsWithGroupDescriptions(
+      mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt, { clientModelSorts })]),
+      groups,
+    );
+    const windows = familyWindowsFromGroups(groups, Date.now());
+    const applied = applyFamilyWindows(models, windows);
+    const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
+    const liveCarbon = buildCarbonStatus(applied, groups, windows, Date.now(), liveArgon, tier);
+    const isIgnoredStandalone = (family: 'gemini' | 'claude' | 'argon' | 'carbon'): boolean =>
+      (family === 'argon' && (liveArgon.mode === 'unified' || liveArgon.mode === 'disabled'))
+      || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
+    const missingFamilies: Family[] = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
+      !isIgnoredStandalone(family)
+      && models.some(model => model.family === family && !isExcludedFromStandaloneModelPool(model))
+      && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.disabled !== true && bucket.remaining_fraction_known))
+      && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && !isExcludedFromStandaloneModelPool(m) && m.own_percentage_known && !m.own_stale)));
+    const hasMissingExplicitOther = models.some(model =>
+      model.family === 'other'
+      && !isExcludedFromStandaloneModelPool(model)
+      && Boolean(model.quota_bucket_name && model.quota_bucket_name.trim())
+      && (!model.own_percentage_known || model.own_stale)
+    ) && !groups.some(group => group.family === 'other' && group.buckets.some(bucket => bucket.disabled !== true && bucket.remaining_fraction_known));
+    if (hasMissingExplicitOther) {
+      missingFamilies.push('other');
+    }
+    const quotaData: QuotaData = {
+      models: applied.map(mappers.modelQuotaFromNormalized),
+      quota_groups: groups.map(mappers.groupToQuotaGroup),
+      is_forbidden: false,
+      subscription_tier: tier,
+      last_updated: observedAt,
+      model_forwarding_rules: {},
+      source: 'live',
+      refresh_state: {
+        complete: Boolean(quotaSummaryData) && models.length > 0 && groups.length > 0 && missingFamilies.length === 0,
+        endpointsAttempted: [`${prefix}:GetUserStatus`, `${prefix}:RetrieveUserQuotaSummary`],
+        endpointsSucceeded: [`${prefix}:GetUserStatus`, ...(quotaSummaryData ? [`${prefix}:RetrieveUserQuotaSummary`] : [])],
+        missingFamilies,
+        missingWindows: [],
+        carriedGroups: 0,
+        refreshedAt: observedAt,
+        ...(options?.quotaSummaryError ? { error: options.quotaSummaryError } : {}),
+        ...(typeof options?.projectId === 'string' && options.projectId.trim() ? { projectId: options.projectId.trim() } : {}),
+      },
+      quota_warnings: models.length === 0 ? [`NO_MODEL_RECORDS:${bt('account_probe.warn.no_model_records')}`] : undefined,
+    };
+
+    return {
+      email,
+      name,
+      tier,
+      accountType,
+      userTierId,
+      userTierName,
+      quota: quotaData,
+    };
+  } catch {}
+  return null;
 }
 
 export async function probeLiveLanguageServerOnce(
@@ -520,67 +642,7 @@ export async function probeLiveLanguageServerOnce(
       } catch {}
     }
 
-    try {
-      const email = String(userStatus.email);
-      const name = userStatus.name ? String(userStatus.name) : null;
-      const userTierId = typeof userStatus.userTier?.id === 'string' ? userStatus.userTier.id : null;
-      const userTierName = typeof userStatus.userTier?.name === 'string' ? userStatus.userTier.name : null;
-      const isEnterpriseVertex = isEnterpriseVertexUserStatus(userStatus);
-      const accountType: 'consumer' | 'enterprise_vertex' = isEnterpriseVertex ? 'enterprise_vertex' : 'consumer';
-      const tier = resolveProbeSubscriptionTier(userStatus, isEnterpriseVertex);
-
-      const observedAt = Math.floor(Date.now() / 1000);
-      const cascadeData = userStatus.cascadeModelConfigData ?? {};
-      const clientConfigs = cascadeData.clientModelConfigs || cascadeData.client_model_configs || [];
-      const clientModelSorts = cascadeData.clientModelSorts ?? cascadeData.client_model_sorts;
-      const groups = mergeGroupSets([normalizeLiveGroups(quotaSummaryData, observedAt)]);
-      const models = resolveModelsWithGroupDescriptions(
-        mergeModelCatalogues([normalizeLiveModels(clientConfigs, observedAt, { clientModelSorts })]),
-        groups,
-      );
-      const windows = familyWindowsFromGroups(groups, Date.now());
-      const applied = applyFamilyWindows(models, windows);
-      const liveArgon = buildArgonStatus(applied, groups, windows, Date.now(), tier);
-      const liveCarbon = buildCarbonStatus(applied, groups, windows, Date.now(), liveArgon, tier);
-      const isIgnoredStandalone = (family: 'gemini' | 'claude' | 'argon' | 'carbon'): boolean =>
-        (family === 'argon' && (liveArgon.mode === 'unified' || liveArgon.mode === 'disabled'))
-        || (family === 'carbon' && (liveCarbon.mode === 'unified' || liveCarbon.mode === 'disabled'));
-      const missingFamilies = (['gemini', 'claude', 'argon', 'carbon'] as const).filter(family =>
-        !isIgnoredStandalone(family)
-        && models.some(model => model.family === family && !isExcludedFromStandaloneModelPool(model))
-        && !groups.some(group => group.family === family && group.buckets.some(bucket => bucket.disabled !== true && bucket.remaining_fraction_known))
-        && !((family === 'argon' || family === 'carbon') && models.some(m => m.family === family && !isExcludedFromStandaloneModelPool(m) && m.own_percentage_known && !m.own_stale)));
-      const quotaData: QuotaData = {
-        models: applied.map(mappers.modelQuotaFromNormalized),
-        quota_groups: groups.map(mappers.groupToQuotaGroup),
-        is_forbidden: false,
-        subscription_tier: tier,
-        last_updated: observedAt,
-        model_forwarding_rules: {},
-        source: 'live',
-        refresh_state: {
-          complete: models.length > 0 && groups.length > 0 && missingFamilies.length === 0,
-          endpointsAttempted: ['live:GetUserStatus', 'live:RetrieveUserQuotaSummary'],
-          endpointsSucceeded: ['live:GetUserStatus', ...(quotaSummaryData ? ['live:RetrieveUserQuotaSummary'] : [])],
-          missingFamilies,
-          missingWindows: [],
-          carriedGroups: 0,
-          refreshedAt: observedAt,
-        },
-        quota_warnings: models.length === 0 ? [`NO_MODEL_RECORDS:${bt('account_probe.warn.no_model_records')}`] : undefined,
-      };
-
-      return {
-        email,
-        name,
-        tier,
-        accountType,
-        userTierId,
-        userTierName,
-        quota: quotaData,
-      };
-    } catch {}
-    return null;
+    return buildLiveProbeResultFromRpc(userStatusData, quotaSummaryData, mappers);
   };
 
   try {
@@ -600,8 +662,44 @@ export async function probeLiveLanguageServerOnce(
       cachedLiveEndpoint = null;
     }
 
-    const execFileFn = options?.execFileImpl ?? defaultExecFile;
     const useVerifiedBundlePorts = fetchImpl === globalThis.fetch;
+
+    if (options?.lsInspectImpl || (isWindows() && !options?.execFileImpl)) {
+      const inspectFn = options?.lsInspectImpl ?? (() => lsInspect());
+      const layout = resolveBundleLayout(target.appPath);
+      const processes = await inspectFn();
+      const verifiedApps = new Set<string>();
+      for (const proc of processes) {
+        if (!Number.isSafeInteger(proc.pid) || proc.pid <= 0) continue;
+        const matchedTarget = proc.cmdLine
+          ? matchingTargetForLanguageServerCommand(proc.cmdLine, target)
+          : pathsEqual(proc.exePath, layout.languageServerPath, 'win32')
+            ? target
+            : null;
+        if (!matchedTarget) continue;
+        const matchedLayout = resolveBundleLayout(matchedTarget.appPath);
+        if (proc.exePath && !pathsEqual(proc.exePath, matchedLayout.languageServerPath, 'win32')) continue;
+        if (useVerifiedBundlePorts && !verifiedApps.has(matchedTarget.appPath)) {
+          try {
+            await inspectBundle(matchedTarget.appPath);
+            verifiedApps.add(matchedTarget.appPath);
+          } catch {
+            continue;
+          }
+        }
+        const csrfToken = proc.csrfToken?.trim() || extractCsrfTokenFromCommand(proc.cmdLine || '');
+        if (!csrfToken) continue;
+        const ports = Array.from(
+          new Set((proc.ports ?? []).filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535)),
+        );
+        if (ports.length === 0) continue;
+        const liveStatus = await tryPortList(proc.pid, csrfToken, ports);
+        if (liveStatus) return liveStatus;
+      }
+      return null;
+    }
+
+    const execFileFn = options?.execFileImpl ?? defaultExecFile;
     const { stdout: psOut } = await execFileFn('/bin/ps', ['-ax', '-ww', '-o', 'pid=,args='], { timeout: 3000 });
     const candidates = collectLanguageServerCandidates(psOut, target);
 

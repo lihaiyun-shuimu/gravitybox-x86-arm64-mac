@@ -29,20 +29,12 @@ func readablePillTint(_ color: NSColor, fillAlpha: CGFloat = 0.14) -> NSColor {
 
 /// 浅色可读警示橙（#B45309，白底 5.1:1）；深色保持系统橙。
 func accessibleWarningColor() -> NSColor {
-    NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemOrange
-            : NSColor(srgbRed: 0.706, green: 0.325, blue: 0.035, alpha: 1)
-    }
+    Design.warningText
 }
 
 /// 浅色可读错误红（#B91C1C，白底 6.4:1）；深色保持系统红。
 func accessibleDangerColor() -> NSColor {
-    NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? .systemRed
-            : NSColor(srgbRed: 0.725, green: 0.110, blue: 0.110, alpha: 1)
-    }
+    Design.dangerText
 }
 
 final class PillBadge: NSView {
@@ -91,7 +83,7 @@ final class PillBadge: NSView {
         needsDisplay = true
     }
     override func draw(_ rect: NSRect) {
-        let radius = bounds.height / 2
+        let radius = max(1.0, min(Design.Radius.badge, bounds.height / 2) - 0.25)
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
         let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         if !emphasized && Self.isNeutralOrInactiveTint(tint, in: effectiveAppearance) {
@@ -517,7 +509,8 @@ func settingRow(icon: String, tint: NSColor, title: String, badge: NSView? = nil
             imgView.centerYAnchor.constraint(equalTo: iconBox.centerYAnchor)
         ])
     } else {
-        let iconView = symbol(icon.replacingOccurrences(of: ".fill", with: ""), size: 13.5, color: tint)
+        let resolvedIcon = icon.hasSuffix(".fill") ? String(icon.dropLast(5)) : icon
+        let iconView = symbol(resolvedIcon, size: 13.5, color: tint)
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
         iconBox.addSubview(iconView)
         NSLayoutConstraint.activate([

@@ -1,6 +1,7 @@
 import { get as httpsGet } from 'node:https';
 import { get as httpGet } from 'node:http';
 import { createHash } from 'node:crypto';
+import type { CDP } from './cdp.js';
 import type { Dictionary } from './dictionary.js';
 import { bt } from './i18n.js';
 
@@ -20,8 +21,17 @@ export const SUPPORTED_BUNDLES = new Map([
   ['2.32.1', '4c0a1ff5659e7dd92e6ad249a386c0dbce2c8e94b88522a2f366ff20b397081e'],
   ['2.32.2', '4c0a1ff5659e7dd92e6ad249a386c0dbce2c8e94b88522a2f366ff20b397081e'],
   ['2.33.0', 'f066a497c9c61198394cb3218e42ff61d85b03910d81282589c3ef066905f347'],
+  ['2.34.0', 'd52ce739c15044c02a32e1b9df62bfe39dd8164c70a2ab783540e6ed5e070251'],
 ]);
 export const VERIFIED_VERSIONS = new Set(SUPPORTED_BUNDLES.keys());
+export const ADDITIONAL_REMOTE_BUNDLES = new Map<string, Set<string>>();
+
+export function isSupportedBundleHash(version: string | undefined, sha256: string | undefined): boolean {
+  if (!version || !sha256) return false;
+  const expected = SUPPORTED_BUNDLES.get(version);
+  if (expected && expected === sha256) return true;
+  return Boolean(ADDITIONAL_REMOTE_BUNDLES.get(version)?.has(sha256));
+}
 
 export function isVerifiedVersion(version?: string): boolean {
   return typeof version === 'string' && VERIFIED_VERSIONS.has(version);
@@ -171,7 +181,7 @@ export function looksLikeNoise(text: string): boolean {
   if (/^Invalid \w+ type\b/i.test(text)) return true;
   if (/^[A-Za-z]+_[A-Z0-9]+$/.test(text)) return true;
   if (/^[A-Z][a-z]+(?:[A-Z][a-z]+)+$/.test(text) && text.length < 26) return true;
-  if (/\s/.test(text) && text.trim().split(/\s+/).every(part => /^(?:[a-z-]+:)*[a-z][a-z0-9]*(?:-[a-z0-9./%[\]]+)*$/.test(part) && /-|:/.test(part))) return true;
+  if (/\s/.test(text) && text.trim().split(/\s+/).every(part => /^(?:[a-z0-9-/]+:)*[a-z][a-z0-9]*(?:-[a-z0-9./%[\]]+)*$/.test(part) && /-|:/.test(part))) return true;
   if (/^[),;\]]/.test(text) && /[(){}[\]]|\.(?:createElement|push|map)\b/.test(text)) return true;
   if (/createElement\(|\.prototype|\.startsWith\(|\.slice\(/.test(text)) return true;
   if (/^\[[A-Za-z][\w.]*\]$/.test(text)) return true;
@@ -408,6 +418,29 @@ export async function fetchBundleWithHash(origin: string, timeout = 8000): Promi
     timeoutError: bt('bundle.resource_timeout'),
   });
   return { source: buffer.toString('utf8'), hash, bytes: buffer.length };
+}
+
+/** 通过 CDP Isolated World 同源缓存计算远端 /main.js SHA-256，零重复跨网流量，不传源码回主进程。 */
+export async function fetchRemoteBundleHashViaCdp(
+  cdp: Pick<CDP, 'evaluate'>,
+  contextId: number
+): Promise<{ source: string | undefined; hash: string; bytes: number }> {
+  const res = await cdp.evaluate(
+    `(async () => {
+      const resp = await fetch('/main.js', { cache: 'force-cache' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const buf = await resp.arrayBuffer();
+      if (buf.byteLength > 20000000) throw new Error('bundle_size_exceeded');
+      const digest = await crypto.subtle.digest('SHA-256', buf);
+      const hash = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+      return { hash, bytes: buf.byteLength };
+    })()`,
+    contextId
+  );
+  if (!res || typeof res.hash !== 'string' || !/^[0-9a-f]{64}$/i.test(res.hash)) {
+    throw new Error(bt('bundle.resource_timeout'));
+  }
+  return { source: undefined, hash: res.hash.toLowerCase(), bytes: Number(res.bytes) || 0 };
 }
 
 /** Keep extractor evidence; generic text is a label, never invent a button role. */

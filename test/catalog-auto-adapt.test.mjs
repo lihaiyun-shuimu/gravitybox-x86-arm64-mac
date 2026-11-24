@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { antigravityLayout } from '../dist/platform/index.js';
+const OPENSSL_BIN = process.platform === 'win32'
+  ? (process.env.OPENSSL_BIN || (existsSync('C:\\Program Files\\Git\\usr\\bin\\openssl.exe') ? 'C:\\Program Files\\Git\\usr\\bin\\openssl.exe' : 'openssl'))
+  : '/usr/bin/openssl';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer } from 'node:http';
@@ -393,9 +398,10 @@ test('BundleCache.key 包含 Contents/Resources/bin/language_server，噪声过�
   // 1. BundleCache.key() 感知 language_server 变化
   const dir = await mkdtemp(join(tmpdir(), 'gb-cache-ls-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  await mkdir(join(dir, 'Contents/Resources/bin'), { recursive: true });
-  await writeFile(join(dir, 'Contents/Resources/app.asar'), 'same-asar');
-  await writeFile(join(dir, 'Contents/Resources/bin/language_server'), 'ls-v1');
+  const layout = antigravityLayout(dir);
+  await mkdir(dirname(layout.languageServerPath), { recursive: true });
+  await writeFile(layout.asarPath, 'same-asar');
+  await writeFile(layout.languageServerPath, 'ls-v1');
 
   let reads = 0;
   const fetcher = async () => ({ hash: `h-${++reads}`, source: 'body', bytes: 4 });
@@ -406,7 +412,7 @@ test('BundleCache.key 包含 Contents/Resources/bin/language_server，噪声过�
   await cache.read(dir, 100, '2.34.0', 'https://127.0.0.1:443', fetcher);
   assert.equal(reads, 1);
   // 仅更新 language_server（app.asar 未变）必须使缓存失效
-  await writeFile(join(dir, 'Contents/Resources/bin/language_server'), 'ls-v2-updated-payload');
+  await writeFile(layout.languageServerPath, 'ls-v2-updated-payload');
   await cache.read(dir, 100, '2.34.0', 'https://127.0.0.1:443', fetcher);
   assert.equal(reads, 2);
 
@@ -462,7 +468,7 @@ test('Controller 未收录高覆盖率版本（>=85%）自动启用全量翻译�
 
   const keyPath = join(dir, 'key.pem');
   const certPath = join(dir, 'cert.pem');
-  await execFileAsync('/usr/bin/openssl', [
+  await execFileAsync(OPENSSL_BIN, [
     'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
     '-keyout', keyPath, '-out', certPath, '-days', '1', '-subj', '/CN=127.0.0.1',
   ]);
@@ -721,4 +727,77 @@ test('HUD resolveModelCapacity 对未入库 -tiered-high 动态模型与 enum �
   assert.equal(byStr.modelId, 'gemini-4-nova', '-tiered-high 必须剥离 -tiered 与 -high 归并到基础模型');
   assert.equal(byStr.modelId, byEnum.modelId, '字符串解析与占位符枚举解析必须得出一致 modelId');
   assert.equal(byStr.capacityTokens, 256_000);
+});
+
+test('P1-7 #1: extractCatalogModels 在无 agentModelSorts (in_model_selector === undefined) 时保留全新未定价 -tiered 聊天模型并继续拦截内部非聊天模型', () => {
+  const snap = resolvePricingCatalogSnapshot({
+    rawPricingTable: DEFAULT_API_PRICES,
+    live: {
+      tier: 'ULTRA',
+      models: [
+        // 上游未下发 agentModelSorts，in_model_selector 缺失
+        { model_id: 'gemini-5-nova-tiered-high', display_name: 'Gemini 5 Nova (High)', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-5-orbit-tiered', display_name: 'Gemini 5 Orbit', disabled: false, quota_source: 'live' },
+        // 剥离 -tiered 后仍属于内部非聊天模型 -> 必须继续拦截
+        { model_id: 'gemini-5-image-tiered', display_name: 'Gemini 5 Image', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-5-control-tiered', display_name: 'Gemini 5 Control', disabled: false, quota_source: 'live' },
+        { model_id: 'gemini-5-exp-ab12-tiered', display_name: 'Gemini 5 Exp', disabled: false, quota_source: 'live' },
+        { model_id: 'tiered-high', display_name: 'Tiered High', disabled: false, quota_source: 'live' },
+        // 显式被 selector 排除 -> 必须拦截
+        { model_id: 'gemini-5-hidden-tiered-high', display_name: 'Gemini 5 Hidden (High)', disabled: false, quota_source: 'live', in_model_selector: false },
+      ],
+    },
+  });
+
+  assert.deepEqual(snap.unpricedLiveModels, [
+    {
+      key: 'gemini-5-nova',
+      displayName: 'Gemini 5 Nova',
+      disabled: false,
+      variants: ['High'],
+    },
+    {
+      key: 'gemini-5-orbit',
+      displayName: 'Gemini 5 Orbit',
+      disabled: false,
+    },
+  ]);
+});
+
+test('P1-7 #2: resolveDynamicOrchestratorModel 动态提取最高 Gemini 主版本号替代硬编码 gemini-4-', (t) => {
+  t.after(() => {
+    clearObservedIdeModelsForTest();
+    resetAndRegisterRemoteModelMetadata({});
+  });
+  clearObservedIdeModelsForTest();
+  resetAndRegisterRemoteModelMetadata({});
+
+  // 1. 从 siblingModelIds 提取最高主版本号 5
+  assert.equal(
+    resolveDynamicOrchestratorModel('gemini-pro-orchestrator-quasar', 'Orchestrator (Quasar)', [
+      'gemini-4-neon-high',
+      'gemini-5-aurora-high',
+    ]),
+    'gemini-5-quasar'
+  );
+
+  // 2. 从 getEffectiveModelAliasKeys()（含 observed 模型）提取最高主版本号 6
+  registerObservedIdeModels([
+    {
+      modelId: 'gemini-6-orion-high',
+      displayName: 'Gemini 6 Orion (High)',
+      modelOrAlias: 'MODEL_PLACEHOLDER_M950',
+    },
+  ]);
+  assert.equal(
+    resolveDynamicOrchestratorModel('gemini-pro-orchestrator-quasar', 'Orchestrator (Quasar)'),
+    'gemini-6-quasar'
+  );
+
+  // 3. 当远端与别名仅有 4 代时回退到 4
+  clearObservedIdeModelsForTest();
+  assert.equal(
+    resolveDynamicOrchestratorModel('gemini-pro-orchestrator-quasar', 'Orchestrator (Quasar)'),
+    'gemini-4-quasar'
+  );
 });

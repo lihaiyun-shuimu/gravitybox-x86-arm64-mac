@@ -99,6 +99,13 @@
       "extractor": "typescript-ast-v2",
       "trust": "explicit-byte-extraction",
       "byteVerifiedAt": "2026-11-18T09:04:35.256Z"
+    },
+    "2.34.0": {
+      "bundleSha256": "d52ce739c15044c02a32e1b9df62bfe39dd8164c70a2ab783540e6ed5e070251",
+      "snapshotSha256": "0d0951773472127e0160a4a2b67f1240989def5dee6de7045e6d79220b76d970",
+      "extractor": "typescript-ast-v2",
+      "trust": "explicit-byte-extraction",
+      "byteVerifiedAt": "2026-11-22T04:38:04.931Z"
     }
   }
 }

@@ -1,5 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Script, runInNewContext } from 'node:vm';
 
 /**
@@ -27,6 +28,7 @@ function stripEsmForClassicRuntime(code) {
 }
 
 async function loadAndSyncHudI18n(rawHudI18nSource) {
+  const normalizedSource = rawHudI18nSource.replace(/\r\n/g, '\n');
   const [zhJsonRaw, enJsonRaw] = await Promise.all([
     readFile(new URL('../assets/i18n/zh-Hans.json', import.meta.url), 'utf8'),
     readFile(new URL('../assets/i18n/en.json', import.meta.url), 'utf8'),
@@ -36,7 +38,7 @@ async function loadAndSyncHudI18n(rawHudI18nSource) {
     en: JSON.parse(enJsonRaw)?.hud ?? {},
   };
   const sandbox = {};
-  const evalCode = stripEsmForClassicRuntime(rawHudI18nSource).replace(
+  const evalCode = stripEsmForClassicRuntime(normalizedSource).replace(
     /\bconst\s+(HUD_FALLBACK_LOCALE|HUD_I18N)\b/g,
     'var $1'
   );
@@ -58,7 +60,7 @@ async function loadAndSyncHudI18n(rawHudI18nSource) {
     }
   }
   const hudLiteral = JSON.stringify(jsonHud, null, 2);
-  const replaced = rawHudI18nSource.replace(
+  const replaced = normalizedSource.replace(
     /export\s+const\s+HUD_I18N\s*=\s*\{[\s\S]*?\n\};/,
     `export const HUD_I18N = ${hudLiteral};`
   );
@@ -88,4 +90,12 @@ export async function copyRuntime(distUrl = new URL('../dist/', import.meta.url)
   await writeFile(new URL('engine.js', distUrl), mergedSource);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await copyRuntime();
+function isDirectEntry() {
+  if (!process.argv[1]) return false;
+  if (process.platform === 'win32') {
+    return resolve(process.argv[1]).toLowerCase() === resolve(fileURLToPath(import.meta.url)).toLowerCase();
+  }
+  return import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isDirectEntry()) await copyRuntime();

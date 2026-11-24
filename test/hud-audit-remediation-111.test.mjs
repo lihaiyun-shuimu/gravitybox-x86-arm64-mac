@@ -79,9 +79,22 @@ function generationBlob({
   ]);
 }
 
+const openDbsByTest = new WeakMap();
+function trackDb(t, db) {
+  let list = openDbsByTest.get(t);
+  if (!list) { list = []; openDbsByTest.set(t, list); }
+  list.push(db);
+  return db;
+}
+function closeTrackedDbs(t) {
+  const list = openDbsByTest.get(t);
+  if (!list) return;
+  for (const db of list.splice(0)) { try { db.close(); } catch {} }
+}
+
 function createWalDb(t, dir, id, parentId) {
   const dbPath = path.join(dir, `${id}.db`);
-  const db = new DatabaseSync(dbPath);
+  const db = trackDb(t, new DatabaseSync(dbPath));
   t.after(() => {
     try {
       db.close();
@@ -455,7 +468,7 @@ class FakeShadowRoot {
 
 test('P0-01: 增量前缀复用克隆原始步骤，gen_metadata 原地刷新已入前缀的模型步时准确更新用量且不锁死或双计', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-p001-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
   const convId = '11111111-1111-4111-8111-111111111111';
   const { db, dbPath } = createWalDb(t, dir, convId);
@@ -515,7 +528,7 @@ test('P0-01: 增量前缀复用克隆原始步骤，gen_metadata 原地刷新已
 
 test('P2-01: 超大步骤被增量前缀吸收的同时，首尾边缘字节变更会触发前缀失效并回退全量重扫', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-p201-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
   const convId = '22222222-2222-4222-8222-222222222222';
   const { db, dbPath } = createWalDb(t, dir, convId);
@@ -677,7 +690,7 @@ test('P2-05: CdpHudBridge 保留跨消息 autoHealAttempts 上限，隔离 ready
 
 test('P2-06: 混合子代理历史冷启动仍执行一次性反向嗅探，且父会话空闲时子代理 12s 保活立即释放', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-p206-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
   const mainId = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
   const explicitChildId = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
@@ -1330,7 +1343,7 @@ test('P1-04 & P2-04: AntigravityHudManager 隔离嵌套子分栏/工具卡/语�
 
 test('1.1.1 终审回归: conversation_summaries.db 10 子代理精确发现、分批 runningSubagentCount=1、subagents/tasks 合并态、reconcile 重绑 ResizeObserver、未定价前缀与 status=4 中止', async (t) => {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-111-batch2-'));
-  t.after(() => fs.rmSync(baseDir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(baseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
   const convDir = path.join(baseDir, 'conversations');
   fs.mkdirSync(convDir, { recursive: true });
 
@@ -1341,7 +1354,7 @@ test('1.1.1 终审回归: conversation_summaries.db 10 子代理精确发现、�
   });
 
   const summariesDbPath = path.join(baseDir, 'conversation_summaries.db');
-  const summariesDb = new DatabaseSync(summariesDbPath);
+  const summariesDb = trackDb(t, new DatabaseSync(summariesDbPath));
   t.after(() => {
     try {
       summariesDb.close();

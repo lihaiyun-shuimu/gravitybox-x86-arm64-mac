@@ -66,10 +66,6 @@ enum MenuQuotaHelpers {
             .replacingOccurrences(of: "·", with: " · ")
     }
 
-    static func localizedPeriodLabel(_ raw: String) -> String {
-        QuotaPresentation.localizedWindowLabel(period: "", label: raw)
-    }
-
     static func groupHeader(_ title: String, brands: [String], fontSize: CGFloat = 11.5, iconSize: CGFloat = 13, spacing: CGFloat = 5) -> NSView {
         var views: [NSView] = brands.compactMap { brand in
             guard let image = ModelIcons.image(brand) else { return nil }
@@ -196,6 +192,7 @@ final class MenuSegmentedTabsView: NSView {
     private let slideMotion = DesignMotion()
 
     final class SegmentItemButton: NSButton {
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func becomeFirstResponder() -> Bool { let result = super.becomeFirstResponder(); needsDisplay = true; return result }
         override func resignFirstResponder() -> Bool { let result = super.resignFirstResponder(); needsDisplay = true; return result }
         override var allowsVibrancy: Bool { false }
@@ -262,7 +259,7 @@ final class MenuSegmentedTabsView: NSView {
                 case .primaryTabs:
                     fg = .labelColor
                 case .secondaryRange, .compactToggle:
-                    fg = isDark ? NSColor(srgbRed: 0.44, green: 0.72, blue: 1.0, alpha: 1.0) : Design.blue
+                    fg = Design.menuSegmentAccent
                 }
             } else {
                 fg = hovered ? .labelColor : Design.secondary
@@ -318,11 +315,15 @@ final class MenuSegmentedTabsView: NSView {
         }
         addSubview(stack)
         pin(stack, to: self, inset: 3)
-        setAccessibilityElement(true)
+        setAccessibilityElement(false)
         setAccessibilityRole(.tabGroup)
         setAccessibilityLabel(accessibilityLabel)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override func accessibilityChildren() -> [Any]? {
+        buttons
+    }
 
     override func layout() {
         super.layout()
@@ -477,7 +478,7 @@ final class MenuMetricTileView: NSView {
         case "cache":
             iconName = "bolt.badge.clock.fill"
         default:
-            iconName = "chart.bar.fill"
+            iconName = "chart.xyaxis.line"
         }
         let iconTint = NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -681,7 +682,8 @@ final class MenuTrendChartView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         let pt = convert(event.locationInWindow, from: nil)
-        guard bounds.contains(pt), !buckets.isEmpty else {
+        guard bounds.contains(pt), !buckets.isEmpty,
+              buckets.contains(where: { !$0.isFuture && $0.value > 0 }) else {
             resetHoverState()
             return
         }
@@ -845,7 +847,7 @@ final class MenuTrendChartView: NSView {
             } else if dimension == .tokens {
                 capStr = InterfaceText.formatCompactTokens(b.value, formatSmallWithLocale: true) as NSString
             } else {
-                capStr = "\(b.value)" as NSString
+                capStr = InterfaceText.formatInteger(b.value) as NSString
             }
             let capAttrs: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold),
@@ -860,10 +862,9 @@ final class MenuTrendChartView: NSView {
             let capY = min(chartTop - capH, max(chartBottom + barH + 4, chartBottom + 10))
             let capRect = NSRect(x: capX, y: capY, width: capW, height: capH)
             let capPath = NSBezierPath(roundedRect: capRect, xRadius: capH / 2, yRadius: capH / 2)
-            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            (isDark ? NSColor(white: 0.18, alpha: 0.94) : NSColor(white: 0.15, alpha: 0.88)).setFill()
+            Design.chartTooltipFill.setFill()
             capPath.fill()
-            (isDark ? NSColor.white.withAlphaComponent(0.18) : NSColor.black.withAlphaComponent(0.12)).setStroke()
+            Design.chartTooltipBorder.setStroke()
             capPath.lineWidth = 0.5
             capPath.stroke()
             capStr.draw(at: NSPoint(x: capX + (capW - capSize.width) / 2, y: capY + (capH - capSize.height) / 2), withAttributes: capAttrs)
@@ -872,18 +873,42 @@ final class MenuTrendChartView: NSView {
 }
 
 final class MenuPlainClickButton: NSButton {
+    var focusRingCornerRadius: CGFloat = 6
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         title = ""
         bezelStyle = .inline
         isBordered = false
-        focusRingType = .none
+        focusRingType = .exterior
         refusesFirstResponder = false
         wantsLayer = true
     }
     required init?(coder: NSCoder) { fatalError() }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds, xRadius: focusRingCornerRadius, yRadius: focusRingCornerRadius).fill()
+    }
     override func draw(_ dirtyRect: NSRect) {
         // Custom container row handles its own background; suppress NSButtonCell's default highlight flash.
+    }
+}
+
+final class MenuCircularFocusButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        title = ""
+        bezelStyle = .inline
+        isBordered = false
+        focusRingType = .exterior
+        setButtonType(.momentaryChange)
+        refusesFirstResponder = false
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(ovalIn: bounds).fill()
     }
 }
 
@@ -917,7 +942,19 @@ final class MenuSilentScrollView: NSScrollView {
 
 final class MenuModelUsageItemView: NSView {
     let rawModel: String
-    let iconView = symbol("sparkles", size: 12, color: Design.secondary)
+    let iconView: NSImageView = {
+        let view = NSImageView(
+            image: NSImage(systemSymbolName: "hexagon", accessibilityDescription: nil)
+                ?? NSImage(systemSymbolName: "square", accessibilityDescription: nil)
+                ?? NSImage()
+        )
+        view.setAccessibilityElement(false)
+        view.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        view.contentTintColor = Design.secondary
+        view.imageScaling = .scaleProportionallyDown
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
     let nameLabel: NSTextField
     let statusBadge: PillBadge
     let tokensLabel: NSTextField
@@ -1022,18 +1059,25 @@ final class MenuModelUsageItemView: NSView {
 typealias MenuModelUsageRow = MenuModelUsageItemView
 
 
+extension SshHostTagBadge {
+    /// 兼容属性：返回徽章当前展示的主机标签文本。
+    var title: String { label.stringValue }
+}
+
 final class MenuExpandableAccountCardView: NSBox {
     let accountId: String
     private var fullEmail: String = ""
     private(set) var isCurrentAccount = false
+    private(set) var canSwitchAccount = false
     private(set) var isAccountReachable = true
     private(set) var isSwitchInFlight = false
-    let stateButton = NSButton()
+    let stateButton = MenuCircularFocusButton(frame: .zero)
     let headerButton = MenuPlainClickButton(frame: .zero)
     let stateIcon = symbol("circle", size: 12, color: Design.secondary)
     let nameLabel = text("", size: 12.5, weight: .semibold, color: .labelColor)
     let tierBadge = TierBadge("", scale: .compact)
     let statusBadge = pillBadge("", color: Design.blue)
+    let sshPresenceBadge = SshHostTagBadge(scale: .compact)
     let chevronIcon = symbol("chevron.down", size: 10, color: Design.secondary)
     let emailLabel = text("", size: 10.5, color: .secondaryLabelColor)
 
@@ -1104,19 +1148,22 @@ final class MenuExpandableAccountCardView: NSBox {
         nameLabel.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(600), for: .horizontal)
         tierBadge.setContentHuggingPriority(.required, for: .horizontal)
         tierBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        statusBadge.label.font = .systemFont(ofSize: 9.5, weight: .semibold)
         statusBadge.setContentHuggingPriority(.required, for: .horizontal)
         statusBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        sshPresenceBadge.setContentHuggingPriority(.required, for: .horizontal)
+        sshPresenceBadge.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(550), for: .horizontal)
+        let sshMaxW = sshPresenceBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 98)
+        sshMaxW.priority = NSLayoutConstraint.Priority(999)
+        sshMaxW.isActive = true
+        sshPresenceBadge.isHidden = true
         emailLabel.font = .systemFont(ofSize: 11.5, weight: .regular)
         emailLabel.lineBreakMode = .byTruncatingMiddle
         emailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         timestampLabel.font = .monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        timestampLabel.lineBreakMode = .byTruncatingTail
+        timestampLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        stateButton.title = ""
-        stateButton.bezelStyle = .inline
-        stateButton.isBordered = false
-        stateButton.focusRingType = .none
-        stateButton.setButtonType(.momentaryChange)
-        stateButton.refusesFirstResponder = false
         stateButton.target = self
         stateButton.action = #selector(stateIconClicked)
         stateButton.addSubview(stateIcon)
@@ -1133,7 +1180,7 @@ final class MenuExpandableAccountCardView: NSBox {
 
         let titleSpacer = flexibleSpace()
         titleSpacer.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-        let topTitleRow = horizontal([nameLabel, tierBadge, statusBadge, titleSpacer, chevronIcon], spacing: 5)
+        let topTitleRow = horizontal([nameLabel, tierBadge, statusBadge, sshPresenceBadge, titleSpacer, chevronIcon], spacing: 5)
         topTitleRow.alignment = .centerY
         topTitleRow.detachesHiddenViews = true
 
@@ -1144,7 +1191,7 @@ final class MenuExpandableAccountCardView: NSBox {
         headerButton.title = ""
         headerButton.bezelStyle = .inline
         headerButton.isBordered = false
-        headerButton.focusRingType = .none
+        headerButton.focusRingType = .exterior
         headerButton.setButtonType(.momentaryChange)
         headerButton.target = self
         headerButton.action = #selector(headerClicked)
@@ -1204,7 +1251,7 @@ final class MenuExpandableAccountCardView: NSBox {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func apply(account: [String: Any], isCurrent: Bool, isLiveVerified: Bool, isRecommended: Bool, isExpanded: Bool, reachable: Bool, switchInFlight: Bool, globalBusy: Bool, singleBusy: Bool, singleError: String?, singleNotice: String? = nil) {
+    func apply(account: [String: Any], isCurrent: Bool, isLiveVerified: Bool, isRecommended: Bool, isExpanded: Bool, reachable: Bool, switchInFlight: Bool, globalBusy: Bool, singleBusy: Bool, singleError: String?, singleNotice: String? = nil, matchingSshHosts: [CanonicalHostEnvironment] = [], hasSshHosts: Bool = false, staleThresholdSeconds: TimeInterval = 300) {
         let email = account["email"] as? String ?? L10n.t("menu_panel.account_card.unnamed", fallback: "未命名账号")
         fullEmail = email
         let rawName = account["name"] as? String
@@ -1231,13 +1278,38 @@ final class MenuExpandableAccountCardView: NSBox {
         tierBadge.isHidden = tier.isEmpty
 
         if isCurrent {
-            statusBadge.isHidden = true
+            if hasSshHosts {
+                statusBadge.title = L10n.t("ssh.presence.current_local", fallback: "本机当前")
+                statusBadge.tint = Design.blue
+                statusBadge.isHidden = false
+            } else {
+                statusBadge.title = ""
+                statusBadge.isHidden = true
+            }
         } else if isRecommended {
             statusBadge.title = L10n.t("menu_panel.account_card.recommended", fallback: "推荐备用")
             statusBadge.tint = .systemGreen
             statusBadge.isHidden = false
         } else {
+            statusBadge.title = ""
             statusBadge.isHidden = true
+        }
+
+        let activeSshHosts = matchingSshHosts.filter { $0.state != .historicalOnly }
+        sshPresenceBadge.toolTip = nil
+        if let primary = activeSshHosts.first {
+            let effectiveState: SshHostState = activeSshHosts.contains(where: { $0.state == .authExpired })
+                ? .authExpired
+                : (activeSshHosts.contains(where: { $0.state == .online }) ? .online : primary.state)
+            sshPresenceBadge.update(
+                hostLabel: primary.hostLabel,
+                state: effectiveState,
+                windowCount: primary.windowCount,
+                extraCount: max(0, activeSshHosts.count - 1)
+            )
+            sshPresenceBadge.isHidden = false
+        } else {
+            sshPresenceBadge.isHidden = true
         }
 
         borderColor = isCurrent ? Design.dynamicAlpha(Design.blue, 0.42) : Design.popoverCardBorder
@@ -1262,8 +1334,31 @@ final class MenuExpandableAccountCardView: NSBox {
         headerButton.setAccessibilityLabel(L10n.t("menu_panel.account_card.a11y", ["name": display, "email": email, "role": roleText, "summary": summary], fallback: "\(display)，\(email)，\(roleText)，\(summary)"))
 
         let now = Date()
-        let standbyMode = ((account["standbyRefreshStatus"] as? [String: Any])?["mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let contract = QuotaPresentation.contract(account)
+        let sourceEnvId = (account["quotaSourceEnvironmentId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sourceHost = !sourceEnvId.isEmpty ? matchingSshHosts.first(where: { $0.environmentId == sourceEnvId }) : nil
+        let hasOnlineSshHost = matchingSshHosts.contains(where: { $0.state == .online })
+        let isRemoteActive = sourceHost != nil || hasOnlineSshHost
+        let rawStandbyMode = ((account["standbyRefreshStatus"] as? [String: Any])?["mode"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let standbyMode = isRemoteActive ? nil : rawStandbyMode
+        let contractInput: [String: Any]
+        if isRemoteActive, account["standbyRefreshStatus"] != nil {
+            var sanitized = account
+            sanitized.removeValue(forKey: "standbyRefreshStatus")
+            contractInput = sanitized
+        } else {
+            contractInput = account
+        }
+        let contract = QuotaPresentation.contract(contractInput)
+        let quota = account["quota"] as? [String: Any]
+        let rawStamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(account["quota_last_updated"]) ?? 0
+        let stamp = rawStamp > 10_000_000_000 ? rawStamp / 1000.0 : rawStamp
+        let freshness = SshEnvironmentResolver.resolveQuotaFreshness(
+            forAccount: account,
+            staleThresholdSeconds: staleThresholdSeconds,
+            now: now
+        )
+        let explicitAccountFreshness = QuotaFreshness(rawValueOrNil: (account["quotaFreshness"] as? String) ?? (quota?["quotaFreshness"] as? String))
+        let forceAllStale = (freshness == .offlineSnapshot || freshness == .errorFallback || freshness == .authExpired || explicitAccountFreshness == .stale || (stamp > 0 && now.timeIntervalSince1970 - stamp > staleThresholdSeconds))
         struct DynamicMeterSpec {
             let title: String
             let groupName: String
@@ -1293,7 +1388,7 @@ final class MenuExpandableAccountCardView: NSBox {
                         percentage: win.percentage,
                         placeholder: win.placeholder(availability: group.availability),
                         reset: win.percentage == nil ? "" : win.effectiveResetText(at: now, standbyMode: standbyMode, compact: true),
-                        stale: win.effectiveStale(at: now)
+                        stale: win.effectiveStale(at: now) || forceAllStale
                     ))
                 }
             }
@@ -1349,42 +1444,54 @@ final class MenuExpandableAccountCardView: NSBox {
             warningLabel.isHidden = true
         }
 
-        let quota = account["quota"] as? [String: Any]
-        let stamp = QuotaPresentation.number(quota?["last_updated"]) ?? QuotaPresentation.number(account["quota_last_updated"]) ?? 0
-        if standbyMode == "snapshot_cooldown_elapsed" {
+        if let standbyMode, standbyMode == "snapshot_cooldown_elapsed" {
             timestampLabel.stringValue = L10n.t("accounts.standby.reset_passed", fallback: "已到重置时间 · 切换后更新")
             timestampLabel.textColor = Design.blue
-            timestampLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            timestampLabel.toolTip = nil
+            timestampLabel.setAccessibilityHelp(L10n.t("accounts.standby.multi_device_hint"))
             timestampLabel.isHidden = false
-        } else if standbyMode == "snapshot_cooling", stamp > 0 {
+        } else if let standbyMode, standbyMode == "snapshot_cooling", stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.todayFormatter : Self.dateFormatter
-            timestampLabel.stringValue = L10n.t("accounts.standby.recorded_at", ["time": fmt.string(from: date)], fallback: "记录于 \(fmt.string(from: date)) · 切换后同步")
+            timestampLabel.stringValue = L10n.t("accounts.standby.recorded_at", ["time": fmt.string(from: date)], fallback: "记录于 \(fmt.string(from: date)) · 切换后更新")
             timestampLabel.textColor = .secondaryLabelColor
-            timestampLabel.toolTip = L10n.t("accounts.standby.multi_device_hint")
+            timestampLabel.toolTip = nil
+            timestampLabel.setAccessibilityHelp(L10n.t("accounts.standby.multi_device_hint"))
             timestampLabel.isHidden = false
         } else if stamp > 0 {
             let date = Date(timeIntervalSince1970: stamp)
             let fmt = Calendar.current.isDateInToday(date) ? Self.todayFormatter : Self.dateFormatter
-            timestampLabel.stringValue = L10n.t("common.updated_at", ["time": fmt.string(from: date)], fallback: "更新于 \(fmt.string(from: date))")
-            timestampLabel.textColor = Design.secondary
+            let isStale = freshness.isStaleOrDegraded
+            let timeStr = fmt.string(from: date)
+            let displayRemoteHost = sourceHost ?? (!isCurrent && sourceEnvId != "local" ? matchingSshHosts.first(where: { $0.state == .online }) : nil)
+            if let displayRemoteHost {
+                let syncNote = L10n.t("accounts.ssh.quota_from_remote", ["host": displayRemoteHost.cleanHostLabel], fallback: "同步自 \(displayRemoteHost.cleanHostLabel)")
+                timestampLabel.stringValue = "\(syncNote) · \(timeStr)"
+            } else {
+                timestampLabel.stringValue = L10n.t("common.updated_at", ["time": timeStr], fallback: "更新于 \(timeStr)")
+            }
+            timestampLabel.textColor = isStale ? accessibleWarningColor() : Design.secondary
             timestampLabel.toolTip = nil
+            timestampLabel.setAccessibilityHelp(nil)
             timestampLabel.isHidden = false
         } else {
             timestampLabel.stringValue = ""
             timestampLabel.textColor = Design.secondary
             timestampLabel.toolTip = nil
+            timestampLabel.setAccessibilityHelp(nil)
             timestampLabel.isHidden = true
         }
 
         let canSwitch = !isCurrent && account["disabled"] as? Bool != true && account["validation_blocked"] as? Bool != true
+        self.canSwitchAccount = canSwitch
+        stateButton.isEnabled = canSwitch && reachable && !switchInFlight
         switchButton.isHidden = isCurrent
         switchButton.isEnabled = canSwitch && reachable && !switchInFlight
         singleRefreshButton.setRefreshState(busy: globalBusy || singleBusy, available: reachable && !globalBusy, error: singleError)
     }
 
     @objc private func stateIconClicked() {
-        guard !isCurrentAccount && isAccountReachable && !isSwitchInFlight else { return }
+        guard canSwitchAccount && !isCurrentAccount && isAccountReachable && !isSwitchInFlight else { return }
         onSwitchAccount?(accountId)
     }
 
@@ -1410,6 +1517,323 @@ final class MenuExpandableAccountCardView: NSBox {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil { hoverMotion.cancel() }
+    }
+}
+
+/// 顶栏 brand 与 EnvironmentContextPill 之间的 1pt × 14pt 极淡竖线分割符。
+final class MenuHeaderVerticalDividerView: NSView {
+    override var allowsVibrancy: Bool { false }
+
+    override init(frame frameRect: NSRect = .zero) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 1, height: 14) }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let color = isDark
+            ? NSColor.white.withAlphaComponent(0.14)
+            : NSColor.black.withAlphaComponent(0.10)
+        color.setFill()
+        bounds.fill()
+    }
+}
+
+/// 统一 5.5pt SSH 状态圆点（在线=绿实心，过期=琥珀实心，离线=灰空心）。
+final class MenuSshStatusDotView: NSView {
+    override var allowsVibrancy: Bool { false }
+    var state: SshHostState = .online {
+        didSet {
+            guard oldValue != state else { return }
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect = .zero) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 6),
+            heightAnchor.constraint(equalToConstant: 6)
+        ])
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let dotRect = NSRect(x: 0.25, y: 0.25, width: 5.5, height: 5.5)
+        let color = SshEnvironmentVisuals.statusDotColor(for: state, appearance: effectiveAppearance)
+        if SshEnvironmentVisuals.isStatusDotFilled(for: state) {
+            color.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+        } else {
+            color.setStroke()
+            let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.65, dy: 0.65))
+            ring.lineWidth = 1.15
+            ring.stroke()
+        }
+    }
+}
+
+/// Tab 2 底部紧凑「远程只读会话」单行跳转条目：[● >_ <Host> · <Email>   <主配额%>  ›]
+final class MenuRemoteHostJumpRow: NSBox {
+    private let clickButton = MenuPlainClickButton(frame: .zero)
+    private let statusDot = MenuSshStatusDotView()
+    private let iconView = NSImageView()
+    let summaryLabel = text("", size: 11, color: .labelColor)
+    let quotaLabel = text("—", size: 11, weight: .semibold, color: .labelColor)
+    private let chevronView: NSImageView = {
+        let iv = symbol("chevron.right", size: 10.5, color: Design.secondary)
+        iv.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold)
+        iv.translatesAutoresizingMaskIntoConstraints = false
+        iv.setAccessibilityElement(false)
+        NSLayoutConstraint.activate([
+            iv.widthAnchor.constraint(equalToConstant: 8),
+            iv.heightAnchor.constraint(equalToConstant: 12)
+        ])
+        return iv
+    }()
+    private(set) var environmentId: String = ""
+    var onSelect: ((String) -> Void)?
+    private var hoverTrackingArea: NSTrackingArea?
+    private var isHovered = false { didSet { if oldValue != isHovered { needsDisplay = true } } }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        boxType = .custom
+        cornerRadius = 8
+        borderWidth = 1
+        borderColor = Design.popoverCardBorder
+        fillColor = Design.popoverCardBackground
+        contentViewMargins = .zero
+
+        iconView.image = SshTerminalIcon.image(pointSize: 12)
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.contentTintColor = .secondaryLabelColor
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.setAccessibilityElement(false)
+        NSLayoutConstraint.activate([
+            iconView.widthAnchor.constraint(equalToConstant: 12),
+            iconView.heightAnchor.constraint(equalToConstant: 12)
+        ])
+
+        summaryLabel.lineBreakMode = .byTruncatingMiddle
+        summaryLabel.maximumNumberOfLines = 1
+        summaryLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        summaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        quotaLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        quotaLabel.alignment = .right
+        quotaLabel.setContentHuggingPriority(.required, for: .horizontal)
+        quotaLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        chevronView.setContentHuggingPriority(.required, for: .horizontal)
+        chevronView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let row = horizontal([statusDot, iconView, summaryLabel, flexibleSpace(), quotaLabel, chevronView], spacing: 5)
+        row.alignment = .centerY
+
+        clickButton.target = self
+        clickButton.action = #selector(rowPressed)
+        clickButton.addSubview(row)
+        pin(row, to: clickButton, inset: 0)
+
+        addSubview(clickButton)
+        clickButton.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 28),
+            clickButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            clickButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            clickButton.topAnchor.constraint(equalTo: topAnchor),
+            clickButton.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = hoverTrackingArea { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        hoverTrackingArea = area
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if isHovered {
+            let hoverPath = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: cornerRadius, yRadius: cornerRadius)
+            (isDark ? NSColor.white.withAlphaComponent(0.045) : NSColor.black.withAlphaComponent(0.025)).setFill()
+            hoverPath.fill()
+        }
+    }
+
+    func apply(host: CanonicalHostEnvironment) {
+        environmentId = host.environmentId
+        statusDot.state = host.state
+        let fallbackHost = host.cleanHostLabel
+        let hostPart = fallbackHost.count > 14 ? String(fallbackHost.prefix(13)) + "…" : fallbackHost
+        let emailPart = host.email.isEmpty ? L10n.t("common.unknown", fallback: "未知") : host.email
+        summaryLabel.stringValue = "\(hostPart) · \(emailPart)"
+        summaryLabel.textColor = host.state.isOfflineLike ? Design.secondary : .labelColor
+
+        switch host.state {
+        case .authExpired:
+            iconView.contentTintColor = accessibleWarningColor()
+        case .offlineRecent, .historicalOnly:
+            iconView.contentTintColor = Design.secondary
+        case .online:
+            iconView.contentTintColor = .secondaryLabelColor
+        }
+
+        let contract = QuotaPresentation.contract(host.rawSession)
+        let preferredGroup = contract.displayGroups.first(where: { $0.key.lowercased() == "gemini" })
+            ?? contract.displayGroups.first
+        let primaryPct = preferredGroup?.windows.compactMap(\.percentage).first
+            ?? contract.displayGroups.flatMap(\.windows).compactMap(\.percentage).first
+
+        if host.state == .authExpired {
+            quotaLabel.stringValue = L10n.t("ssh.picker.state.auth_expired", fallback: "授权已过期")
+            quotaLabel.textColor = accessibleWarningColor()
+        } else if let pct = primaryPct {
+            let clamped = max(0, min(100, pct))
+            quotaLabel.stringValue = "\(clamped)%"
+            if clamped <= 10 {
+                quotaLabel.textColor = accessibleDangerColor()
+            } else if clamped <= 20 {
+                quotaLabel.textColor = accessibleWarningColor()
+            } else {
+                quotaLabel.textColor = host.state.isOfflineLike ? Design.secondary : .labelColor
+            }
+        } else {
+            quotaLabel.stringValue = "—"
+            quotaLabel.textColor = Design.secondary
+        }
+
+        toolTip = nil
+        clickButton.toolTip = nil
+        clickButton.setAccessibilityLabel("\(fallbackHost), \(emailPart), \(quotaLabel.stringValue)")
+    }
+
+    @objc private func rowPressed() {
+        guard !environmentId.isEmpty else { return }
+        onSelect?(environmentId)
+    }
+}
+
+/// Tab 2 超过 2 台未保存远端主机时展示的可点击 `+N 台 ▾` 分组菜单按钮。
+final class MenuRemoteMoreHostsButton: DesignButton {
+    private(set) var extraHosts: [CanonicalHostEnvironment] = []
+    var onSelect: ((String) -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        title = ""
+        bezelStyle = .rounded
+        isBordered = false
+        controlSize = .small
+        font = .systemFont(ofSize: 11, weight: .medium)
+        let chevron = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9.5, weight: .semibold))
+        chevron?.isTemplate = true
+        image = chevron
+        imagePosition = .imageTrailing
+        target = self
+        action = #selector(buttonPressed)
+        toolTip = nil
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(extraHosts: [CanonicalHostEnvironment]) {
+        self.extraHosts = extraHosts
+        guard !extraHosts.isEmpty else {
+            isHidden = true
+            title = ""
+            toolTip = nil
+            return
+        }
+        title = L10n.t("overview.ssh.more_hosts_menu", ["count": extraHosts.count], fallback: "+\(extraHosts.count) 台")
+        toolTip = nil
+        setAccessibilityLabel(
+            L10n.t("usage.env.more_hosts_a11y", ["count": extraHosts.count], fallback: "更多 \(extraHosts.count) 台 SSH 主机")
+        )
+        isHidden = false
+    }
+
+    func buildMenu() -> NSMenu {
+        let items: [EnvironmentContextPill.Item] = extraHosts.map { host in
+            let contract = QuotaPresentation.contract(host.rawSession)
+            let preferredGroup = contract.displayGroups.first(where: { $0.key.lowercased() == "gemini" })
+                ?? contract.displayGroups.first
+            let primaryPct = preferredGroup?.windows.compactMap(\.percentage).first
+                ?? contract.displayGroups.flatMap(\.windows).compactMap(\.percentage).first
+            let secondary: String?
+            if host.state == .authExpired {
+                secondary = L10n.t("ssh.picker.state.auth_expired", fallback: "授权已过期")
+            } else if let pct = primaryPct {
+                secondary = "\(max(0, min(100, pct)))%"
+            } else {
+                secondary = nil
+            }
+            return EnvironmentContextPill.Item(
+                scope: .remote(environmentId: host.environmentId),
+                hostLabel: host.cleanHostLabel,
+                state: host.state,
+                windowCount: host.windowCount,
+                email: host.email.isEmpty ? nil : host.email,
+                secondaryText: secondary
+            )
+        }
+        let menu = SshEnvironmentVisuals.buildGroupedMenu(items: items, fontSize: 12.5, minimumWidth: 204)
+        for item in menu.items where item.representedObject != nil {
+            item.target = self
+            item.action = #selector(menuItemSelected(_:))
+        }
+        return menu
+    }
+
+    @objc private func buttonPressed() {
+        guard !extraHosts.isEmpty else { return }
+        if let panel = window as? MenuFloatingPanel, !panel.isKeyWindow {
+            panel.makeKey()
+        }
+        Design.popUpMenu(buildMenu(), below: self)
+    }
+
+    @objc private func menuItemSelected(_ sender: NSMenuItem) {
+        guard let envId = sender.representedObject as? String, !envId.isEmpty else { return }
+        onSelect?(envId)
     }
 }
 

@@ -7,8 +7,10 @@ import{DEEP_STEPS,traverseDeep,sanitizeNativeMenus,deepMarkdown}from'../dist/dee
 test('插件扫描仅读取展示字段，拒绝符号链接和凭据形状，不执行插件',async()=>{
  const temp=await mkdtemp(join(tmpdir(),'gravitybox-plugin-test-'));try{
   const root=join(temp,'plugins');await mkdir(root);await mkdir(join(root,'safe'));await writeFile(join(root,'safe','plugin.json'),JSON.stringify({name:'safe-plugin',displayName:'Sample',description:'A useful plugin description',mcpServers:{apiKey:'private-key-must-not-appear'},scripts:{install:'must-not-run'}}));
-  await mkdir(join(root,'linked'));await writeFile(join(temp,'outside.json'),JSON.stringify({name:'outside',description:'must-not-read'}));await symlink(join(temp,'outside.json'),join(root,'linked','plugin.json'));
-  const catalog=await readPluginCatalog(root,new AbortController().signal);assert.equal(catalog.entries.length,1);assert.equal(catalog.inspectedFiles,1);assert.ok(catalog.skipped>0);assert.equal(JSON.stringify(catalog).includes('private-key'),false);assert.equal(catalog.entries[0].onlineEligible,false);assert.equal(pluginDisplay({name:'bad',description:'Bearer secret-value'},'bad'),undefined);
+  await mkdir(join(root,'linked'));await writeFile(join(temp,'outside.json'),JSON.stringify({name:'outside',description:'must-not-read'}));
+  let linkedCreated=false;
+  try{await symlink(join(temp,'outside.json'),join(root,'linked','plugin.json'));linkedCreated=true;}catch(err){if(process.platform!=='win32'||err?.code!=='EPERM')throw err;await symlink(join(temp),join(root,'linked-dir'),'junction');linkedCreated=true;}
+  const catalog=await readPluginCatalog(root,new AbortController().signal);assert.equal(catalog.entries.length,1);assert.equal(catalog.inspectedFiles,1);assert.ok(!linkedCreated||catalog.skipped>0);assert.equal(JSON.stringify(catalog).includes('private-key'),false);assert.equal(catalog.entries[0].onlineEligible,false);assert.equal(pluginDisplay({name:'bad',description:'Bearer secret-value'},'bad'),undefined);
   appendPluginViews(catalog,[{id:'public',name:'Public',description:'Public description',source:'marketplace-view'},{id:'untrusted',name:'Untrusted',description:'not accepted',source:'arbitrary'}]);assert.equal(catalog.entries.length,2);
  }finally{await rm(temp,{recursive:true,force:true})}
 });

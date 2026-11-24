@@ -1,19 +1,20 @@
 import test from "node:test";
 import { describe as describeContractGroup } from "node:test";
 import assert from "node:assert/strict";
-import { dictionaryFromEntries, loadDictionaryLayers, migrateLegacyIncrementalDictionaries, DictionaryStore } from "../dist/dictionary.js";
+import { dictionaryFromEntries, loadDictionaryLayers, migrateLegacyIncrementalDictionaries, DictionaryStore, validateTemplateRules } from "../dist/dictionary.js";
 import { coverageMetricSnapshot, coverageScopes, coverageTranslationLookup, createCoverage, extractCoverageStrings, isCoverageNoise, recordCoverageVisit, recountCoverage, resolveCoverageTranslation, shouldHideCoverageRow, filterCoverageEntries } from "../dist/coverage.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { safeRoute, scopedKey, decodeScopedKey, previewItemId, selectedPreviewItems } from "../dist/candidates.js";
+import { safeRoute, scopedKey, decodeScopedKey, describeContext, previewItemId, selectedPreviewItems } from "../dist/candidates.js";
 import { Controller } from "../dist/controller.js";
 import { fileURLToPath } from "node:url";
 import { validateTranslations } from "../tools/merge-translations.mjs";
 import { loadDictLayers } from "../tools/coverage-report.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { extractUiStrings, extractedKind } from "../dist/bundle.js";
+import { extractUiStrings, extractedKind, looksLikeNoise, foldDictionaryKey } from "../dist/bundle.js";
+import { extractInlineGroupsAst, inlineSlotViolations, resolveInlineGroupCoverage, validateInlineSlotLayout } from "../tools/extract-inline-groups-ast.mjs";
 
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("词典与抽取 · audit-p3-coverage", { concurrency: false }, async () => {
@@ -225,7 +226,7 @@ test('巡检编辑仅允许明确 UI，保留场景，修改后失效旧实机�
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("词典与抽取 · refactor", { concurrency: false }, async () => {
 const root = new URL('../', import.meta.url);
-async function state() { const directory = await mkdtemp('/tmp/gb-test-'); await mkdir(join(directory, '词典')); return directory; }
+async function state() { const directory = await mkdtemp(join(tmpdir(), 'gb-test-')); await mkdir(join(directory, '词典')); return directory; }
 
 test('运行时与发布门禁采用相同词典优先级', async () => {
   const runtime = await loadDictionaryLayers(fileURLToPath(new URL('dict/', root))); const gate = await loadDictLayers(fileURLToPath(new URL('dict/', root)));
@@ -492,5 +493,281 @@ test('P1-15: 栈扫描拦截多层嵌套括号量词 ReDoS 绕过，且 Dictiona
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('P0-3: looksLikeNoise 拦截带斜杠/数字 Tailwind 变体串，且不误伤正常小写英文短语', () => {
+  const tailwindNoise = [
+    'group-hover/plugin-row:pr-8 group-focus-within/plugin-row:pr-8',
+    'pr-2 group-hover/header:pr-16 group-focus-within/header:pr-16',
+  ];
+  for (const s of tailwindNoise) {
+    assert.equal(looksLikeNoise(s), true, `应判为 Tailwind 噪声：${s}`);
+  }
+  const normalPhrases = ['any time', 'add note', 'Add note', 'Any time', 'git pull'];
+  for (const s of normalPhrases) {
+    assert.equal(looksLikeNoise(s), false, `不应误杀正常英文短语：${s}`);
+  }
+});
+
+test('P2-3: runtime/engine.js 与 dist/dictionary.js 的 hasNestedQuantifiedGroup 跨端行为 100% 一致', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { hasNestedQuantifiedGroup: distHasNested } = await import('../dist/dictionary.js');
+  const engineSrc = await readFile(fileURLToPath(new URL('../runtime/engine.js', import.meta.url)), 'utf8');
+  const match = engineSrc.match(
+    /function isRepeatableBraceQuantifier\([\s\S]*?\n  function hasNestedQuantifiedGroup\([\s\S]*?\n  \}\r?\n(?=\s*function compileDeclarativeTemplateRules)/
+  );
+  assert.ok(match, 'runtime/engine.js 中应存在 isRepeatableBraceQuantifier 与 hasNestedQuantifiedGroup');
+  const { hasNestedQuantifiedGroup: runtimeHasNested } = runInNewContext(`${match[0]}; ({ hasNestedQuantifiedGroup })`);
+  assert.equal(typeof runtimeHasNested, 'function');
+
+  const cases = [
+    // 正例（存在嵌套量词 ReDoS 风险，预期 true）
+    ['^((?:a+)+)+$', true],
+    ['^([a-z]+(\\s+[a-z]+)+)+$', true],
+    ['^((a*)*)$', true],
+    ['^(a{1,3}){2,}$', true],
+    ['^(a+){2}$', true],
+    ['^(a+){1,}$', true],
+    ['^(a+)?$', true],
+    ['^(?:[a-z]+\\s*)+$', true],
+    ['^((a{2})+)$', true],
+    ['^(?:\\d+)+$', true],
+    ['^([\\(\\)a]+)+$', true],
+    // 反例（安全正则与边界转义/字符类，预期 false）
+    ['^Synced\\s+(\\d+)\\s+workspaces?$', false],
+    ['^([a-z+]+)\\s+(\\d+)$', false],
+    ['^([a-z*]+)\\s+(a\\+)+$', false],
+    ['^(a){1}$', false],
+    ['^(a{0,1})+$', false],
+    ['^\\((a+)\\)+$', false],
+    ['^([\\(\\)a]+)\\s+(\\d+)$', false],
+    ['^Processed\\s+(\\d+)\\s+items?$', false],
+    ['^(\\d+)(m|h|d|w|mo|y)$', false],
+    ['^([a-z]{1,1})$', false],
+  ];
+
+  for (const [pattern, expected] of cases) {
+    const distResult = distHasNested(pattern);
+    const runtimeResult = runtimeHasNested(pattern);
+    assert.equal(distResult, expected, `dist hasNestedQuantifiedGroup("${pattern}") 预期 ${expected}`);
+    assert.equal(runtimeResult, expected, `runtime hasNestedQuantifiedGroup("${pattern}") 预期 ${expected}`);
+    assert.equal(runtimeResult, distResult, `跨端结果不一致：${pattern}`);
+  }
+});
+
+test('P1-34 & P1-36: 2.34.0 新增词条与模板规则有效，且 proxy.err.* 中英文键与占位符完全对齐', async () => {
+  const dict = JSON.parse(await readFile(fileURLToPath(new URL('../dict/base.json', import.meta.url)), 'utf8'));
+  const required234Keys = [
+    'Enable Word Wrap',
+    'Disable Word Wrap',
+    'In System Settings, click {0}, choose {1}, then turn it on.',
+    'In System Settings, click {0}, choose {1}, then turn it on. Already on? Select {2}, click {3}, then click {4} and add it again.',
+    "In System Settings, turn on {0}. If it isn't in the list, drag it in from the small window next to System Settings.",
+    "In System Settings, turn on {0}. If it isn't in the list, drag it in from the small window next to System Settings. Already on? Select {1}, click {2}, then drag it back in from the small window.",
+  ];
+  for (const key of required234Keys) {
+    assert.equal(typeof dict[key], 'string', `dict/base.json 应包含 2.34.0 词条：${key}`);
+    assert.match(dict[key], /[\u4e00-\u9fff]/, `2.34.0 词条译文应含中文：${key}`);
+  }
+
+  const engineSrc = await readFile(fileURLToPath(new URL('../runtime/engine.js', import.meta.url)), 'utf8');
+  for (const ruleKey of [
+    'Relaunch {app} to finish Screen Recording.',
+    'Show {count} more subagents',
+    'Enable Word Wrap ({shortcut})',
+    'Disable Word Wrap ({shortcut})',
+    'Toggle Word Wrap ({shortcut})',
+    'Failed to save settings: {reason}',
+    'Failed to save project settings: {reason}',
+    'Configure {server}',
+  ]) {
+    assert.ok(engineSrc.includes(ruleKey), `runtime/engine.js 应包含 2.34.0 规则：${ruleKey}`);
+  }
+
+  const zh = JSON.parse(await readFile(fileURLToPath(new URL('../assets/i18n/zh-Hans.json', import.meta.url)), 'utf8'));
+  const en = JSON.parse(await readFile(fileURLToPath(new URL('../assets/i18n/en.json', import.meta.url)), 'utf8'));
+  const proxyKeys = [
+    'proxy.err.url_must_be_string',
+    'proxy.err.url_empty',
+    'proxy.err.url_invalid_chars',
+    'proxy.err.url_invalid',
+    'proxy.err.unsupported_scheme_named',
+    'proxy.err.unsupported_scheme',
+    'proxy.err.missing_host',
+    'proxy.err.disallowed_path_query_fragment',
+    'proxy.err.missing_port',
+    'proxy.err.invalid_host_port',
+    'proxy.err.invalid_port',
+    'proxy.err.invalid_mode',
+    'proxy.err.manual_url_must_be_string',
+  ];
+  const ph = (s) => (s.match(/\{[a-zA-Z0-9_.-]+\}/g) ?? []).sort().join('|');
+  for (const k of proxyKeys) {
+    assert.equal(typeof zh.backend[k], 'string', `zh-Hans.json 缺少 ${k}`);
+    assert.equal(typeof en.backend[k], 'string', `en.json 缺少 ${k}`);
+    assert.match(zh.backend[k], /[\u4e00-\u9fff]/, `zh-Hans.json.${k} 应为中文`);
+    assert.equal(ph(zh.backend[k]), ph(en.backend[k]), `${k} 占位符应完全一致`);
+  }
+});
+
+test('P2-17 ~ P2-22: 语言包补齐、HUD 三方同步、template 上下文、setBaseDir 重建监听与 engine.js 更新防交错', async () => {
+  const [zhRaw, enRaw, engineSrc, hudMod] = await Promise.all([
+    readFile(fileURLToPath(new URL('../assets/i18n/zh-Hans.json', import.meta.url)), 'utf8'),
+    readFile(fileURLToPath(new URL('../assets/i18n/en.json', import.meta.url)), 'utf8'),
+    readFile(fileURLToPath(new URL('../runtime/engine.js', import.meta.url)), 'utf8'),
+    import('../runtime/hud-i18n.js'),
+  ]);
+  const zh = JSON.parse(zhRaw);
+  const en = JSON.parse(enRaw);
+
+  // P2-17: quota.standalone.daily_known
+  assert.equal(zh.backend['quota.standalone.daily_known'], '{shortLabel} 每日配额已取得（剩余 {pct}%）');
+  assert.equal(en.backend['quota.standalone.daily_known'], '{shortLabel} daily quota retrieved ({pct}% remaining)');
+
+  // P2-18: snapshot(s) 单复数修复
+  assert.equal(en.app['overview.ssh.companion_offline_suffix'], ' ({count} offline snapshot(s))');
+
+  // P2-20: candidate.kind.template 映射与双语词条
+  assert.equal(zh.backend['candidate.kind.template'], '模板');
+  assert.equal(en.backend['candidate.kind.template'], 'Template');
+  assert.match(describeContext({ route: '/settings', kind: 'template' }), /模板|Template/);
+
+  // P2-21: engine.js updateGeneration 与大小写不敏感匹配
+  assert.ok(engineSrc.includes('let updateGeneration = 0;'), 'engine.js 应维护 updateGeneration 令牌');
+  assert.ok(engineSrc.includes("brand.toLowerCase() === 'claude and gpt'"), 'engine.js 应使用大小写不敏感的 Claude and GPT 判断');
+
+  // P2-22: HUD_I18N 与语言包三方 100% 对齐，且确认废弃的 7 个 hud key 与 10 个 OAuth key 已清理
+  assert.deepEqual(hudMod.HUD_I18N['zh-Hans'], zh.hud);
+  assert.deepEqual(hudMod.HUD_I18N.en, en.hud);
+  for (const deadHud of ['lblStageSectionOrchestrator', 'stageRolePlanner', 'stageCompactionBadge', 'ariaContextSessionCompNote']) {
+    assert.equal(deadHud in zh.hud, false);
+    assert.equal(deadHud in en.hud, false);
+  }
+  assert.equal('add_account.google_title' in zh.app, false);
+  assert.equal('add_account.google_title' in en.app, false);
+
+  // P2-19: DictionaryStore.setBaseDir 切换目录后重建 watcher 并能响应新目录热更新
+  const dir = await mkdtemp(join(tmpdir(), 'gb-p2-19-'));
+  try {
+    const baseA = join(dir, 'base-a');
+    const baseB = join(dir, 'base-b');
+    await mkdir(baseA, { recursive: true });
+    await mkdir(baseB, { recursive: true });
+    await writeFile(join(baseA, 'base.json'), JSON.stringify({ Open: '打开' }));
+    await writeFile(join(baseB, 'base.json'), JSON.stringify({ Open: '开启' }));
+    const store = new DictionaryStore(baseA);
+    await store.start();
+    try {
+      assert.equal(store.current?.entries.Open, '打开');
+      await store.setBaseDir(baseB);
+      assert.equal(store.current?.entries.Open, '开启');
+      const updated = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('setBaseDir 后新目录变更未触发 watcher 热更新')), 2500);
+        store.once('updated', (next) => {
+          clearTimeout(timer);
+          resolve(next);
+        });
+      });
+      await writeFile(join(baseB, 'base.json'), JSON.stringify({ Open: '立即开启' }));
+      const nextDict = await updated;
+      assert.equal(nextDict.entries.Open, '立即开启');
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('模板规则双向隔离、实体槽位收紧、全量语料碰撞门禁与 JSX 内联组提取校验', async () => {
+  const [engineSrc, uiRaw, dictRaw] = await Promise.all([
+    readFile(fileURLToPath(new URL('../runtime/engine.js', import.meta.url)), 'utf8'),
+    readFile(fileURLToPath(new URL('../ui-strings/2.34.0.json', import.meta.url)), 'utf8'),
+    readFile(fileURLToPath(new URL('../dict/base.json', import.meta.url)), 'utf8'),
+  ]);
+  const ui = JSON.parse(uiRaw);
+  const dict = JSON.parse(dictRaw);
+
+  // 1. validateTemplateRules 拒绝非内联规则在 replacement 中注入 {0} 占位符
+  const filteredRules = validateTemplateRules([
+    { key: 'Configure {server}', pattern: '^Configure\\s+(.+)$', replacement: '配置 {0}' },
+    { key: 'Safe {0} rule', pattern: '^Safe\\s+\\{0\\}\\s+rule$', replacement: '安全 {0} 规则' },
+  ]);
+  assert.equal(filteredRules.length, 1);
+  assert.equal(filteredRules[0].key, 'Safe {0} rule');
+
+  // 2. 直接执行 runtime/engine.js 中的 TEMPLATE_RULES + isEntityNameSlot 校验全量语料防碰撞
+  const startIdx = engineSrc.indexOf('const ENTITY_PROSE_STOP_WORDS =');
+  const endIdx = engineSrc.indexOf('function translateKeybindingExamples');
+  assert.ok(startIdx > 0 && endIdx > startIdx, 'runtime/engine.js 应包含 ENTITY_PROSE_STOP_WORDS 与 TEMPLATE_RULES');
+  const snippet = engineSrc.slice(startIdx, endIdx);
+  const rules = new Function(
+    'MODEL_GROUP_LABEL', 'formatDuration', 'nestedLabel', 'entryFor', 'isRelativeTimeBadge', 'isElapsedDurationNode', 'translateKeybindingExamples',
+    `${snippet}\nfor (const r of TEMPLATE_RULES) r.inlineOnly = /\\{\\d+\\}/.test(r.key);\nreturn TEMPLATE_RULES;`
+  )(/^Models within this group:\s*(.*)$/i, d => d, s => s, () => undefined, () => false, () => false, s => s);
+
+  const matchWithRules = (text) => {
+    const hasInlineSlot = /\{\d+\}/.test(text);
+    for (const rule of rules) {
+      if (Boolean(rule.inlineOnly) !== hasInlineSlot) continue;
+      const m = text.match(rule.pattern);
+      if (!m) continue;
+      if (rule.guard && !rule.guard(null, m)) continue;
+      const replaced = text.replace(rule.pattern, rule.replace);
+      if (!hasInlineSlot && /\{\d+\}/.test(replaced)) continue;
+      return { key: rule.key, replaced };
+    }
+    return null;
+  };
+
+  // 2a. Configure {server} 必须匹配短实体名，但绝不匹配完整英文长句或含 {0} 的内联组
+  assert.equal(matchWithRules('Configure chrome-devtools')?.replaced, '配置 chrome-devtools');
+  assert.equal(matchWithRules('Configure what the agent can do in local and remote conversations.'), null);
+  assert.equal(matchWithRules('Configure what the agent can do in local and remote conversations. {0}.'), null);
+  assert.equal(matchWithRules('Configure global allowed and denied resource permissions. {0}.'), null);
+  assert.equal(matchWithRules('Configure default behaviors, skills, and MCP servers. {0}.'), null);
+
+  const folded = new Map();
+  for (const [k, v] of Object.entries(dict)) {
+    const f = foldDictionaryKey(k);
+    if (!folded.has(f)) folded.set(f, v);
+  }
+
+  // 2b. 全量 2.34.0 非 template/fragment 句子及其合成 {0}. 变体：任何非 inlineOnly 规则都不得命中 {0} 串，也不得吞噬完整英文长句或未收录词条
+  for (const row of ui.strings) {
+    if (row.kinds?.includes('template') || row.kinds?.includes('fragment')) continue;
+    const syntheticInline = `${row.text} {0}.`;
+    const inlineHit = matchWithRules(syntheticInline);
+    if (inlineHit) {
+      const matchedRule = rules.find(r => r.key === inlineHit.key);
+      assert.equal(matchedRule?.inlineOnly, true, `非 inlineOnly 规则 ${inlineHit.key} 不得匹配内联串：${syntheticInline}`);
+    }
+    const plainHit = matchWithRules(row.text);
+    if (plainHit && plainHit.key === 'Configure {server}') {
+      assert.equal(folded.has(foldDictionaryKey(row.text)), true, `Configure {server} 不应命中未收录静态句：${row.text}`);
+      assert.equal(/[.?!]/.test(row.text), false, `Configure {server} 不应吞噬带标点完整句：${row.text}`);
+    }
+  }
+
+  // 3. extract-inline-groups-ast.mjs 提取与槽位布局校验
+  const sampleJsx = `
+    const A = E.createElement("span", null, ua ? "Configure what the agent can do in local and remote conversations." : "Configure global allowed and denied resource permissions.", " ", E.createElement("a", { href: "#" }, "Learn more"), ".");
+    const B = _jsx("p", { children: ["Visit ", _jsx("a", { href: "#", children: "Legal Help" }), " for info."] });
+    const C = E.createElement("div", null, "Plain text ", cond && E.createElement(E.Fragment, null, E.createElement("a", { href: "#" }, "Learn more"), "."));
+  `;
+  const extracted = extractInlineGroupsAst(sampleJsx).map(x => x.text);
+  assert.ok(extracted.includes('Configure what the agent can do in local and remote conversations. {0}.'));
+  assert.ok(extracted.includes('Configure global allowed and denied resource permissions. {0}.'));
+  assert.ok(extracted.includes('Visit {0} for info.'));
+  assert.ok(extracted.includes('Plain text {0}.'));
+
+  assert.equal(validateInlineSlotLayout('Gronk {0}', '{0}，请阅读').ok, false);
+  assert.equal(validateInlineSlotLayout('Blorp {0} zib {1}.', '先 {1}，再 {0}。').ok, false);
+  assert.equal(validateInlineSlotLayout('Configure {0}.', '配置 {0}。').ok, true);
+  assert.equal(inlineSlotViolations(dict).length, 0, 'dict/base.json 不应存在内联槽位布局违规');
+
+  assert.equal(resolveInlineGroupCoverage('Configure what the agent can do in local and remote conversations. {0}.', folded).mode, 'compositional');
+  assert.equal(resolveInlineGroupCoverage('This Google Cloud project is not supported. Input a different project, or sign in with another account. {0}', folded).mode, 'compositional');
+  assert.equal(resolveInlineGroupCoverage('Are you sure you want to delete {0}? This action cannot be undone.', folded).mode, 'compositional');
 });
 });

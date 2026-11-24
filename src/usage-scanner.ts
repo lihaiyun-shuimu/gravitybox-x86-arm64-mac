@@ -2,7 +2,7 @@ import { readdir, lstat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { DataDirectoryName } from './application-target.js';
-import { SqliteReadSnapshot, runUsageDbScanInWorker } from './sqlite-read.js';
+import { runUsageDbScanInWorker } from './sqlite-read.js';
 import { ProtobufReader } from './protobuf.js';
 import { USAGE_PROJECTION_VERSION } from './protobuf-projection.js';
 import type { LedgerEvent } from './usage-ledger.js';
@@ -26,6 +26,17 @@ export interface DiscoveredDbStat {
   at: number;
 }
 
+export type UsageWorkerScanner = (
+  req: { dbPath: string },
+  signal?: AbortSignal
+) => Promise<
+  Awaited<ReturnType<typeof runUsageDbScanInWorker>> & {
+    trajectoryType?: number;
+    forkStepIndex?: number;
+    forkParentCascadeId?: string;
+  }
+>;
+
 export interface UsageScanContext {
   discoveredStats: Map<string, DiscoveredDbStat>;
   fileCache: Map<string, FileCacheEntry>;
@@ -35,6 +46,7 @@ export interface UsageScanContext {
   loadUsageLedger: () => Promise<void>;
   upsertLedger: (event: LedgerEvent) => void;
   getLedgerEvent: (eventKey: string) => LedgerEvent | undefined;
+  scanDbWorker?: UsageWorkerScanner;
 }
 
 export interface StepLinkCandidate {
@@ -122,17 +134,6 @@ export function resolveLinkedStepTimestamp(
   return 0;
 }
 
-export async function querySqlite(
-  dbPath: string,
-  sql: string,
-  signal?: AbortSignal,
-  reader?: SqliteReadSnapshot
-): Promise<{ ok: boolean; rows: any[]; error?: string }> {
-  if (reader) return reader.query(sql);
-  const owned = new SqliteReadSnapshot(dbPath, signal);
-  try { return await owned.query(sql); } finally { await owned.close(); }
-}
-
 export async function discoverDatabaseFiles(
   geminiDir: string,
   dataDirectoryNames: readonly DataDirectoryName[],
@@ -216,47 +217,6 @@ export async function discoverDatabaseFiles(
   return { paths: list.slice(0, maxFiles).map(x => x.path), errors, discoveredCount: list.length };
 }
 
-export async function blobRows(
-  dbPath: string,
-  table: 'gen_metadata' | 'steps',
-  column: 'data' | 'metadata',
-  where: string,
-  onRows?: (rows: any[]) => void,
-  knownIndex?: any[],
-  signal?: AbortSignal,
-  reader?: SqliteReadSnapshot
-): Promise<{ ok: boolean; rows: any[]; error?: string }> {
-  const index = knownIndex ? { ok: true, rows: knownIndex } : await querySqlite(dbPath, `SELECT idx, length(${column}) as size FROM ${table} WHERE ${where} ORDER BY idx;`, signal, reader);
-  if (!index.ok) return index;
-  const result: any[] = [];
-  let batch: any[] = [], bytes = 0;
-  const flush = async () => {
-    signal?.throwIfAborted();
-    if (!batch.length) return;
-    const ids = batch.map(row => Number(row.idx)).filter(Number.isSafeInteger);
-    if (ids.length !== batch.length) throw new Error(bt('scanner.err.unsupported_row_index'));
-    const reply = await querySqlite(dbPath, `SELECT idx, length(${column}) as size, ${column} as data_blob FROM ${table} WHERE idx IN (${ids.join(',')}) ORDER BY idx;`, signal, reader);
-    if (!reply.ok) throw new Error(reply.error);
-    if (onRows) onRows(reply.rows); else result.push(...reply.rows);
-    batch = []; bytes = 0;
-  };
-  try {
-    for (const row of index.rows) {
-      if (row.size > 16777216) {
-        await flush();
-        const projected = reader ? await reader.projectBlob(table, column, Number(row.idx)) : null;
-        const value = projected?.ok ? projected.rows[0] : { ...row, data_hex: '' };
-        if (onRows) onRows([value]); else result.push(value); continue;
-      }
-      if (batch.length >= 200 || (bytes + row.size > 2 * 1024 * 1024 && batch.length)) await flush();
-      batch.push(row); bytes += Number(row.size) || 0;
-    }
-    await flush();
-    result.sort((a, b) => Number(a.idx) - Number(b.idx));
-    return { ok: true, rows: result };
-  } catch (error) { return { ok: false, rows: [], error: (error as Error).message }; }
-}
-
 export function isTransientSqliteReadError(message = ''): boolean {
   return /跨批读取期间变化|changed across batches|busy|locked|no such table|连接已关闭|connection closed|超出单批预算|exceeded batch budget|unable to open/i.test(message);
 }
@@ -274,6 +234,7 @@ export async function scanDatabaseEvents(ctx: UsageScanContext, dbPath: string, 
   events: GenerationEvent[];
   generationsScanned: number;
   skippedLargeRecords: number;
+  excludedForkedGenIndices?: number[];
   hasError?: boolean;
   error?: string;
   usedCached?: boolean;
@@ -284,6 +245,9 @@ export async function scanDatabaseEvents(ctx: UsageScanContext, dbPath: string, 
     if (!lastResult.hasError || signal?.aborted || !isTransientSqliteReadError(lastResult.error)) break;
     await new Promise(resolve => setTimeout(resolve, attempt * 100));
     if (signal?.aborted) break;
+    lastResult = await scanDatabaseEventsOnce(ctx, dbPath, true, signal);
+  }
+  if (!lastResult.hasError && lastResult.changedDuringScan && !signal?.aborted) {
     lastResult = await scanDatabaseEventsOnce(ctx, dbPath, true, signal);
   }
   if (lastResult.hasError && !signal?.aborted && await isInitializingOrRemovedDb(dbPath, lastResult.error)) {
@@ -303,10 +267,12 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   events: GenerationEvent[];
   generationsScanned: number;
   skippedLargeRecords: number;
+  excludedForkedGenIndices?: number[];
   hasError?: boolean;
   error?: string;
   usedCached?: boolean;
   cacheHit?: boolean;
+  changedDuringScan?: boolean;
 }> {
   let fileStat: { dev: number; ino: number; birthtimeMs: number; mtimeMs: number; size: number } | null = null;
   let walMtimeMs = 0;
@@ -363,7 +329,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     // ignore
   }
 
-  const workerScan = await runUsageDbScanInWorker({ dbPath }, signal);
+  const workerScan = await (ctx.scanDbWorker ?? runUsageDbScanInWorker)({ dbPath }, signal);
   if (!workerScan.ok) {
     const cached = ctx.fileCache.get(dbPath);
     const errText = workerScan.changedDuringRead ? bt('scanner.err.changed_across_batches') : workerScan.error;
@@ -432,7 +398,30 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     return { events: [], generationsScanned: 0, skippedLargeRecords: 0, hasError: false };
   }
 
+  const forkScan = workerScan as {
+    trajectoryType?: number;
+    forkStepIndex?: number;
+    forkParentCascadeId?: string;
+  };
+  const hasForkCutoff =
+    typeof forkScan.forkParentCascadeId === 'string' &&
+    forkScan.forkParentCascadeId.trim().length > 0 &&
+    typeof forkScan.forkStepIndex === 'number' &&
+    Number.isSafeInteger(forkScan.forkStepIndex) &&
+    forkScan.forkStepIndex >= 0;
+  const forkStepIndex = hasForkCutoff ? forkScan.forkStepIndex! : -1;
+  const excludedForkedGenIndices: number[] = [];
+
   const validTimestamp = (value: number) => Number.isSafeInteger(value) && value >= 946684800 && value <= Date.now() / 1000 + 86400;
+  const siblingModelIds = new Set<string>();
+  for (const row of workerScan.genRows) {
+    if (!row.data_blob || (row.size > 16 * 1024 * 1024 && !row.projected)) continue;
+    const blob = Buffer.from(row.data_blob.buffer, row.data_blob.byteOffset, row.data_blob.byteLength);
+    const wrapped = ProtobufReader.findField(blob, 1);
+    if (!wrapped) continue;
+    const mid = ProtobufReader.findString(wrapped, 19);
+    if (mid && mid.trim()) siblingModelIds.add(mid.trim());
+  }
   const pendingStepLinks: { event: GenerationEvent; indices: number[]; execution: Buffer | null; usage: Buffer }[] = [];
   for (const row of workerScan.genRows) {
     generationsScanned++;
@@ -443,6 +432,17 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     if (!row.data_blob) continue;
 
     const blob = Buffer.from(row.data_blob.buffer, row.data_blob.byteOffset, row.data_blob.byteLength);
+    let stepIndices: number[] | null | undefined;
+    if (hasForkCutoff) {
+      stepIndices = ProtobufReader.stepIndices(blob);
+      if (stepIndices !== null && stepIndices.length > 0 && stepIndices.every(i => i <= forkStepIndex)) {
+        const genIdx = Number(row.idx);
+        if (Number.isSafeInteger(genIdx) && genIdx >= 0) {
+          excludedForkedGenIndices.push(genIdx);
+        }
+        continue;
+      }
+    }
     const wrapped = ProtobufReader.findField(blob, 1);
     if (!wrapped) continue;
 
@@ -480,7 +480,10 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
     if (!validTimestamp(timestamp)) timestamp = 0;
 
     const modelEnum = ProtobufReader.findVarint(wrapped, 3) ?? ProtobufReader.findVarint(usage, 1) ?? null;
-    const assignedModel = resolveDatabaseModelFullName(modelId, label, modelEnum, { canonicalUnknown: true });
+    const assignedModel = resolveDatabaseModelFullName(modelId, label, modelEnum, {
+      canonicalUnknown: true,
+      ...(siblingModelIds.size > 0 ? { siblingModelIds } : {}),
+    });
     const lockModelKey = modelId || label || '未知模型';
 
     const observedCtx = ctx.lookupObservedContext(timestamp);
@@ -509,7 +512,7 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
       ...(accountType ? { account_type: accountType } : {}),
     };
     if (timestamp === 0) {
-      const indices = ProtobufReader.stepIndices(blob);
+      const indices = stepIndices !== undefined ? stepIndices : ProtobufReader.stepIndices(blob);
       if (indices !== null) {
         pendingStepLinks.push({ event: eventObj, indices, execution: ProtobufReader.findField(blob, 4), usage });
       }
@@ -574,20 +577,41 @@ async function scanDatabaseEventsOnce(ctx: UsageScanContext, dbPath: string, byp
   const unknownTime = events.some(event => event.timestamp_seconds <= 0);
   const hasError = !stepOk && unknownTime;
   const timeError = hasError ? bt('scanner.err.timestamp_read_failed') : undefined;
-  ctx.setFileCacheEntry(dbPath, {
-    mtimeMs: after.mtimeMs,
-    size: after.size,
-    walMtimeMs: afterWal?.mtimeMs ?? 0,
-    walSize: afterWal?.size ?? 0,
+  const changedDuringScan = Boolean(
+    fileStat && (
+      after.mtimeMs !== fileStat.mtimeMs ||
+      after.size !== fileStat.size ||
+      (afterWal?.mtimeMs ?? 0) !== walMtimeMs ||
+      (afterWal?.size ?? 0) !== walSize
+    )
+  );
+  if (changedDuringScan) {
+    // Do not bind a snapshot read before/during a WAL append to the newer file fingerprint.
+    ctx.fileCache.delete(dbPath);
+  } else {
+    ctx.setFileCacheEntry(dbPath, {
+      mtimeMs: after.mtimeMs,
+      size: after.size,
+      walMtimeMs: afterWal?.mtimeMs ?? 0,
+      walSize: afterWal?.size ?? 0,
+      events,
+      generationsScanned,
+      skippedLargeRecords,
+      projectionVersion: USAGE_PROJECTION_VERSION,
+      hasError,
+      error: timeError,
+      lastSuccessAt: hasError ? ctx.fileCache.get(dbPath)?.lastSuccessAt : Math.floor(Date.now() / 1000),
+    });
+    if (!hasError) ctx.markFileCacheDirty();
+  }
+
+  return {
     events,
     generationsScanned,
     skippedLargeRecords,
-    projectionVersion: USAGE_PROJECTION_VERSION,
+    ...(excludedForkedGenIndices.length > 0 ? { excludedForkedGenIndices } : {}),
     hasError,
     error: timeError,
-    lastSuccessAt: hasError ? ctx.fileCache.get(dbPath)?.lastSuccessAt : Math.floor(Date.now() / 1000),
-  });
-  if (!hasError) ctx.markFileCacheDirty();
-
-  return { events, generationsScanned, skippedLargeRecords, hasError, error: timeError };
+    ...(changedDuringScan ? { changedDuringScan: true } : {}),
+  };
 }

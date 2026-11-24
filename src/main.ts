@@ -1,8 +1,7 @@
 import { ALLOWED_DATA_DIRECTORY_NAMES, applicationChannel, savedApplicationChannel, applicationTarget, detectInstalledChannels, type ApplicationChannel, type ApplicationTarget } from './application-target.js';
 import { GoogleAccountLogin } from './account-oauth.js';
 import { AccountSwitchService } from './account-switch.js';
-import { AccountsManager, accountCredentialReadiness, accountErrorCode, cleanAndLocalizeRefreshError, computeStandbyRefreshStatus, getGoogleClientId, getGoogleClientSecret, hasExpiredQuotaWindow, mergeSubscriptionTier, type Account, type QuotaBucket, type QuotaData, type QuotaGroup } from './accounts.js';
-import { classifyFamily, classifyWindow, normalizeResetTime } from './quota.js';
+import { AccountsManager, accountCredentialReadiness, accountErrorCode, cleanAndLocalizeRefreshError, computeStandbyRefreshStatus, getGoogleClientId, getGoogleClientSecret, hasExpiredQuotaWindow, type Account, type QuotaData } from './accounts.js';
 import { UsageStatsManager } from './usage.js';
 import {
   buildPricingCatalogPayloadSnapshot,
@@ -21,15 +20,21 @@ export {
   type LiveIdeModelsSnapshot,
 };
 import {
+  EnvironmentRegistry,
+  fuseAccountQuotaAcrossEnvironments,
+  mergeLiveQuotaWithSaved,
   normalizeSubscriptionTier,
   projectAccountForIpcNormalized as projectAccountNormalizedWithManager,
   projectAllUsagePeriodSummaries,
   projectQuotaContract,
+  projectSingleUsagePeriod,
   projectUsagePeriodSummary,
+  type EnvironmentRegistryLocalAccountInput,
+  type RemoteQuotaCandidate,
 } from './ipc-projections.js';
-export { normalizeSubscriptionTier, projectQuotaContract };
+export { mergeLiveQuotaWithSaved, normalizeSubscriptionTier, projectQuotaContract };
 import { CacheMaintenance } from './maintenance.js';
-import { mkdir, lstat, chmod, unlink, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, lstat, chmod, readFile, readdir, writeFile } from 'node:fs/promises';
 import { realpathSync, readFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -40,7 +45,16 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DictionaryStore, loadDictionary, dictionaryFromEntries, validateEntries, validateTemplateRules, resolveDictionaryForLocale } from './dictionary.js';
 import { bt, getActiveLocale, setActiveLocale, resolveInitialRuntimeLanguage, resolveLocale } from './i18n.js';
-import { Controller, type AssistantStatus } from './controller.js';
+import { Controller, type AssistantStatus, type RemoteSessionState } from './controller.js';
+import {
+  RemoteUsageSyncCoordinator,
+  buildRemoteEnvironmentId,
+  type RemoteGenerationEvent,
+  type RemoteUsageSyncReceipt,
+} from './remote-usage-sync.js';
+import { cleanHostLabel } from './ssh-context.js';
+import type { LedgerEvent } from './usage-ledger.js';
+import type { AvailableEnvironmentUsageOption, EnvironmentLifecycleState, KnownEnvironmentContext, SyncReceipt, TokenUsageSummary } from './usage-types.js';
 import { coverageMetricSnapshot } from './coverage.js';
 import { atomicJson, readOptionalJson, sanitizeError } from './files.js';
 import { discover } from './discovery.js';
@@ -49,6 +63,28 @@ import { acquireProcessLease, type ProcessLease } from './process-lock.js';
 import { createHash } from 'node:crypto';
 import { IdempotencyStore, canonicalPayload } from './ipc-idempotency.js';
 export { canonicalPayload } from './ipc-idempotency.js';
+import { loadProxyConfigFromStateDir, redactProxyUrl, resolveEffectiveProxy, setRuntimeProxyConfig } from './proxy.js';
+import {
+  appProcesses,
+  cleanupIpcEndpoint,
+  cleanupIpcSession,
+  defaultAntigravityInstallDirs,
+  defaultAppSupportDir,
+  defaultGravityBoxStateDir,
+  finalizeIpcEndpointAfterListen,
+  isOwnedByCurrentUser,
+  isPathUnder,
+  isWindows,
+  pathsEqual,
+  prepareIpcEndpointForListen,
+  prepareWindowsIpcForListen,
+  resolveClientIpcTarget,
+  resolveIpcEndpoint,
+  validateIpcEndpointForClient,
+  verifyIpcAuthToken,
+  writeIpcSession,
+  type WindowsIpcSession,
+} from './platform/index.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -61,7 +97,9 @@ function sanitizeErrorMessage(err: unknown): string {
   if (!(err instanceof Error)) return bt('common.action_incomplete');
   const msg = err.message || '';
   const redacted = sanitizeError(msg);
-  const sanitized = redacted.replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, bt('common.path_token'));
+  const sanitized = redacted
+    .replace(/\/(?:Users|private|var|tmp|Volumes)\/[^\s'"]+/g, bt('common.path_token'))
+    .replace(/[A-Za-z]:\\(?:Users|ProgramData|Windows\\Temp)\\[^\s'"]+/gi, bt('common.path_token'));
   return sanitized.slice(0, 200);
 }
 
@@ -70,106 +108,6 @@ function formatResetTime(resetTime: number | null | undefined): string {
   const tsMs = typeof resetTime === 'number' && resetTime < 1e11 ? resetTime * 1000 : Number(resetTime);
   const date = new Date(tsMs);
   return !isNaN(date.getTime()) ? `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}` : String(resetTime);
-}
-
-function isFutureResetIso(resetTime: unknown, nowMs: number): boolean {
-  const iso = normalizeResetTime(resetTime);
-  if (!iso) return false;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) && ms > nowMs;
-}
-
-function isExpiredResetIso(resetTime: unknown, nowMs: number): boolean {
-  const iso = normalizeResetTime(resetTime);
-  if (!iso) return false;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) && ms <= nowMs;
-}
-
-/**
- * 合并本机实时语言服务配额与已保存账号配额：
- * - 当实时探测未返回分组时，保留已存分组及真实 `last_updated`（避免把旧数据伪标为刚刚刷新）；
- * - 若实时缓存返回了已过期窗口（reset_time <= nowMs），而已存配额对应语义窗口已有未过期的更新周期，则保留未过期窗口；
- * - 实时探测未返回有效模型或套餐降级 FREE 时，保留已存模型与真实高级套餐。
- */
-export function mergeLiveQuotaWithSaved(
-  savedQuota: QuotaData | null | undefined,
-  liveQuota: QuotaData | null | undefined,
-  nowMs: number = Date.now(),
-): QuotaData | null | undefined {
-  if (!liveQuota) return savedQuota;
-  if (!savedQuota) return liveQuota;
-  const savedGroups = savedQuota.quota_groups ?? [];
-  const liveGroups = liveQuota.quota_groups ?? [];
-  const hasLiveGroups = liveGroups.length > 0;
-  const hasSavedGroups = savedGroups.length > 0;
-  const hasKnownLiveModels = Array.isArray(liveQuota.models) && liveQuota.models.some(m => m?.percentage_known || m?.own_percentage_known);
-  const hasSavedModels = Array.isArray(savedQuota.models) && savedQuota.models.length > 0;
-  const liveComplete = liveQuota.refresh_state?.complete === true;
-  const mergedStaleGroups = liveQuota.stale_groups?.length
-    ? liveQuota.stale_groups
-    : (hasLiveGroups && liveComplete ? undefined : savedQuota.stale_groups);
-
-  let mergedGroups: QuotaGroup[];
-  if (!hasLiveGroups) {
-    mergedGroups = savedGroups;
-  } else if (!hasSavedGroups) {
-    mergedGroups = liveGroups;
-  } else {
-    const savedBucketsBySemantic = new Map<string, QuotaBucket>();
-    for (const sg of savedGroups) {
-      const fam = sg.family ?? classifyFamily({
-        groupName: sg.display_name,
-        description: sg.description,
-        bucketId: sg.buckets?.[0]?.bucket_id,
-      });
-      for (const sb of sg.buckets ?? []) {
-        if (sb.stale === true || sb.remaining_fraction_known === false) continue;
-        const win = sb.window ?? classifyWindow(undefined, sb.bucket_id, sb.display_name);
-        if (win === 'unspecified') continue;
-        if (isFutureResetIso(sb.reset_time, nowMs)) {
-          savedBucketsBySemantic.set(`${fam}:${win}`, sb);
-        }
-      }
-    }
-    mergedGroups = liveGroups.map(lg => {
-      const fam = lg.family ?? classifyFamily({
-        groupName: lg.display_name,
-        description: lg.description,
-        bucketId: lg.buckets?.[0]?.bucket_id,
-      });
-      const nextBuckets = (lg.buckets ?? []).map(lb => {
-        const win = lb.window ?? classifyWindow(undefined, lb.bucket_id, lb.display_name);
-        if (win !== 'unspecified' && isExpiredResetIso(lb.reset_time, nowMs)) {
-          const fresherSaved = savedBucketsBySemantic.get(`${fam}:${win}`);
-          if (fresherSaved) {
-            return { ...fresherSaved };
-          }
-        }
-        return lb;
-      });
-      return { ...lg, buckets: nextBuckets };
-    });
-  }
-
-  const effectiveLastUpdated =
-    !hasLiveGroups && hasSavedGroups && typeof savedQuota.last_updated === 'number' && savedQuota.last_updated > 0
-      ? savedQuota.last_updated
-      : liveQuota.last_updated;
-
-  const merged: QuotaData = {
-    ...savedQuota,
-    ...liveQuota,
-    last_updated: effectiveLastUpdated,
-    quota_groups: mergedGroups,
-    models: (hasLiveGroups || hasKnownLiveModels || !hasSavedModels) ? liveQuota.models : savedQuota.models,
-    subscription_tier: mergeSubscriptionTier(liveQuota.subscription_tier, savedQuota.subscription_tier, {
-      allowFreeDowngrade: hasLiveGroups || liveComplete || !savedQuota.subscription_tier,
-    }),
-  };
-  if (mergedStaleGroups?.length) merged.stale_groups = mergedStaleGroups;
-  else delete merged.stale_groups;
-  return merged;
 }
 
 export function resolveUnsavedLiveSubscriptionTier(
@@ -200,8 +138,102 @@ export type DashboardAggregateDeps = {
   getAccountQuotaOverview: (account: any, options?: any) => any;
   getUsageSummary: () => Promise<any>;
   getPricingTable: () => Promise<any>;
+  getRemoteSessions?: () => RemoteQuotaCandidate[];
 };
 export type DashboardAggregate = { accounts: any; usage: any; accountsError: string; usageError: string };
+
+/**
+ * 若本机非活跃账号正在任意在线 SSH 会话中登录，优先强制通过该 SSH 只读通道实时探测并回写配额展示快照；
+ * 成功时返回完整 IPC 响应对象，失败或无匹配在线会话时返回 null 以回退本地刷新路径。
+ */
+export async function refreshStandbyAccountViaRemoteSsh(deps: {
+  targetAcc: Account | null;
+  targetIsLocalActive: boolean;
+  hasLocalOAuthClient: boolean;
+  nowMs?: number;
+  getRemoteSessionsSnapshot: (nowMs?: number) => RemoteSessionState[];
+  probeRemoteByEnvironmentId: (environmentId: string) => Promise<unknown>;
+  syncRemoteObservedQuota: (accountId: string, quota: QuotaData, tier?: string | null) => Promise<Account | null>;
+  getAccount: (accountId: string) => Promise<Account | null>;
+  toRemoteCandidates: (sessions: RemoteSessionState[]) => RemoteQuotaCandidate[];
+  getAccountQuotaOverview: (account: Account, options: { nowMs: number }) => any;
+  projectAccount: (account: Account, opts: any) => any;
+  buildEnvironmentSnapshot: (opts: { nowMs: number }) => {
+    remoteSessions: Record<string, unknown>[];
+    environments: unknown[];
+    environmentsRevision: number;
+    remoteSyncRevision: number;
+    focusedEnvironmentId: string;
+  };
+  publishSnapshot: () => void;
+  readOkMessage?: string;
+}): Promise<Record<string, unknown> | null> {
+  const { targetAcc, targetIsLocalActive, hasLocalOAuthClient } = deps;
+  if (!targetAcc || targetIsLocalActive) return null;
+  const nowMs = deps.nowMs ?? Date.now();
+  const targetEmailLower = targetAcc.email.trim().toLowerCase();
+  const currentRemotes = deps.getRemoteSessionsSnapshot(nowMs);
+  const matchingRemote = currentRemotes.find(s =>
+    s.state !== 'disconnected'
+    && (
+      s.matchedLocalAccountId === targetAcc.id
+      || (Boolean(s.email) && s.email.trim().toLowerCase() === targetEmailLower)
+    )
+  );
+  if (!matchingRemote) return null;
+
+  await deps.probeRemoteByEnvironmentId(matchingRemote.environmentId).catch(() => null);
+  const afterNowMs = Date.now();
+  const afterRemotes = deps.getRemoteSessionsSnapshot(afterNowMs);
+  const freshRemote = afterRemotes.find(s =>
+    s.environmentId === matchingRemote.environmentId
+    && s.state === 'connected'
+    && Boolean(s.quota?.models?.length)
+    && (!s.email || s.email.trim().toLowerCase() === targetEmailLower)
+  );
+  if (!freshRemote?.quota) {
+    deps.publishSnapshot();
+    return null;
+  }
+
+  const syncedAcc = (await deps.syncRemoteObservedQuota(targetAcc.id, freshRemote.quota, freshRemote.tier).catch(() => null))
+    ?? (await deps.getAccount(targetAcc.id).catch(() => null))
+    ?? targetAcc;
+  const fused = fuseAccountQuotaAcrossEnvironments({
+    email: syncedAcc.email,
+    savedQuota: syncedAcc.quota,
+    liveLocalQuota: null,
+    remoteSessions: deps.toRemoteCandidates(afterRemotes),
+    nowMs: afterNowMs,
+  });
+  const fusedAcc: Account = { ...syncedAcc, quota: fused.quota };
+  const overview = deps.getAccountQuotaOverview(fusedAcc, { nowMs: afterNowMs });
+  const projected = deps.projectAccount(fusedAcc, {
+    overview,
+    nowMs: afterNowMs,
+    isActive: false,
+    hasLocalOAuthClient,
+    includeOverviewFields: true,
+    revisionWithReadiness: true,
+    quotaSourceEnvironmentId: fused.quotaSourceEnvironmentId ?? freshRemote.environmentId,
+    activeRemoteEnvIds: fused.activeRemoteEnvIds.length > 0 ? fused.activeRemoteEnvIds : [freshRemote.environmentId],
+  });
+  const envSnapshot = deps.buildEnvironmentSnapshot({ nowMs: afterNowMs });
+  deps.publishSnapshot();
+  return {
+    ok: true,
+    partial: false,
+    message: deps.readOkMessage ?? bt('main.quota.read_ok'),
+    quota: projected?.quota ?? null,
+    account: projected,
+    subscription_tier: normalizeSubscriptionTier(projected?.subscription_tier),
+    remoteSessions: envSnapshot.remoteSessions,
+    environments: envSnapshot.environments,
+    environmentsRevision: envSnapshot.environmentsRevision,
+    remoteSyncRevision: envSnapshot.remoteSyncRevision,
+    focusedEnvironmentId: envSnapshot.focusedEnvironmentId,
+  };
+}
 
 /**
  * 总览聚合降级处理：accounts / usage 两段各自独立降级，
@@ -231,10 +263,15 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
 
         // 同一载荷的顶层/模型/分组/英文描述倒计时统一由 reset_time 按同一参考时刻现算。
         const dashboardNowMs = Date.now();
+        const remoteCandidates = deps.getRemoteSessions ? deps.getRemoteSessions() : [];
+        let savedQuotaForFusion: QuotaData | null | undefined = activeAcc?.quota ?? null;
+        let liveQuotaForFusion: QuotaData | null | undefined = null;
         if (liveAccountEmail) {
           const matchedSummary = listRes.accounts.find((a: any) => a.email.toLowerCase() === liveAccountEmail.toLowerCase());
           const matchedSaved = matchedSummary ? await deps.getAccount(matchedSummary.id) : null;
           if (matchedSaved) {
+            savedQuotaForFusion = matchedSaved.quota ?? null;
+            liveQuotaForFusion = liveLs?.quota ?? null;
             const mergedQuota = mergeLiveQuotaWithSaved(matchedSaved.quota, liveLs?.quota, dashboardNowMs);
             sourceAcc = { ...matchedSaved, ...(mergedQuota ? { quota: mergedQuota } : {}) };
             currentAccountId = matchedSaved.id;
@@ -244,6 +281,8 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
             quotaRefreshError = cleanAndLocalizeRefreshError(matchedSaved.quota_refresh_error) ?? '';
           } else {
             // 实机运行账号未保存在本地账号库：严禁混入已存 activeAcc 的姓名、等级或配额
+            savedQuotaForFusion = null;
+            liveQuotaForFusion = liveLs?.quota ?? null;
             sourceAcc = {
               email: liveAccountEmail,
               name: liveLs?.name ?? '',
@@ -255,6 +294,19 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
             isLiveVerified = false;
             quotaRefreshError = '';
           }
+        }
+
+        const fusedDashboardQuota = activeEmail
+          ? fuseAccountQuotaAcrossEnvironments({
+              email: activeEmail,
+              savedQuota: savedQuotaForFusion,
+              liveLocalQuota: liveQuotaForFusion,
+              remoteSessions: remoteCandidates,
+              nowMs: dashboardNowMs,
+            })
+          : { quota: sourceAcc?.quota ?? null, quotaSourceEnvironmentId: sourceAcc?.quota ? 'local' : null, activeRemoteEnvIds: [], freshestObservedAtSec: null };
+        if (sourceAcc && fusedDashboardQuota.quota) {
+          sourceAcc = { ...sourceAcc, quota: fusedDashboardQuota.quota };
         }
 
         const quotaOverview = sourceAcc ? deps.getAccountQuotaOverview(sourceAcc, { nowMs: dashboardNowMs }) : null;
@@ -277,6 +329,8 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           currentEmail: activeEmail,
           liveAccountEmail,
           quotaLastUpdated: sourceAcc?.quota?.last_updated ?? null,
+          quotaSourceEnvironmentId: fusedDashboardQuota.quotaSourceEnvironmentId,
+          activeRemoteEnvIds: fusedDashboardQuota.activeRemoteEnvIds,
           readyCount: listRes.accounts.filter((a: any) => !a.disabled).length,
           autoSwitchEnabled: autoCfg.enabled,
           fiveHourRemaining: quotaOverview?.fiveHourRemaining ?? null,
@@ -313,15 +367,21 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
     })(),
     (async () => {
       try {
-        const [summary, pricing] = await Promise.all([
+        const [rawSummary, pricing] = await Promise.all([
           deps.getUsageSummary(),
           deps.getPricingTable(),
         ]);
+        const summary = rawSummary as TokenUsageSummary;
+        const isUnfilteredEnv = (summary?.selected_environment_id ?? 'all') === 'all';
+        const hasTodaySeries =
+          Array.isArray(summary?.today?.by_model) && Array.isArray(summary?.today_hourly);
         const allPeriodsProjected =
-          Array.isArray(summary?.today?.by_model) && Array.isArray(summary?.today_hourly)
+          isUnfilteredEnv && hasTodaySeries
             ? projectAllUsagePeriodSummaries(summary)
             : undefined;
-        const todayProjected = allPeriodsProjected?.today;
+        const todayProjected = allPeriodsProjected?.today ?? (hasTodaySeries ? projectSingleUsagePeriod(summary, 'today') : undefined);
+        const envBreakdown = summary.today?.environment_breakdown ?? summary.environment_breakdown ?? null;
+        const selectedEnvId = summary?.selected_environment_id ?? 'all';
         usage = {
           todayTokens: summary.today.totals.total_tokens,
           totalTokens: summary.all_time.totals.total_tokens,
@@ -332,18 +392,22 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
           pricingModels: Object.keys(pricing).length,
           todayPricedModels: summary.today.priced_models ?? 0,
           todayUnpricedModels: summary.today.unpriced_models ?? 0,
-          unpricedModels: (summary as any).unpriced_models ?? 0,
-          pricedModels: (summary as any).priced_models ?? 0,
-          databasesScanned: (summary as any).databases_scanned ?? 0,
-          databasesDiscovered: (summary as any).databases_discovered ?? 0,
-          scanScopeDescription: (summary as any).scan_scope_description ?? '',
-          hasError: (summary as any).has_error ?? false,
-          failedDatabasesCount: (summary as any).failed_databases_count ?? 0,
-          skippedLargeRecords: (summary as any).skipped_large_records ?? 0,
-          availability: (summary as any).availability ?? 'complete',
-          unknownTimeRecords: (summary as any).unknown_time_records ?? 0,
-          unknownTimeTokens: (summary as any).unknown_time_tokens ?? 0,
-          databaseDiagnostics: (summary as any).database_diagnostics ?? [],
+          unpricedModels: summary.unpriced_models ?? 0,
+          pricedModels: summary.priced_models ?? 0,
+          databasesScanned: summary.databases_scanned ?? 0,
+          databasesDiscovered: summary.databases_discovered ?? 0,
+          scanScopeDescription: summary.scan_scope_description ?? '',
+          hasError: summary.has_error ?? false,
+          failedDatabasesCount: summary.failed_databases_count ?? 0,
+          skippedLargeRecords: summary.skipped_large_records ?? 0,
+          availability: summary.availability ?? 'complete',
+          unknownTimeRecords: summary.unknown_time_records ?? 0,
+          unknownTimeTokens: summary.unknown_time_tokens ?? 0,
+          databaseDiagnostics: summary.database_diagnostics ?? [],
+          selectedEnvironmentId: selectedEnvId,
+          selected_environment_id: selectedEnvId,
+          availableEnvironments: summary.available_environments ?? [],
+          ...(envBreakdown ? { environmentBreakdown: envBreakdown, environment_breakdown: envBreakdown } : {}),
           ...(todayProjected ? {
             todayHourly: todayProjected.todayHourly,
             todayByModel: todayProjected.byModel,
@@ -358,20 +422,18 @@ export async function buildDashboardAggregate(deps: DashboardAggregateDeps): Pro
 
 export async function request(command: string): Promise<any> {
   const argv = process.argv.slice(2);
-  const targetStateDir = resolve(cliOption(argv, '--state-dir', join(homedir(), 'Library', 'Application Support', 'GravityBox'))!);
-  const targetSocketPath = join(targetStateDir, 'control.sock');
-  const sockInfo = await lstat(targetSocketPath).catch((err: NodeJS.ErrnoException) => {
-    if (err?.code === 'ENOENT') throw new Error(bt('main.assistant_not_running'));
-    throw err;
-  });
-  if (!sockInfo.isSocket() || sockInfo.isSymbolicLink() || sockInfo.uid !== process.getuid?.()) {
-    throw new Error(bt('main.socket_mismatch'));
+  const targetStateDir = resolve(cliOption(argv, '--state-dir', defaultGravityBoxStateDir())!);
+  const target = await resolveClientIpcTarget(targetStateDir);
+  if (!target) {
+    throw new Error(bt('main.assistant_not_running'));
   }
+  await validateIpcEndpointForClient(target.endpoint);
+  const requestPayload = target.authToken ? { command, authToken: target.authToken } : { command };
   return new Promise((resolveReply, reject) => {
-    const client = createConnection(targetSocketPath); let buffer = ''; let received = 0;
+    const client = createConnection(target.endpoint); let buffer = ''; let received = 0;
     const decoder = new StringDecoder('utf8');
-    client.setTimeout(['status', 'ping', 'task_list'].includes(command) ? 8000 : 120000, () => { client.destroy(); reject(new Error(bt('main.request_timeout'))); });
-    client.on('connect', () => client.write(JSON.stringify({ command }) + '\n'));
+    client.setTimeout(['status', 'ping', 'task_list', 'proxy_get'].includes(command) ? 8000 : 120000, () => { client.destroy(); reject(new Error(bt('main.request_timeout'))); });
+    client.on('connect', () => client.write(JSON.stringify(requestPayload) + '\n'));
     client.on('data', bytes => {
       // CLI 必须与 socket 服务端一样按 UTF-8 流解码：多字节中文可能跨 chunk 边界，
       // 逐 chunk toString() 会产生 U+FFFD 并损坏 coverage_report/dictionary_export 的 JSON。
@@ -384,12 +446,17 @@ export async function request(command: string): Promise<any> {
   });
 }
 async function run() {
-  if (process.cwd() !== '/') {
-    try {
-      process.loadEnvFile?.();
-    } catch (error: any) {
-      if (error?.code !== 'ENOENT') {
-        // ignore
+  const projectRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));
+  if (process.cwd() !== '/' && pathsEqual(resolve(process.cwd()), projectRoot)) {
+    const cwdEnvPath = join(projectRoot, '.env');
+    const cwdEnvInfo = await lstat(cwdEnvPath).catch(() => null);
+    if (cwdEnvInfo && cwdEnvInfo.isFile() && !cwdEnvInfo.isSymbolicLink() && isOwnedByCurrentUser(cwdEnvInfo)) {
+      try {
+        process.loadEnvFile?.(cwdEnvPath);
+      } catch (error: any) {
+        if (error?.code !== 'ENOENT') {
+          // ignore
+        }
       }
     }
   }
@@ -398,14 +465,14 @@ async function run() {
   const command = option('--command');
   if (command) { console.log(JSON.stringify(await request(command))); return; }
   if (args.includes('--heal')) throw new Error(bt('main.heal_unsupported'));
-  const stateDir = resolve(option('--state-dir', join(homedir(), 'Library', 'Application Support', 'GravityBox'))!);
+  const stateDir = resolve(option('--state-dir', defaultGravityBoxStateDir())!);
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const stateInfo = await lstat(stateDir);
-  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || stateInfo.uid !== process.getuid?.()) throw new Error(bt('main.state_dir_mismatch'));
-  await chmod(stateDir, 0o700);
+  if (!stateInfo.isDirectory() || stateInfo.isSymbolicLink() || !isOwnedByCurrentUser(stateInfo)) throw new Error(bt('main.state_dir_mismatch'));
+  if (!isWindows()) await chmod(stateDir, 0o700);
   const envPath = join(stateDir, '.env');
   const envInfo = await lstat(envPath).catch(() => null);
-  if (envInfo && envInfo.isFile() && !envInfo.isSymbolicLink() && envInfo.uid === process.getuid?.()) {
+  if (envInfo && envInfo.isFile() && !envInfo.isSymbolicLink() && isOwnedByCurrentUser(envInfo)) {
     try {
       process.loadEnvFile?.(envPath);
     } catch (error: any) {
@@ -414,7 +481,8 @@ async function run() {
       }
     }
   }
-  const socketPath = join(stateDir, 'control.sock');
+  let windowsIpcSession: WindowsIpcSession | null = null;
+  let socketPath = resolveIpcEndpoint(stateDir);
   let configuredChannel: unknown;
   let configuredHudEnabled: unknown;
   let configuredAppLanguage: unknown;
@@ -427,6 +495,7 @@ async function run() {
     configuredAutoPricingSync = parsedCfg.autoPricingSyncEnabled;
   }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(bt('main.channel_config_unreadable')); }
+  loadProxyConfigFromStateDir(stateDir);
   const explicitLocaleArg = option('--locale');
   const explicitSystemLocalesArg = option('--system-locales');
   const initialSystemLocales = explicitSystemLocalesArg
@@ -451,7 +520,7 @@ async function run() {
     console.log(JSON.stringify(endpoint ? { found: true, pid: endpoint.pid, appVersion: endpoint.appVersion, legacyPatch: endpoint.legacyPatch, loopback: true } : { found: false })); return;
   }
   const geminiDir = option('--gemini-dir', process.env.GRAVITYBOX_GEMINI_DIR || process.env.GEMINI_DIR || join(homedir(), '.gemini'))!;
-  const cacheMaintenance = new CacheMaintenance(profile, join(homedir(), '.Trash'), undefined, { stateDir: channelStateDir, geminiDir, appPath });
+  const cacheMaintenance = new CacheMaintenance(profile, isWindows() ? undefined : join(homedir(), '.Trash'), undefined, { stateDir: channelStateDir, geminiDir, appPath });
   const accountsManager = new AccountsManager(stateDir, { target });
   const liveIdeModelsPath = join(stateDir, 'live-ide-models.json');
   let liveSnapshotWriteChain = Promise.resolve();
@@ -482,7 +551,7 @@ async function run() {
   }
   const accountLogin = new GoogleAccountLogin((token, signal) => accountsManager.addAccountFromOAuth(token, signal));
   const homeDir = option('--home-dir', process.env.GRAVITYBOX_HOME_DIR || homedir())!;
-  const appSupportDir = option('--app-support-dir', process.env.GRAVITYBOX_APP_SUPPORT_DIR || join(homedir(), 'Library', 'Application Support'))!;
+  const appSupportDir = option('--app-support-dir', process.env.GRAVITYBOX_APP_SUPPORT_DIR || defaultAppSupportDir())!;
   const switchService = new AccountSwitchService(accountsManager, { stateDir, profile, channel, homeDir, geminiDir });
   const usageManager = new UsageStatsManager({ stateDir, geminiDir });
   cacheMaintenance.setHooks({
@@ -491,6 +560,15 @@ async function run() {
   });
   let accountSyncInFlight: Promise<void> | null = null;
   let accountSyncedAt = 0;
+  const cachedAccountIdsByEmail = new Map<string, string>();
+  const refreshCachedAccountIds = (accounts: ReadonlyArray<{ id?: string; email?: string }>): void => {
+    cachedAccountIdsByEmail.clear();
+    for (const a of accounts) {
+      if (a.email && a.id) cachedAccountIdsByEmail.set(a.email.trim().toLowerCase(), a.id);
+    }
+  };
+  const matchCachedAccountId = (email: string): string | null =>
+    cachedAccountIdsByEmail.get(email.trim().toLowerCase()) ?? null;
   async function syncActiveAccountToUsageManager(forceSync = false): Promise<void> {
     const now = Date.now();
     if (!forceSync && now - accountSyncedAt < 4500) return;
@@ -500,6 +578,7 @@ async function run() {
         const live = await probeLiveCached().catch(() => null);
         const listRes = await accountsManager.listAccounts({ liveEmailHint: live?.email ?? null }).catch(() => null);
         if (listRes?.accounts) {
+          refreshCachedAccountIds(listRes.accounts);
           usageManager.setKnownAccounts(listRes.accounts.map(a => ({
             id: a.id,
             email: a.email,
@@ -568,7 +647,8 @@ async function run() {
     return projectAccountNormalizedWithManager(account, accountsManager, options);
   }
   const hasLocalOAuthClientConfigured = () => Boolean(getGoogleClientId() && getGoogleClientSecret());
-  const resolveActiveIdentityForIpc = async (): Promise<{ activeId: string | null; activeEmailLower: string | null }> => {
+  type ActiveIpcIdentity = { activeId: string | null; activeEmailLower: string | null };
+  const resolveActiveIdentityForIpc = async (): Promise<ActiveIpcIdentity> => {
     const live = await probeLiveCached().catch(() => null);
     const detectedEmail = live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
     const index = await accountsManager.loadIndex().catch(() => null);
@@ -578,6 +658,16 @@ async function run() {
       activeId = index.accounts.find(a => a.email.trim().toLowerCase() === activeEmailLower)?.id ?? null;
     }
     return { activeId, activeEmailLower };
+  };
+  const isIdentityActiveAccount = (
+    identity: ActiveIpcIdentity,
+    account: { id?: string | null; email?: string | null } | null | undefined,
+  ): boolean => {
+    if (!account) return false;
+    if (identity.activeEmailLower && account.email) {
+      return account.email.trim().toLowerCase() === identity.activeEmailLower;
+    }
+    return Boolean(!identity.activeEmailLower && account.id && identity.activeId === account.id);
   };
   backendLease = await acquireProcessLease(join(stateDir, 'backend.lock'), 0);
   const earlySignalExit = () => { backendLease?.releaseSync(); process.exit(0); };
@@ -596,28 +686,23 @@ async function run() {
       await atomicJson(configPath, { ...document, applicationChannel: 'stable' });
     }
   }
-  try {
-    const info = await lstat(socketPath);
-    if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error(bt('main.socket_mismatch'));
-    // Connection acceptance proves a live server even if a long operation delays its reply.
-    const live = await new Promise<boolean>((resolveLive, reject) => {
-      const client = createConnection(socketPath);
-      client.once('connect', () => { client.destroy(); resolveLive(true); });
-      client.once('error', (error: NodeJS.ErrnoException) => {
-        if (['ECONNREFUSED', 'ENOENT'].includes(error.code ?? '')) resolveLive(false);
-        else reject(new Error(bt('main.socket_unconfirmed')));
-      });
-      client.setTimeout(1500, () => { client.destroy(); reject(new Error(bt('main.socket_busy'))); });
-    });
-    if (live) throw new Error(bt('main.assistant_already_running'));
-    const current = await lstat(socketPath);
-    if (current.ino !== info.ino || current.dev !== info.dev) throw new Error(bt('main.socket_changed'));
-    await unlink(socketPath);
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (isWindows()) {
+    windowsIpcSession = await prepareWindowsIpcForListen(stateDir);
+    socketPath = windowsIpcSession.pipeName;
+  } else {
+    await prepareIpcEndpointForListen(socketPath);
+  }
+  const cleanupIpc = async () => {
+    if (windowsIpcSession) {
+      await cleanupIpcSession(stateDir, process.pid).catch(() => {});
+    } else {
+      await cleanupIpcEndpoint(socketPath).catch(() => {});
+    }
+  };
   await mkdir(channelStateDir, { recursive: true, mode: 0o700 });
   const userDir = join(stateDir, '词典'); await mkdir(userDir, { recursive: true, mode: 0o700 });
   const userInfo = await lstat(userDir);
-  if (userInfo.isSymbolicLink() || !userInfo.isDirectory() || userInfo.uid !== process.getuid?.()) throw new Error(bt('main.dict_dir_mismatch'));
+  if (userInfo.isSymbolicLink() || !userInfo.isDirectory() || !isOwnedByCurrentUser(userInfo)) throw new Error(bt('main.dict_dir_mismatch'));
   const personalPath = join(userDir, '个人覆盖.json');
   try { await lstat(personalPath); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') await atomicJson(personalPath, {}); else throw error; }
   const baseDir = fileURLToPath(new URL('../dict/', import.meta.url));
@@ -652,23 +737,74 @@ async function run() {
   }
   catch { fallback = await loadDictionary(initialDictInfo.baseDir); }
   await store.start(fallback);
+  let stopping = false;
   let writeChain = Promise.resolve();
   let statusTasks:Tasks|undefined;
+  let syncRemoteTargetStateAndMaybeTriggerSync: () => void = () => {};
+  const environmentRegistry = new EnvironmentRegistry();
+  let cachedLocalAccountSnapshot: EnvironmentRegistryLocalAccountInput | null = null;
+  let cachedAvailableEnvironments: AvailableEnvironmentUsageOption[] = [];
+  let cachedLocalUsageSyncedAtSec: number | null = null;
+  let buildUnifiedEnvironmentSnapshot: (options?: {
+    availableEnvironments?: AvailableEnvironmentUsageOption[];
+    nowMs?: number;
+    remoteSessionsOverride?: RemoteSessionState[];
+  }) => ReturnType<EnvironmentRegistry['buildSnapshot']> = () => ({
+    environments: [],
+    environmentsRevision: 0,
+    remoteSyncRevision: 0,
+    focusedEnvironmentId: 'local',
+    remoteSessions: [],
+  });
   let pendingStatus: any, writingStatus=false, lastStatusKey="", lastStatusWrite=0;
   const onStatus = (status: AssistantStatus) => {
+    syncRemoteTargetStateAndMaybeTriggerSync();
+    const envSnapshot = buildUnifiedEnvironmentSnapshot();
     const installState = detectInstalledChannels(channel);
     const oauthClientConfigured = Boolean(getGoogleClientId() && getGoogleClientSecret());
-    const snapshot = { ...status, oauthClientConfigured, applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch, bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels, pricingRevision: usageManager.getPricingRevision(), taskRevision:statusTasks?.revision??0,runningTasks:statusTasks?.list().filter(t=>t.state==='running').length??0 };
+    const snapshot = {
+      ...status,
+      remoteSessions: envSnapshot.remoteSessions,
+      environments: envSnapshot.environments,
+      environmentsRevision: envSnapshot.environmentsRevision,
+      remoteSyncRevision: envSnapshot.remoteSyncRevision,
+      focusedEnvironmentId: envSnapshot.focusedEnvironmentId,
+      oauthClientConfigured,
+      applicationChannel: channel,
+      applicationLabel: target.label,
+      accountSwitchSupported: target.supportsAccountSwitch,
+      bothApplicationsInstalled: installState.bothInstalled,
+      availableChannels: installState.channels,
+      pricingRevision: usageManager.getPricingRevision(),
+      taskRevision: statusTasks?.revision ?? 0,
+      runningTasks: statusTasks?.list().filter(t => t.state === 'running').length ?? 0,
+    };
     const {updatedAt,rssMB,...meaningful}=snapshot;const key=JSON.stringify(meaningful);
     if(key===lastStatusKey&&Date.now()-lastStatusWrite<30000)return;
     lastStatusKey=key;lastStatusWrite=Date.now();pendingStatus=snapshot;
-    if(!writingStatus) {writingStatus=true;writeChain=writeChain.catch(()=>{}).then(async()=>{try {while(pendingStatus){const snapshot=pendingStatus;pendingStatus=undefined;await atomicJson(join(stateDir,'status.json'),snapshot,undefined,{durability:'relaxed'});}}finally{writingStatus=false;}});writeChain.catch(()=>{});}
+    if(!writingStatus) {writingStatus=true;writeChain=writeChain.catch(()=>{}).then(async()=>{try {while(pendingStatus){const snapshot=pendingStatus;pendingStatus=undefined;await atomicJson(join(stateDir,'status.json'),snapshot,undefined,{durability:'relaxed'});}}finally{writingStatus=false;}}).catch(()=>{});}
   };
   let fixture: { port: number; origin: string } | undefined;
   if (option('--fixture-port')) {
     const port = Number(option('--fixture-port')), origin = option('--fixture-origin');
     if (!Number.isInteger(port) || !origin || !/^http:\/\/127\.0\.0\.1:\d+$/.test(origin)) throw new Error(bt('main.fixture_invalid'));
     fixture = { port, origin };
+  }
+  const expiredWindowRefreshAt = new Map<string, number>();
+  function scheduleExpiredQuotaCorrection(targetId: string | null, quota: QuotaData | null | undefined, nowMs: number = Date.now()): void {
+    if (stopping || fixture) return;
+    if (!hasExpiredQuotaWindow(quota, nowMs)) return;
+    const key = targetId || '__live_unsaved__';
+    const lastAttempt = expiredWindowRefreshAt.get(key) ?? 0;
+    if (nowMs - lastAttempt < 60_000) return;
+    expiredWindowRefreshAt.set(key, nowMs);
+    if (targetId) {
+      void accountsManager.refreshQuota(targetId).catch(() => {});
+    } else {
+      void accountsManager.probeLiveLanguageServer(globalThis.fetch, { forceRefresh: true })
+        .then(res => persistLiveIdeModelsIfPresent(res))
+        .catch(() => {});
+    }
   }
   let applyChain = Promise.resolve();
   const shortcutEnabled = !!fixture;
@@ -713,6 +849,312 @@ async function run() {
     reloadDictionary: async () => { await store.reload(); await applyChain; if (store.lastError) throw new Error(store.lastError); },
     onStatus,
   });
+  let lastConnectedRemoteEnvs = new Map<string, { hostLabel: string; state: string; email: string }>();
+  const lastRemoteHeartbeatAtMs = new Map<string, number>();
+  const remoteLastSyncedAtSec = new Map<string, number>();
+  const remoteSyncCoordinator = new RemoteUsageSyncCoordinator({
+    stateDir,
+    getTargets: () => controller.getConnectedRemoteRpcTargets(),
+    ledger: {
+      receipts: () => usageManager.getSyncReceipts(),
+      save: async (
+        events: RemoteGenerationEvent[],
+        options?: { billingPrices?: Record<string, unknown>; receipts?: RemoteUsageSyncReceipt[] }
+      ) => {
+        const res = await usageManager.ingestRemoteUsageBatch(
+          events as LedgerEvent[],
+          (options?.receipts ?? []) as SyncReceipt[],
+          options?.billingPrices ? { billingPrices: options.billingPrices as Record<string, any> } : undefined
+        );
+        if (options?.receipts) {
+          for (const rec of options.receipts) {
+            if (rec?.environment_id && rec.committed_at > 0) {
+              const prev = remoteLastSyncedAtSec.get(rec.environment_id) ?? 0;
+              if (rec.committed_at > prev) remoteLastSyncedAtSec.set(rec.environment_id, rec.committed_at);
+            }
+          }
+        }
+        return res;
+      },
+    },
+    resolveMatchedLocalAccountId: matchCachedAccountId,
+    getBillingPrices: () => usageManager.getBillingPricingTable(),
+    onIdentityObserved: info => {
+      if (info.live.quota?.models?.length) {
+        registerObservedModelsFromSource(info.live.quota.models);
+      }
+      controller.applyObservedRemoteIdentity({
+        environmentId: info.environmentId,
+        remoteKey: info.remoteKey,
+        live: info.live,
+        observedAtMs: info.observedAtMs,
+        matchAccountId: matchCachedAccountId,
+        getQuotaOverview: (quota, nowMs) => accountsManager.getAccountQuotaOverview({ quota }, { nowMs }),
+      });
+      syncRemoteTargetStateAndMaybeTriggerSync();
+      if (!stopping) {
+        onStatus(controller.snapshot());
+      }
+    },
+    onCommitted: () => {
+      syncRemoteTargetStateAndMaybeTriggerSync();
+      if (!stopping) {
+        onStatus(controller.snapshot());
+      }
+    },
+  });
+  const toRemoteQuotaCandidates = (sessions: RemoteSessionState[]): RemoteQuotaCandidate[] =>
+    sessions.map(s => {
+      const host = cleanHostLabel(s.hostLabel) || s.hostLabel || 'ssh-host';
+      const envId = s.environmentId || buildRemoteEnvironmentId(host);
+      const lifecycleState: EnvironmentLifecycleState =
+        s.state === 'disconnected'
+          ? 'offline_recent'
+          : s.state === 'auth_expired'
+            ? 'auth_expired'
+            : 'online';
+      return {
+        environmentId: envId,
+        email: s.email,
+        lifecycleState,
+        quota: s.quota,
+        observedAtMs: s.observedAt,
+      };
+    });
+  buildUnifiedEnvironmentSnapshot = (options) => {
+    const nowMs = options?.nowMs ?? Date.now();
+    const sessions = options?.remoteSessionsOverride ?? controller.getRemoteSessionsSnapshot(nowMs);
+    const windowCounts = controller.getEnvironmentWindowCounts();
+    const availEnvs = options?.availableEnvironments ?? cachedAvailableEnvironments;
+    if (options?.availableEnvironments) {
+      cachedAvailableEnvironments = options.availableEnvironments;
+    }
+    const histMap = new Map<string, { environmentId: string; hostLabel?: string; lastSyncedAtSec?: number | null }>();
+    for (const envOpt of availEnvs) {
+      if (envOpt?.kind !== 'ssh' || !envOpt.id || envOpt.id === 'local') continue;
+      if (envOpt.last_synced_at && envOpt.last_synced_at > 0) {
+        const prev = remoteLastSyncedAtSec.get(envOpt.id) ?? 0;
+        if (envOpt.last_synced_at > prev) remoteLastSyncedAtSec.set(envOpt.id, envOpt.last_synced_at);
+      }
+      histMap.set(envOpt.id, {
+        environmentId: envOpt.id,
+        hostLabel: envOpt.host_label || envOpt.label || envOpt.id,
+        lastSyncedAtSec: envOpt.last_synced_at ?? remoteLastSyncedAtSec.get(envOpt.id) ?? null,
+      });
+    }
+    for (const obsEnv of remoteSyncCoordinator.observationStore.listEnvironments()) {
+      if (!obsEnv.environmentId || obsEnv.environmentId === 'local') continue;
+      if (obsEnv.lastSyncedAt && obsEnv.lastSyncedAt > 0) {
+        const prev = remoteLastSyncedAtSec.get(obsEnv.environmentId) ?? 0;
+        if (obsEnv.lastSyncedAt > prev) remoteLastSyncedAtSec.set(obsEnv.environmentId, obsEnv.lastSyncedAt);
+      }
+      if (!histMap.has(obsEnv.environmentId)) {
+        histMap.set(obsEnv.environmentId, {
+          environmentId: obsEnv.environmentId,
+          hostLabel: obsEnv.hostLabel,
+          lastSyncedAtSec: obsEnv.lastSyncedAt ?? remoteLastSyncedAtSec.get(obsEnv.environmentId) ?? null,
+        });
+      }
+    }
+    for (const [envId, syncedSec] of remoteLastSyncedAtSec.entries()) {
+      if (envId === 'local' || histMap.has(envId)) continue;
+      histMap.set(envId, {
+        environmentId: envId,
+        hostLabel: envId,
+        lastSyncedAtSec: syncedSec,
+      });
+    }
+
+    const localSnapshot: EnvironmentRegistryLocalAccountInput | null = cachedLocalAccountSnapshot
+      ? {
+          ...cachedLocalAccountSnapshot,
+          ...(cachedLocalUsageSyncedAtSec ? { lastSyncedAtSec: cachedLocalUsageSyncedAtSec } : {}),
+        }
+      : (cachedLocalUsageSyncedAtSec ? { lastSyncedAtSec: cachedLocalUsageSyncedAtSec } : null);
+
+    return environmentRegistry.buildSnapshot({
+      nowMs,
+      localWindowCount: controller.getLocalWindowsCount(),
+      localFocusedAt: controller.getLocalFocusedAt(),
+      focusedEnvironmentId: controller.getFocusedEnvironmentId(),
+      localAccount: localSnapshot,
+      remoteSessions: sessions,
+      windowCountsByEnvId: windowCounts,
+      historicalEnvironments: [...histMap.values()],
+      receiptSyncTimes: remoteLastSyncedAtSec,
+      remoteSyncRevision: usageManager.getRemoteSyncRevision(),
+      staleAfterSeconds: accountsManager.getConfiguredQuotaStaleSeconds(),
+      matchAccountId: matchCachedAccountId,
+      getQuotaOverview: (quota, tsMs) => accountsManager.getAccountQuotaOverview({ quota }, { nowMs: tsMs }),
+      formatResetTime,
+      resolveUnsavedTier: (live, overview) => resolveUnsavedLiveSubscriptionTier(live, overview),
+    });
+  };
+  syncRemoteTargetStateAndMaybeTriggerSync = () => {
+    if (stopping) return;
+    const targets = controller.getConnectedRemoteRpcTargets();
+    const sessions = controller.getRemoteSessionsSnapshot();
+    const windowCounts = controller.getEnvironmentWindowCounts();
+    const envMap = new Map<string, KnownEnvironmentContext>();
+    const currentConnected = new Map<string, { hostLabel: string; state: string; email: string }>();
+    let shouldTriggerSync = false;
+
+    for (const t of targets) {
+      const lastSynced = remoteLastSyncedAtSec.get(t.environmentId);
+      const online = t.state !== 'disconnected';
+      const lifecycleState: EnvironmentLifecycleState = t.state === 'auth_expired' ? 'auth_expired' : 'online';
+      envMap.set(t.environmentId, {
+        id: t.environmentId,
+        kind: 'ssh',
+        host_label: t.hostLabel,
+        label: t.hostLabel,
+        online,
+        lifecycle_state: lifecycleState,
+        window_count: windowCounts.get(t.environmentId) ?? t.windowCount ?? 1,
+        ...(lastSynced !== undefined ? { last_synced_at: lastSynced } : {}),
+      });
+      if (online) {
+        currentConnected.set(t.environmentId, { hostLabel: t.hostLabel, state: t.state, email: t.email });
+        const prev = lastConnectedRemoteEnvs.get(t.environmentId);
+        const nowMs = Date.now();
+        const heartbeatDue = nowMs - (lastRemoteHeartbeatAtMs.get(t.environmentId) ?? 0) >= 30_000;
+        if (!prev || prev.state !== t.state || prev.email !== t.email) {
+          shouldTriggerSync = true;
+        }
+        if (t.email && (!prev || prev.state !== t.state || prev.email !== t.email || heartbeatDue)) {
+          lastRemoteHeartbeatAtMs.set(t.environmentId, nowMs);
+          remoteSyncCoordinator.recordObservation({
+            hostLabel: t.hostLabel,
+            environmentId: t.environmentId,
+            email: t.email,
+            matchedLocalAccountId: t.matchedLocalAccountId ?? cachedAccountIdsByEmail.get(t.email.toLowerCase()) ?? null,
+            accountType: t.accountType,
+          });
+        }
+      }
+    }
+
+    for (const s of sessions) {
+      const envId = s.environmentId || buildRemoteEnvironmentId(s.hostLabel);
+      if (envMap.has(envId)) continue;
+      const lastSynced = remoteLastSyncedAtSec.get(envId);
+      const online = s.state !== 'disconnected';
+      const lifecycleState: EnvironmentLifecycleState =
+        s.state === 'disconnected'
+          ? 'offline_recent'
+          : s.state === 'auth_expired'
+            ? 'auth_expired'
+            : 'online';
+      envMap.set(envId, {
+        id: envId,
+        kind: 'ssh',
+        host_label: cleanHostLabel(s.hostLabel) || s.hostLabel,
+        label: cleanHostLabel(s.hostLabel) || s.hostLabel,
+        online,
+        lifecycle_state: lifecycleState,
+        window_count: online ? (windowCounts.get(envId) ?? 1) : 0,
+        ...(lastSynced !== undefined ? { last_synced_at: lastSynced } : {}),
+      });
+    }
+
+    for (const prevEnvId of lastConnectedRemoteEnvs.keys()) {
+      if (!currentConnected.has(prevEnvId)) {
+        lastRemoteHeartbeatAtMs.delete(prevEnvId);
+        remoteSyncCoordinator.markEnvironmentDisconnected(prevEnvId);
+      }
+    }
+    lastConnectedRemoteEnvs = currentConnected;
+    usageManager.setOnlineRemoteEnvironments([...envMap.values()]);
+
+    if (shouldTriggerSync && !fixture) {
+      remoteSyncCoordinator.triggerSync();
+    }
+  };
+  const runBoundedRemoteSyncForDemand = async (maxWaitMs = 6_000): Promise<void> => {
+    syncRemoteTargetStateAndMaybeTriggerSync();
+    if (stopping || fixture) return;
+    if (controller.getConnectedRemoteRpcTargets().length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const syncAc = new AbortController();
+    try {
+      await Promise.race([
+        remoteSyncCoordinator.syncNow({ force: true, signal: syncAc.signal }).catch(() => {}),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => {
+            syncAc.abort();
+            resolve();
+          }, maxWaitMs);
+          timer.unref();
+        }),
+      ]);
+    } catch {
+      // 远端同步超时或失败绝不阻塞本机用量查询返回
+    } finally {
+      if (timer) clearTimeout(timer);
+      syncRemoteTargetStateAndMaybeTriggerSync();
+    }
+  };
+  async function buildRemoteSessionsPayload(options?: {
+    force?: boolean;
+    remoteKey?: string;
+    environmentId?: string;
+    nonBlocking?: boolean;
+  }): Promise<Record<string, unknown>[]> {
+    const index = await accountsManager.loadIndex().catch(() => null);
+    if (index?.accounts) {
+      refreshCachedAccountIds(index.accounts);
+    }
+    const matchAccountId = (email: string): string | null => {
+      if (!index || !email) return null;
+      const targetEmail = email.toLowerCase();
+      const found = index.accounts.find(a => a.email.toLowerCase() === targetEmail);
+      return found?.id ?? null;
+    };
+    const getQuotaOverview = (quota: QuotaData, nowMs: number) =>
+      accountsManager.getAccountQuotaOverview({ quota }, { nowMs });
+
+    const nowMs = Date.now();
+    let sessions: RemoteSessionState[];
+    if (options?.nonBlocking) {
+      sessions = controller.getRemoteSessionsSnapshot(nowMs);
+      const needsBgProbe = sessions.some(
+        s => s.state === 'connected' && (!s.observedAt || nowMs - s.observedAt >= 30_000)
+      );
+      if (needsBgProbe) {
+        void controller.probeRemoteSessions({
+          matchAccountId,
+          getQuotaOverview,
+        }).then(probed => {
+          for (const s of probed) {
+            if (s.state === 'connected' && s.quota?.models?.length && s.matchedLocalAccountId) {
+              void accountsManager.syncRemoteObservedQuota(s.matchedLocalAccountId, s.quota, s.tier).catch(() => null);
+            }
+          }
+        }).catch(() => {});
+      }
+    } else {
+      sessions = await controller.probeRemoteSessions({
+        force: options?.force,
+        remoteKey: options?.remoteKey,
+        environmentId: options?.environmentId,
+        matchAccountId,
+        getQuotaOverview,
+      });
+      for (const s of sessions) {
+        if (s.state === 'connected' && s.quota?.models?.length && s.matchedLocalAccountId) {
+          await accountsManager.syncRemoteObservedQuota(s.matchedLocalAccountId, s.quota, s.tier).catch(() => null);
+        }
+      }
+    }
+    syncRemoteTargetStateAndMaybeTriggerSync();
+    for (const s of sessions) {
+      if (s.quota?.models?.length) {
+        registerObservedModelsFromSource(s.quota.models);
+      }
+    }
+
+    return buildUnifiedEnvironmentSnapshot({ nowMs, remoteSessionsOverride: sessions }).remoteSessions;
+  }
   const tasks = new Tasks(stateDir, () => onStatus(controller.snapshot()));statusTasks=tasks; await tasks.start();
   usageManager.setOnPricingUpdated(() => {
     onStatus(controller.snapshot());
@@ -743,34 +1185,37 @@ async function run() {
   store.on('updated', dictionary => { cache(); applyChain = controller.update(dictionary); applyChain.catch(() => controller.dictionaryError(bt('main.dict_partial_update'))); });
   store.on('invalid', message => controller.dictionaryError(String(message)));
   store.on('valid', () => controller.dictionaryError());
-  let commandChain = Promise.resolve(); let stopping = false; const ipcMetrics = { statusRequests: 0, taskPayloadReplies: 0 };
-  const expiredWindowRefreshAt = new Map<string, number>();
-  function scheduleExpiredQuotaCorrection(targetId: string | null, quota: QuotaData | null | undefined, nowMs: number = Date.now()): void {
-    if (stopping || fixture) return;
-    if (!hasExpiredQuotaWindow(quota, nowMs)) return;
-    const key = targetId || '__live_unsaved__';
-    const lastAttempt = expiredWindowRefreshAt.get(key) ?? 0;
-    if (nowMs - lastAttempt < 60_000) return;
-    expiredWindowRefreshAt.set(key, nowMs);
-    if (targetId) {
-      void accountsManager.refreshQuota(targetId).catch(() => {});
-    } else {
-      void accountsManager.probeLiveLanguageServer(globalThis.fetch, { forceRefresh: true })
-        .then(res => persistLiveIdeModelsIfPresent(res))
-        .catch(() => {});
-    }
-  }
+  let commandChain = Promise.resolve(); const ipcMetrics = { statusRequests: 0, taskPayloadReplies: 0 };
   const startQuotaRefreshTask = () => tasks.begin('quota-refresh', bt('main.task.quota_refresh_title'), async (signal, progress, _commit) => {
-    const result = await accountsManager.refreshAllQuotas(globalThis.fetch, {
-      signal,
-      onAccountUpdated: (account, done, total) => {
-        if (account?.quota?.models?.length) {
-          registerObservedModelsFromSource(account.quota.models);
-        }
-        progress(done, total);
-      },
-    });
-    const skippedStandby = (result as { skippedStandby?: number }).skippedStandby ?? 0;
+    const remoteProbePromise = controller.getRemoteSessionsSnapshot().some(s => s.state !== 'disconnected')
+      ? buildRemoteSessionsPayload({ force: true }).catch(() => [] as Record<string, unknown>[])
+      : Promise.resolve([] as Record<string, unknown>[]);
+    const [result] = await Promise.all([
+      accountsManager.refreshAllQuotas(globalThis.fetch, {
+        signal,
+        onAccountUpdated: (account, done, total) => {
+          if (account?.quota?.models?.length) {
+            registerObservedModelsFromSource(account.quota.models);
+          }
+          progress(done, total);
+        },
+      }),
+      remoteProbePromise,
+    ]);
+    if (controller.getRemoteSessionsSnapshot().length > 0) {
+      onStatus(controller.snapshot());
+    }
+    const localUpdatedIds = new Set(result.accounts.map(a => a.id));
+    const remoteRefreshedIds = new Set<string>();
+    for (const s of controller.getRemoteSessionsSnapshot()) {
+      if (s.state === 'connected' && s.quota?.models?.length && s.matchedLocalAccountId && !localUpdatedIds.has(s.matchedLocalAccountId)) {
+        remoteRefreshedIds.add(s.matchedLocalAccountId);
+      }
+    }
+    const extraRemoteUpdated = remoteRefreshedIds.size;
+    const rawSkippedStandby = (result as { skippedStandby?: number }).skippedStandby ?? 0;
+    const skippedStandby = Math.max(0, rawSkippedStandby - extraRemoteUpdated);
+    const updatedCount = result.accounts.length + extraRemoteUpdated;
     const incomplete = result.accounts.filter(a => a.quota?.refresh_state?.complete === false).length;
     const warnings = result.accounts.filter(a => a.quota_refresh_error || a.quota?.refresh_state?.complete === false).length;
     const staleAccounts = result.accounts.filter(a => (a.quota?.stale_groups?.length ?? 0) > 0).length;
@@ -779,16 +1224,17 @@ async function run() {
     const stalePart = staleAccounts ? bt('main.task.quota_refresh_stale_part', { accounts: staleAccounts, groups: staleGroups }) : '';
     const hasFailures = result.failures.length > 0;
     const message = hasFailures
-      ? bt('main.task.quota_refresh_failures', { total: result.accounts.length, failed: result.failures.length })
-      : result.accounts.length === 0 && skippedStandby > 0
+      ? bt('main.task.quota_refresh_failures', { total: updatedCount, failed: result.failures.length })
+      : updatedCount === 0 && skippedStandby > 0
       ? bt('main.task.quota_refresh_standby_only', { skipped: skippedStandby })
       : skippedStandby > 0
-      ? bt('main.task.quota_refresh_ok_with_standby', { updated: result.accounts.length, skipped: skippedStandby })
-      : bt('main.task.quota_refresh_ok', { total: result.accounts.length, incompletePart, stalePart });
+      ? bt('main.task.quota_refresh_ok_with_standby', { updated: updatedCount, skipped: skippedStandby })
+      : bt('main.task.quota_refresh_ok', { total: updatedCount, incompletePart, stalePart });
     const ok = !hasFailures && incomplete === 0;
-    const partial = (hasFailures || incomplete > 0) && result.accounts.length > 0;
+    const partial = (hasFailures || incomplete > 0) && updatedCount > 0;
     return { ok, partial,
-      incomplete, updated: result.accounts.length, failed: result.failures.length, skippedStandby, warnings, staleAccounts, staleGroups,
+      incomplete, updated: updatedCount, failed: result.failures.length, skippedStandby, warnings, staleAccounts, staleGroups,
+      remoteRefreshedCount: extraRemoteUpdated,
       message };
   });
   async function recommendationPreview(config: any, cached: boolean) {
@@ -822,6 +1268,10 @@ async function run() {
       client.setTimeout(120_000, () => client.destroy());
       try { parsed = JSON.parse(input.split('\n')[0]!); } catch { reply({ ok: false, error: bt('main.request_invalid_format') }); return; }
       if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)){reply({ok:false,error:bt('main.request_invalid_format')});return;}
+      if (windowsIpcSession && !verifyIpcAuthToken(parsed.authToken, windowsIpcSession.authToken)) {
+        reply({ ok: false, error: bt('main.socket_mismatch') });
+        return;
+      }
       const command = parsed.command;
       if (stopping && command !== 'stop') {
         reply({ ok: false, error: bt('main.assistant_not_running') });
@@ -830,7 +1280,7 @@ async function run() {
       if (parsed.idempotencyKey) {
         if(typeof parsed.idempotencyKey!=='string'||parsed.idempotencyKey.length>256){reply({ok:false,error:bt('main.idempotency_invalid')});return;}
         const fingerprint=createHash('sha256').update(JSON.stringify(canonicalPayload(parsed))).digest('hex');
-        const state=idempotencyStore.reserve(parsed.idempotencyKey,fingerprint,reply);
+        const state=idempotencyStore.reserve(parsed.idempotencyKey,fingerprint,reply,{ok:false,error:bt('main.request_timeout')});
         if(state==='waiting')return;
         if(state!=='owner'){reply({ok:false,error:state==='conflict'?bt('main.idempotency_conflict'):bt('main.too_many_requests')});return;}
         ownsIdempotency=true;
@@ -854,6 +1304,8 @@ async function run() {
           let activeSubscriptionTier = 'FREE';
           let liveAccountEmail: string | null = null;
           let accountsRevision = '';
+          const statusNowMs = Date.now();
+          const remoteCandidatesForStatus = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(statusNowMs));
           if (parsed.includeAccounts !== false) {
             try {
               const liveLs = await probeLiveCached().catch(() => null);
@@ -874,34 +1326,89 @@ async function run() {
                 if (matchedSaved) {
                   activeAccountEmail = matchedSaved.email;
                   const liveQuotaForMatched = liveLs?.email?.toLowerCase() === detectedEmail.toLowerCase() ? liveLs.quota : null;
-                  const statusNowMs = Date.now();
                   scheduleExpiredQuotaCorrection(matchedSaved.id, liveQuotaForMatched, statusNowMs);
-                  const q = accountsManager.getAccountQuotaOverview({ ...matchedSaved, quota: mergeLiveQuotaWithSaved(matchedSaved.quota, liveQuotaForMatched, statusNowMs) }, { nowMs: statusNowMs });
+                  const localMerged = mergeLiveQuotaWithSaved(matchedSaved.quota, liveQuotaForMatched, statusNowMs) ?? null;
+                  const fused = fuseAccountQuotaAcrossEnvironments({
+                    email: matchedSaved.email,
+                    savedQuota: matchedSaved.quota,
+                    liveLocalQuota: liveQuotaForMatched,
+                    remoteSessions: remoteCandidatesForStatus,
+                    nowMs: statusNowMs,
+                  });
+                  const q = accountsManager.getAccountQuotaOverview({ ...matchedSaved, quota: fused.quota }, { nowMs: statusNowMs });
                   activeFiveHourQuota = q.fiveHourRemaining;
                   activeSubscriptionTier = normalizeSubscriptionTier(q.subscriptionTier);
+                  cachedLocalAccountSnapshot = {
+                    email: matchedSaved.email,
+                    name: matchedSaved.name || liveLs?.name || '',
+                    tier: activeSubscriptionTier,
+                    quota: localMerged,
+                    observedAtSec: localMerged?.last_updated ?? null,
+                    lastError: cleanAndLocalizeRefreshError(matchedSaved.quota_refresh_error) ?? '',
+                  };
                 } else if (liveLs?.email) {
                   activeAccountEmail = liveLs.email;
                   scheduleExpiredQuotaCorrection(null, liveLs.quota);
-                  const q = accountsManager.getAccountQuotaOverview({ quota: liveLs.quota });
+                  const fused = fuseAccountQuotaAcrossEnvironments({
+                    email: liveLs.email,
+                    savedQuota: null,
+                    liveLocalQuota: liveLs.quota,
+                    remoteSessions: remoteCandidatesForStatus,
+                    nowMs: statusNowMs,
+                  });
+                  const q = accountsManager.getAccountQuotaOverview({ quota: fused.quota ?? liveLs.quota }, { nowMs: statusNowMs });
                   activeFiveHourQuota = q.fiveHourRemaining;
                   activeSubscriptionTier = resolveUnsavedLiveSubscriptionTier(liveLs, q);
+                  cachedLocalAccountSnapshot = {
+                    email: liveLs.email,
+                    name: liveLs.name ?? '',
+                    tier: activeSubscriptionTier,
+                    quota: liveLs.quota ?? null,
+                    observedAtSec: liveLs.quota?.last_updated ?? null,
+                    lastError: '',
+                  };
                 }
               } else if (listRes.active_account) {
                 usageManager.setCurrentAccountContext(undefined);
                 activeAccountEmail = listRes.active_account.email;
-                const q = accountsManager.getAccountQuotaOverview(listRes.active_account);
+                const fused = fuseAccountQuotaAcrossEnvironments({
+                  email: listRes.active_account.email,
+                  savedQuota: listRes.active_account.quota,
+                  liveLocalQuota: null,
+                  remoteSessions: remoteCandidatesForStatus,
+                  nowMs: statusNowMs,
+                });
+                const q = accountsManager.getAccountQuotaOverview({ ...listRes.active_account, quota: fused.quota }, { nowMs: statusNowMs });
                 activeFiveHourQuota = q.fiveHourRemaining;
                 activeSubscriptionTier = normalizeSubscriptionTier(q.subscriptionTier);
+                cachedLocalAccountSnapshot = {
+                  email: listRes.active_account.email,
+                  name: listRes.active_account.name ?? '',
+                  tier: activeSubscriptionTier,
+                  quota: listRes.active_account.quota ?? null,
+                  observedAtSec: listRes.active_account.quota?.last_updated ?? null,
+                  lastError: cleanAndLocalizeRefreshError(listRes.active_account.quota_refresh_error) ?? '',
+                };
+              } else {
+                cachedLocalAccountSnapshot = null;
               }
             } catch {}
           }
           const all = tasks.list(), revision = tasks.revision;
           const installState = detectInstalledChannels(channel);
+          await buildRemoteSessionsPayload({ nonBlocking: true }).catch(() => []);
+          const envSnapshot = buildUnifiedEnvironmentSnapshot({ nowMs: statusNowMs });
+          const snap = controller.snapshot();
           if (parsed.includeTasks !== false && parsed.tasksSince !== revision) ipcMetrics.taskPayloadReplies++;
           reply({
             ok: true,
             status: {
-              ...controller.snapshot(),
+              ...snap,
+              remoteSessions: envSnapshot.remoteSessions,
+              environments: envSnapshot.environments,
+              environmentsRevision: envSnapshot.environmentsRevision,
+              remoteSyncRevision: envSnapshot.remoteSyncRevision,
+              focusedEnvironmentId: envSnapshot.focusedEnvironmentId,
               oauthClientConfigured: Boolean(getGoogleClientId() && getGoogleClientSecret()),
               applicationChannel: channel, applicationLabel: target.label, accountSwitchSupported: target.supportsAccountSwitch,
               bothApplicationsInstalled: installState.bothInstalled, availableChannels: installState.channels,
@@ -922,6 +1429,7 @@ async function run() {
       else if (['pause', 'restore'].includes(command)) { cancelRunningDeepScan(); }
       if (command === 'dashboard_summary') {
         (async () => {
+        const targetEnvironmentId = typeof parsed.environmentId === 'string' && parsed.environmentId.trim() ? parsed.environmentId.trim() : undefined;
         const counts = store.layerCounts;
         const dictTotal = (counts?.builtin ?? 0) + (counts?.incremental ?? 0) + (counts?.personal ?? 0);
         const livePromise = probeLiveCached().catch(() => null);
@@ -940,13 +1448,29 @@ async function run() {
             probeLiveLanguageServer: () => livePromise,
             getAccount: (id: string) => accountsManager.getAccount(id),
             getAccountQuotaOverview: (account: any, options?: any) => accountsManager.getAccountQuotaOverview(account, options),
-            getUsageSummary: () => usageManager.getUsageSummary(),
+            getUsageSummary: () => {
+              syncRemoteTargetStateAndMaybeTriggerSync();
+              return usageManager.getUsageSummary(false, undefined, targetEnvironmentId);
+            },
             getPricingTable: async () => {
               await pricingSyncPromise;
               return usageManager.getActivePricingTable();
             },
+            getRemoteSessions: () => toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot()),
           }),
+          buildRemoteSessionsPayload().catch(() => []),
         ]);
+        const dashAvailEnvs = Array.isArray(aggregate.usage?.availableEnvironments)
+          ? aggregate.usage.availableEnvironments as AvailableEnvironmentUsageOption[]
+          : undefined;
+        const envSnapshot = buildUnifiedEnvironmentSnapshot({ availableEnvironments: dashAvailEnvs });
+        const snap = controller.snapshot();
+        if (aggregate.usage && typeof aggregate.usage === 'object') {
+          aggregate.usage.environments = envSnapshot.environments;
+          aggregate.usage.environmentsRevision = envSnapshot.environmentsRevision;
+          aggregate.usage.remoteSyncRevision = envSnapshot.remoteSyncRevision;
+          aggregate.usage.focusedEnvironmentId = envSnapshot.focusedEnvironmentId;
+        }
         /* 总览“已覆盖”与覆盖页同源（translated / 已抽取），并带上应用版本与生成时间。 */
         const coverageMetrics = coverageMetricSnapshot(report);
 
@@ -971,6 +1495,15 @@ async function run() {
           coverage: report ? coverageMetrics : null,
           accounts: aggregate.accounts,
           usage: aggregate.usage,
+          remoteSessions: envSnapshot.remoteSessions,
+          environments: envSnapshot.environments,
+          environmentsRevision: envSnapshot.environmentsRevision,
+          remoteSyncRevision: envSnapshot.remoteSyncRevision,
+          focusedEnvironmentId: envSnapshot.focusedEnvironmentId,
+          focusedContextKey: snap.focusedContextKey ?? 'local',
+          remoteObservedVersion: snap.remoteObservedVersion ?? 0,
+          sshWindowsCount: snap.sshWindowsCount ?? 0,
+          activeSshHosts: snap.activeSshHosts ?? [],
           /* 局部失败时错误已脱敏，成功段仍返回可用数据，整体保持 ok:true。 */
           accountsError: aggregate.accountsError,
           usageError: aggregate.usageError,
@@ -987,6 +1520,7 @@ async function run() {
             const listNowMs = Date.now();
             const live = await probeLiveCached().catch(() => null);
             const detectedEmail = live?.email ?? await accountsManager.detectCurrentAntigravityEmail({ liveEmailHint: null }).catch(() => null);
+            const remoteCandidates = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(listNowMs));
             let effectiveActiveId = index.current_account_id;
             if (detectedEmail) {
               const matched = index.accounts.find(a => a.email.toLowerCase() === detectedEmail.toLowerCase());
@@ -1005,9 +1539,16 @@ async function run() {
               if (isLiveMatched) {
                 scheduleExpiredQuotaCorrection(summary.id, live.quota, listNowMs);
               }
+              const fused = fuseAccountQuotaAcrossEnvironments({
+                email: saved.email,
+                savedQuota: saved.quota,
+                liveLocalQuota: isLiveMatched ? live.quota : null,
+                remoteSessions: remoteCandidates,
+                nowMs: listNowMs,
+              });
               const acc: Account = {
                 ...saved,
-                quota: isLiveMatched ? mergeLiveQuotaWithSaved(saved.quota, live.quota, listNowMs) : saved.quota,
+                quota: fused.quota,
               };
               const projected = projectAccountForIpcNormalized(acc, {
                 nowMs: listNowMs,
@@ -1016,6 +1557,9 @@ async function run() {
                 includeOverviewFields: true,
                 formatResetTime,
                 revisionWithReadiness: true,
+                persistedQuotaLastUpdated: saved.quota?.last_updated ?? 0,
+                quotaSourceEnvironmentId: fused.quotaSourceEnvironmentId,
+                activeRemoteEnvIds: fused.activeRemoteEnvIds,
               });
               return { id: acc.id, ...(projected ?? {}) };
             }));
@@ -1039,17 +1583,28 @@ async function run() {
             return;
           }
           if (command === 'account_get') {
+            const getNowMs = Date.now();
             const acc = await accountsManager.getAccount(parsed.id);
             const identity = await resolveActiveIdentityForIpc();
-            const isActive = Boolean(acc && (
-              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
-              || (!identity.activeEmailLower && identity.activeId === acc.id)
-            ));
+            const remoteCandidates = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(getNowMs));
+            const isActive = isIdentityActiveAccount(identity, acc);
+            const fused = acc
+              ? fuseAccountQuotaAcrossEnvironments({
+                  email: acc.email,
+                  savedQuota: acc.quota,
+                  liveLocalQuota: null,
+                  remoteSessions: remoteCandidates,
+                  nowMs: getNowMs,
+                })
+              : null;
+            const fusedAcc = acc && fused ? { ...acc, quota: fused.quota } : acc;
             reply({
               ok: !!acc,
-              account: projectAccountForIpcNormalized(acc, {
+              account: projectAccountForIpcNormalized(fusedAcc, {
+                nowMs: getNowMs,
                 isActive,
                 hasLocalOAuthClient: hasLocalOAuthClientConfigured(),
+                ...(fused ? { quotaSourceEnvironmentId: fused.quotaSourceEnvironmentId, activeRemoteEnvIds: fused.activeRemoteEnvIds } : {}),
               }),
             });
             return;
@@ -1068,24 +1623,46 @@ async function run() {
           const insidersPrefix = '/Applications/Antigravity - Insiders.app/Contents/';
           const stablePrefix = `${target.appPath}/Contents/`;
           try {
-            const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-ww', '-o', 'pid=,pcpu=,args='], { timeout: 3000 });
-            for (const line of psOut.split('\n')) {
-              const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+(.*)$/);
-              if (!m) continue;
-              const cpu = parseFloat(m[2] || '0');
-              const args = m[3] || '';
-              if (args.startsWith(insidersPrefix)) {
-                // Align with AccountSwitchService.guardStopped(): block any Insiders process sharing official credentials.
-                appRunning = true;
-                insidersRunning = true;
-              } else if (args.startsWith(stablePrefix)) {
-                appRunning = true;
-                stableRunning = true;
-              } else {
-                continue;
+            if (isWindows()) {
+              const stableRoots = new Set<string>([target.appPath]);
+              const insidersRoots = new Set<string>();
+              for (const dir of defaultAntigravityInstallDirs()) {
+                stableRoots.add(join(dir, 'Antigravity'));
+                insidersRoots.add(join(dir, 'Antigravity - Insiders'));
+                insidersRoots.add(join(dir, 'Antigravity Insiders'));
+                insidersRoots.add(join(dir, 'Antigravity-Insiders'));
               }
-              if (/language_server/i.test(args) && cpu > maxLsCpu) {
-                maxLsCpu = cpu;
+              const procs = await appProcesses([...stableRoots, ...insidersRoots]);
+              for (const proc of procs) {
+                const isInsiders = Array.from(insidersRoots).some(root => isPathUnder(proc.exePath, root, 'win32'));
+                if (isInsiders) {
+                  appRunning = true;
+                  insidersRunning = true;
+                } else if (Array.from(stableRoots).some(root => isPathUnder(proc.exePath, root, 'win32'))) {
+                  appRunning = true;
+                  stableRunning = true;
+                }
+              }
+            } else {
+              const { stdout: psOut } = await execFileAsync('/bin/ps', ['-ax', '-ww', '-o', 'pid=,pcpu=,args='], { timeout: 3000 });
+              for (const line of psOut.split('\n')) {
+                const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+(.*)$/);
+                if (!m) continue;
+                const cpu = parseFloat(m[2] || '0');
+                const args = m[3] || '';
+                if (args.startsWith(insidersPrefix)) {
+                  // Align with AccountSwitchService.guardStopped(): block any Insiders process sharing official credentials.
+                  appRunning = true;
+                  insidersRunning = true;
+                } else if (args.startsWith(stablePrefix)) {
+                  appRunning = true;
+                  stableRunning = true;
+                } else {
+                  continue;
+                }
+                if (/language_server/i.test(args) && cpu > maxLsCpu) {
+                  maxLsCpu = cpu;
+                }
               }
             }
           } catch {}
@@ -1122,6 +1699,7 @@ async function run() {
               }
             } catch {}
           }
+          const sshSummary = controller.getActiveSshWindowsSummary();
           reply({
             ok: true,
             appRunning,
@@ -1131,14 +1709,55 @@ async function run() {
             state: hasRunningTask ? 'busy' : 'safe',
             hasRunningTask,
             taskReason,
+            activeSshWindowsCount: sshSummary.count,
+            activeSshHosts: sshSummary.hosts,
           });
         })().catch(error => reply({ ok: false, state: 'unknown', error: sanitizeErrorMessage(error) }));
         return;
       }
       // 只读及自管理锁的配额刷新命令直接并发响应，不阻塞在全局写锁 commandChain 队列后
       const isReadOnlyAutoSwitch = command === 'auto_switch_best' && parsed.execute !== true;
-      if (['maintenance_scan', 'maintenance_history', 'account_recovery_info', 'auto_switch_get', 'usage_snapshot_release', 'usage_events', 'usage_summary', 'usage_ledger_review', 'api_pricing_get', 'pricing_sync_status', 'quota_refresh', 'quota_refresh_start'].includes(command) || isReadOnlyAutoSwitch) {
+      if (['proxy_get', 'maintenance_scan', 'maintenance_history', 'account_recovery_info', 'auto_switch_get', 'usage_snapshot_release', 'usage_events', 'usage_summary', 'usage_ledger_review', 'api_pricing_get', 'pricing_sync_status', 'quota_refresh', 'quota_refresh_start', 'remote_quota_refresh'].includes(command) || isReadOnlyAutoSwitch) {
         (async () => {
+          if (command === 'proxy_get') {
+            const resolved = await resolveEffectiveProxy({ forceRefreshSystem: parsed.force === true });
+            reply({
+              ok: true,
+              proxy: {
+                mode: resolved.mode,
+                manualUrl: redactProxyUrl(resolved.manualUrl) ?? '',
+                effectiveUrl: redactProxyUrl(resolved.effectiveUrl),
+                source: resolved.source,
+              },
+            });
+            return;
+          }
+          if (command === 'remote_quota_refresh') {
+            const remoteKey = typeof parsed.remoteKey === 'string' && parsed.remoteKey.trim()
+              ? parsed.remoteKey.trim()
+              : undefined;
+            const environmentId = typeof parsed.environmentId === 'string' && parsed.environmentId.trim()
+              ? parsed.environmentId.trim()
+              : undefined;
+            await buildRemoteSessionsPayload({ force: true, remoteKey, environmentId });
+            if (!fixture && controller.getConnectedRemoteRpcTargets().length > 0) {
+              remoteSyncCoordinator.triggerSync();
+            }
+            const envSnapshot = buildUnifiedEnvironmentSnapshot();
+            const snap = controller.snapshot();
+            onStatus(snap);
+            reply({
+              ok: true,
+              remoteSessions: envSnapshot.remoteSessions,
+              environments: envSnapshot.environments,
+              environmentsRevision: envSnapshot.environmentsRevision,
+              remoteSyncRevision: envSnapshot.remoteSyncRevision,
+              focusedEnvironmentId: envSnapshot.focusedEnvironmentId,
+              remoteObservedVersion: snap.remoteObservedVersion ?? 0,
+              focusedContextKey: snap.focusedContextKey ?? 'local',
+            });
+            return;
+          }
           if (command === 'quota_refresh_start') {
             const taskId = startQuotaRefreshTask();
             reply({ ok: true, taskId });
@@ -1150,12 +1769,28 @@ async function run() {
             const identity = await resolveActiveIdentityForIpc();
             const index = await accountsManager.loadIndex().catch(() => null);
             const targetId = typeof parsed.id === 'string' && parsed.id ? parsed.id : (index?.current_account_id ?? null);
-            const isTargetActive = (accEmail: string | null | undefined, accId: string | null | undefined): boolean => {
-              if (identity.activeEmailLower && accEmail) {
-                return accEmail.trim().toLowerCase() === identity.activeEmailLower;
-              }
-              return Boolean(accId && identity.activeId && accId === identity.activeId);
-            };
+            const targetAcc = targetId ? await accountsManager.getAccount(targetId).catch(() => null) : null;
+            const targetIsLocalActive = isIdentityActiveAccount(identity, targetAcc);
+            const remoteRefreshReply = await refreshStandbyAccountViaRemoteSsh({
+              targetAcc,
+              targetIsLocalActive,
+              hasLocalOAuthClient,
+              nowMs: refreshNowMs,
+              getRemoteSessionsSnapshot: ms => controller.getRemoteSessionsSnapshot(ms),
+              probeRemoteByEnvironmentId: environmentId => buildRemoteSessionsPayload({ force: true, environmentId }),
+              syncRemoteObservedQuota: (accountId, quota, tier) => accountsManager.syncRemoteObservedQuota(accountId, quota, tier),
+              getAccount: accountId => accountsManager.getAccount(accountId),
+              toRemoteCandidates: toRemoteQuotaCandidates,
+              getAccountQuotaOverview: (acc, opts) => accountsManager.getAccountQuotaOverview(acc, opts),
+              projectAccount: (acc, opts) => projectAccountForIpcNormalized(acc, { ...opts, formatResetTime }),
+              buildEnvironmentSnapshot: opts => buildUnifiedEnvironmentSnapshot(opts),
+              publishSnapshot: () => onStatus(controller.snapshot()),
+              readOkMessage: bt('main.quota.read_ok'),
+            });
+            if (remoteRefreshReply) {
+              reply(remoteRefreshReply);
+              return;
+            }
             try {
               const acc = await accountsManager.refreshQuota(parsed.id);
               if (acc.quota?.models?.length) {
@@ -1165,7 +1800,7 @@ async function run() {
               const projected = projectAccountForIpcNormalized(acc, {
                 overview,
                 nowMs: refreshNowMs,
-                isActive: isTargetActive(acc.email, acc.id),
+                isActive: isIdentityActiveAccount(identity, acc),
                 hasLocalOAuthClient,
                 includeOverviewFields: true,
                 formatResetTime,
@@ -1230,17 +1865,56 @@ async function run() {
           if (command === 'usage_snapshot_release') { usageManager.releaseSnapshot(String(parsed.snapshotId ?? '')); reply({ ok: true }); return; }
           if (command === 'usage_events') {
             const period = ['today', '7d', '30d', 'all'].includes(String(parsed.period)) ? String(parsed.period) : 'today';
+            const force = Boolean(parsed.force);
             const targetAccountId = typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : undefined;
+            const targetEnvironmentId = typeof parsed.environmentId === 'string' && parsed.environmentId ? parsed.environmentId : undefined;
             await syncActiveAccountToUsageManager().catch(() => {});
-            reply({ ok: true, ...await usageManager.getUsageEvents(period, String(parsed.query ?? ''), Number(parsed.offset), Number(parsed.limit), typeof parsed.snapshotId === 'string' ? parsed.snapshotId : undefined, parsed.pinSnapshot === true, Boolean(parsed.force), targetAccountId) });
+            if (force) {
+              await runBoundedRemoteSyncForDemand(6_000);
+            } else {
+              syncRemoteTargetStateAndMaybeTriggerSync();
+            }
+            reply({
+              ok: true,
+              ...await usageManager.getUsageEvents(
+                period,
+                String(parsed.query ?? ''),
+                Number(parsed.offset),
+                Number(parsed.limit),
+                typeof parsed.snapshotId === 'string' ? parsed.snapshotId : undefined,
+                parsed.pinSnapshot === true,
+                force,
+                targetAccountId,
+                targetEnvironmentId
+              ),
+            });
             return;
           }
           if (command === 'usage_summary') {
             const force = Boolean(parsed.force);
             const targetAccountId = typeof parsed.accountId === 'string' && parsed.accountId ? parsed.accountId : undefined;
+            const targetEnvironmentId = typeof parsed.environmentId === 'string' && parsed.environmentId ? parsed.environmentId : undefined;
             await syncActiveAccountToUsageManager().catch(() => {});
-            const usage = await usageManager.getUsageSummary(force, targetAccountId);
-            reply(projectUsagePeriodSummary(usage, parsed.period, { includeAllPeriods: !targetAccountId || targetAccountId === 'all' }));
+            if (force) {
+              await runBoundedRemoteSyncForDemand(6_000);
+            } else {
+              syncRemoteTargetStateAndMaybeTriggerSync();
+            }
+            const usage = await usageManager.getUsageSummary(force, targetAccountId, targetEnvironmentId);
+            if (usage.generated_at && usage.generated_at > 0) {
+              cachedLocalUsageSyncedAtSec = usage.generated_at;
+            }
+            const envSnapshot = buildUnifiedEnvironmentSnapshot({
+              availableEnvironments: usage.available_environments,
+            });
+            reply(
+              projectUsagePeriodSummary(usage, parsed.period, {
+                includeAllPeriods:
+                  (!targetAccountId || targetAccountId === 'all') &&
+                  (!targetEnvironmentId || targetEnvironmentId === 'all'),
+                environmentsSnapshot: envSnapshot,
+              })
+            );
             return;
           }
           if (command === 'api_pricing_get') {
@@ -1273,7 +1947,24 @@ async function run() {
             reply({ok:true,...res,...catalogPayload,status:await usageManager.getPricingSyncStatus()});
             return;
           }
-          if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain;reply({ok:true,status:controller.snapshot()});return;}
+          if (command === 'proxy_set') {
+            setRuntimeProxyConfig({
+              mode: parsed.mode,
+              ...(parsed.manualUrl !== undefined ? { manualUrl: parsed.manualUrl } : {}),
+            });
+            const resolved = await resolveEffectiveProxy({ forceRefreshSystem: true });
+            reply({
+              ok: true,
+              proxy: {
+                mode: resolved.mode,
+                manualUrl: redactProxyUrl(resolved.manualUrl) ?? '',
+                effectiveUrl: redactProxyUrl(resolved.effectiveUrl),
+                source: resolved.source,
+              },
+            });
+            return;
+          }
+          if(command==='hud_set'){const nextHud=parsed.enabled!==false;await saveRuntimePreferences({hudEnabled:nextHud});await controller.configureHud(nextHud);await writeChain.catch(()=>{});reply({ok:true,status:controller.snapshot()});return;}
           if(command==='maintenance_smart_clear'){reply(await cacheMaintenance.smartClear({scopes:parsed.scopes,retentionDays:parsed.retentionDays,keepLocalSnapshots:parsed.keepLocalSnapshots}));return;}
           if(command==='maintenance_clear'){reply(await cacheMaintenance.clear(parsed.token, parsed.selectedNames));return;}
           if(command==='maintenance_restore'){reply(await cacheMaintenance.restore(parsed.snapshotId ?? parsed.id));return;}
@@ -1310,10 +2001,7 @@ async function run() {
           if (command === 'account_upsert') {
             const acc = await accountsManager.upsertAccount(parsed.data ?? parsed.account ?? parsed);
             const identity = await resolveActiveIdentityForIpc();
-            const isActive = Boolean(
-              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
-              || (!identity.activeEmailLower && identity.activeId === acc.id),
-            );
+            const isActive = isIdentityActiveAccount(identity, acc);
             reply({
               ok: true,
               account: projectAccountForIpcNormalized(acc, {
@@ -1326,10 +2014,7 @@ async function run() {
           if (command === 'account_rename') {
             const acc = await accountsManager.renameAccount(String(parsed.id ?? ''), parsed.name);
             const identity = await resolveActiveIdentityForIpc();
-            const isActive = Boolean(
-              (identity.activeEmailLower && acc.email.trim().toLowerCase() === identity.activeEmailLower)
-              || (!identity.activeEmailLower && identity.activeId === acc.id),
-            );
+            const isActive = isIdentityActiveAccount(identity, acc);
             reply({
               ok: true,
               account: projectAccountForIpcNormalized(acc, {
@@ -1344,16 +2029,16 @@ async function run() {
             return;
           }
           if (command === 'account_reorder') {
+            if (!Array.isArray(parsed.ids) || parsed.ids.some((item: unknown) => typeof item !== 'string')) {
+              throw new Error(bt('main.request_invalid_format'));
+            }
             const index = await accountsManager.reorderAccounts(parsed.ids);
             const identity = await resolveActiveIdentityForIpc();
             const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
             const reordered = await Promise.all(index.accounts.map(async summary => {
               const saved = await accountsManager.getAccount(summary.id).catch(() => null);
               const targetAcc = saved ?? summary;
-              const isActive = Boolean(
-                (identity.activeEmailLower && targetAcc.email.trim().toLowerCase() === identity.activeEmailLower)
-                || (!identity.activeEmailLower && identity.activeId === targetAcc.id),
-              );
+              const isActive = isIdentityActiveAccount(identity, targetAcc);
               return projectAccountForIpcNormalized(targetAcc, { isActive, hasLocalOAuthClient });
             }));
             reply({ ok: true, accounts: reordered });
@@ -1440,12 +2125,24 @@ async function run() {
             const identity = await resolveActiveIdentityForIpc();
             const hasLocalOAuthClient = hasLocalOAuthClientConfigured();
             const allNowMs = Date.now();
+            const remoteCandidates = toRemoteQuotaCandidates(controller.getRemoteSessionsSnapshot(allNowMs));
             const accounts = result.accounts.map(account => {
-              const isActive = Boolean(
-                (identity.activeEmailLower && account.email.trim().toLowerCase() === identity.activeEmailLower)
-                || (!identity.activeEmailLower && identity.activeId === account.id),
-              );
-              return projectAccountForIpcNormalized(account, { isActive, hasLocalOAuthClient, nowMs: allNowMs });
+              const isActive = isIdentityActiveAccount(identity, account);
+              const fused = fuseAccountQuotaAcrossEnvironments({
+                email: account.email,
+                savedQuota: account.quota,
+                liveLocalQuota: isActive ? account.quota : null,
+                remoteSessions: remoteCandidates,
+                nowMs: allNowMs,
+              });
+              const fusedAccount: Account = { ...account, quota: fused.quota };
+              return projectAccountForIpcNormalized(fusedAccount, {
+                isActive,
+                hasLocalOAuthClient,
+                nowMs: allNowMs,
+                quotaSourceEnvironmentId: fused.quotaSourceEnvironmentId,
+                activeRemoteEnvIds: fused.activeRemoteEnvIds,
+              });
             });
             reply({ ok: result.failures.length === 0,
               accounts,
@@ -1474,11 +2171,32 @@ async function run() {
           }
           else if (command === 'toggle') {if(!fixture)throw new Error(bt('main.shortcut_removed'));await controller.toggleLanguage();}
           else if (command === 'reload') await store.reload();
-          else if (command === 'stop') { stopping = true; clearTimeout(startupPricingSyncTimer); clearInterval(periodicPricingSyncTimer); clearTimeout(startupQuotaRefreshTimer); clearInterval(periodicQuotaRefreshTimer); server.close(); await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); }
+          else if (command === 'stop') {
+            stopping = true;
+            clearTimeout(startupPricingSyncTimer);
+            clearInterval(periodicPricingSyncTimer);
+            clearTimeout(startupQuotaRefreshTimer);
+            clearInterval(periodicQuotaRefreshTimer);
+            clearInterval(periodicRemoteSyncTimer);
+            server.close();
+            try {
+              await accountLogin.close().catch(() => {});
+              await tasks.stop().catch(() => {});
+              try { store.close(); } catch {}
+              await controller.stop().catch(() => {});
+              await writeChain.catch(() => {});
+              await cacheChain.catch(() => {});
+              reply({ ok: true, status: controller.snapshot() });
+            } finally {
+              await cleanupIpc();
+              await backendLease?.release().catch(() => {});
+              setTimeout(() => process.exit(0), 100);
+            }
+            return;
+          }
           else throw new Error(bt('main.unknown_command'));
-          await writeChain; await cacheChain.catch(() => {});
+          await writeChain.catch(() => {}); await cacheChain.catch(() => {});
           reply({ ok: true, status: controller.snapshot() });
-          if (stopping) { await unlink(socketPath).catch(() => {}); await backendLease?.release(); setTimeout(() => process.exit(0), 100); }
         } catch (error) { reply({ ok: false, error: sanitizeErrorMessage(error) }); }
       });
     });
@@ -1524,18 +2242,60 @@ async function run() {
     const validInterval = [5, 10, 15, 30, 60].includes(minutes);
     const cooldownMs = minutes * 60_000;
     const autoIntervalDue = validInterval && !(lastAutoQuotaRefreshIntervalMinutes === minutes && Date.now() - lastAutoQuotaRefreshStartAt < cooldownMs);
-    if (!autoIntervalDue && hasLocalOAuthClient) return;
-    if (autoIntervalDue && tasks.list().some(t => t.state === 'running')) return;
+    const onlineSshSessions = controller.getRemoteSessionsSnapshot().filter(s => s.state === 'connected');
+    if (!autoIntervalDue && hasLocalOAuthClient && onlineSshSessions.length === 0) return;
     autoQuotaRefreshCheckInFlight = true;
     void (async () => {
       try {
+        const nowMs = Date.now();
+        const nowSec = nowMs / 1000;
+        const staleMs = accountsManager.getConfiguredQuotaStaleSeconds() * 1000;
+        const sshRefreshIntervalMs = validInterval ? Math.min(cooldownMs, staleMs) : staleMs;
+
+        // 1. 在线 SSH 主机纳入定时静默配额刷新（即使本机无 OAuth 或未配置本地备用号也独立生效）
+        const overdueRemoteKeys = onlineSshSessions
+          .filter(s => !s.observedAt || nowMs - s.observedAt >= sshRefreshIntervalMs)
+          .map(s => s.remoteKey);
+        if (overdueRemoteKeys.length > 0 && !stopping) {
+          const idx = await accountsManager.loadIndex().catch(() => null);
+          const matchAccountId = (email: string): string | null => {
+            if (!idx || !email) return null;
+            const targetEmail = email.toLowerCase();
+            return idx.accounts.find(a => a.email.toLowerCase() === targetEmail)?.id ?? null;
+          };
+          const getQuotaOverview = (quota: QuotaData, tsMs: number) =>
+            accountsManager.getAccountQuotaOverview({ quota }, { nowMs: tsMs });
+          const refreshed = await Promise.all(
+            overdueRemoteKeys.map(rk =>
+              controller.probeRemoteSessions({
+                force: true,
+                remoteKey: rk,
+                matchAccountId,
+                getQuotaOverview,
+              }).catch(() => [])
+            )
+          );
+          for (const list of refreshed) {
+            for (const s of list) {
+              if (s.quota?.models?.length) registerObservedModelsFromSource(s.quota.models);
+            }
+          }
+          syncRemoteTargetStateAndMaybeTriggerSync();
+          if (!stopping) onStatus(controller.snapshot());
+        }
+
+        if (autoIntervalDue && tasks.list().some(t => t.state === 'running')) return;
         const index = await accountsManager.loadIndex();
         const enabledSummaries = index.accounts.filter(acc => !acc.disabled);
         if (enabledSummaries.length === 0) return;
-        const nowMs = Date.now();
-        const nowSec = nowMs / 1000;
         const intervalSec = minutes * 60;
         const identity = await resolveActiveIdentityForIpc();
+        const activeRemoteEmails = new Set(
+          controller
+            .getRemoteSessionsSnapshot(nowMs)
+            .filter(s => s.state === 'connected' && typeof s.email === 'string' && s.email.trim().length > 0)
+            .map(s => s.email!.trim().toLowerCase()),
+        );
         let hasOverdueAccount = false;
         for (const summary of enabledSummaries) {
           const saved = await accountsManager.getAccount(summary.id).catch(() => null);
@@ -1544,15 +2304,17 @@ async function run() {
           const isActive = identity.activeEmailLower
             ? saved.email.trim().toLowerCase() === identity.activeEmailLower
             : saved.id === index.current_account_id;
+          const isRemoteActive = activeRemoteEmails.has(saved.email.trim().toLowerCase());
           const standbyStatus = computeStandbyRefreshStatus(saved, {
             isActive,
+            isRemoteActive,
             hasLocalOAuthClient,
             nowMs,
           });
           const lastUpdated = saved.quota?.last_updated ?? 0;
 
           // Pre-expiry Last-Mile Snap: refresh standby account silently shortly before its harvested access token expires.
-          if (!hasLocalOAuthClient && !isActive) {
+          if (!hasLocalOAuthClient && !isActive && !isRemoteActive) {
             const exp = saved.token?.expiry_timestamp;
             const hasValidAccess = Boolean(saved.token?.access_token && saved.token.access_token !== 'pending_refresh');
             const ttl = typeof exp === 'number' && Number.isFinite(exp) ? exp - nowSec : -1;
@@ -1584,35 +2346,99 @@ async function run() {
   startupQuotaRefreshTimer.unref();
   const periodicQuotaRefreshTimer = setInterval(() => maybeScheduleAutoQuotaRefresh(), 30_000);
   periodicQuotaRefreshTimer.unref();
+  const periodicRemoteSyncTimer = setInterval(() => {
+    if (stopping || fixture) return;
+    syncRemoteTargetStateAndMaybeTriggerSync();
+    remoteSyncCoordinator.triggerSync();
+  }, 45_000);
+  periodicRemoteSyncTimer.unref();
   server.maxConnections = 64;
-  const previousUmask = process.umask(0o177);
-  try {
+  if (isWindows()) {
     await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(socketPath, resolveListen); });
-  } finally {
-    process.umask(previousUmask);
+  } else {
+    const previousUmask = process.umask(0o177);
+    try {
+      await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(socketPath, resolveListen); });
+    } finally {
+      process.umask(previousUmask);
+    }
   }
-  await chmod(socketPath, 0o600);
+  server.on('error', error => {
+    console.error(`[GravityBox] ${sanitizeError(error?.message ?? bt('main.uncaught_exception'))}`);
+  });
+  if (windowsIpcSession) {
+    await writeIpcSession(stateDir, windowsIpcSession);
+  } else {
+    await finalizeIpcEndpointAfterListen(socketPath);
+  }
   const stop = async (code = 0) => {
     if (stopping) return; stopping = true;
     clearTimeout(startupPricingSyncTimer);
     clearInterval(periodicPricingSyncTimer);
     clearTimeout(startupQuotaRefreshTimer);
     clearInterval(periodicQuotaRefreshTimer);
+    clearInterval(periodicRemoteSyncTimer);
     server.close();
-    await commandChain.catch(() => {});
-    await accountLogin.close(); await tasks.stop(); store.close(); await controller.stop(); await writeChain; await cacheChain.catch(() => {}); await unlink(socketPath).catch(() => {}); await backendLease?.release(); process.exit(code);
+    try {
+      await commandChain.catch(() => {});
+      await accountLogin.close().catch(() => {});
+      await tasks.stop().catch(() => {});
+      try { store.close(); } catch {}
+      await controller.stop().catch(() => {});
+      await writeChain.catch(() => {});
+      await cacheChain.catch(() => {});
+    } finally {
+      await cleanupIpc();
+      await backendLease?.release().catch(() => {});
+      process.exit(code);
+    }
   };
   process.off('SIGTERM', earlySignalExit); process.off('SIGINT', earlySignalExit);
   process.on('SIGTERM', () => void stop()); process.on('SIGINT', () => void stop());
   // A single bad payload must not take the whole localisation helper down; log it and keep serving.
-  process.on('uncaughtException', error => { console.error(`[GravityBox] ${sanitizeError(error?.stack ?? error?.message ?? bt('main.uncaught_exception'))}`); if (stopping) void stop(1); });
+  process.on('uncaughtException', error => { console.error(`[GravityBox] ${sanitizeError(error?.stack ?? error?.message ?? bt('main.uncaught_exception'))}`); if (stopping) { backendLease?.releaseSync(); process.exit(1); } });
   process.on('unhandledRejection', reason => { console.error(`[GravityBox] ${reason instanceof Error ? sanitizeError(reason.message) : bt('main.unhandled_rejection')}`); });
+  await Promise.all([
+    remoteSyncCoordinator.observationStore.load().catch(() => {}),
+    usageManager.getSyncReceipts().then(receipts => {
+      for (const rec of Object.values(receipts ?? {})) {
+        if (rec?.environment_id && rec.committed_at > 0) {
+          const prev = remoteLastSyncedAtSec.get(rec.environment_id) ?? 0;
+          if (rec.committed_at > prev) remoteLastSyncedAtSec.set(rec.environment_id, rec.committed_at);
+        }
+      }
+    }).catch(() => {}),
+    accountsManager.listAccounts().then(listRes => {
+      refreshCachedAccountIds(listRes.accounts);
+      if (listRes.active_account) {
+        const q = accountsManager.getAccountQuotaOverview(listRes.active_account);
+        cachedLocalAccountSnapshot = {
+          email: listRes.active_account.email,
+          name: listRes.active_account.name ?? '',
+          tier: normalizeSubscriptionTier(q.subscriptionTier),
+          quota: listRes.active_account.quota ?? null,
+          observedAtSec: listRes.active_account.quota?.last_updated ?? null,
+          lastError: cleanAndLocalizeRefreshError(listRes.active_account.quota_refresh_error) ?? '',
+        };
+      }
+    }).catch(() => {}),
+  ]);
   onStatus(controller.snapshot());
-  void accountsManager.loadIndex().catch(() => {});
-  void usageManager.getUsageSummary(false).catch(() => {});
+  void usageManager.getUsageSummary(false).then(summary => {
+    if (summary?.available_environments) {
+      cachedAvailableEnvironments = summary.available_environments;
+    }
+    if (summary?.generated_at && summary.generated_at > 0) {
+      cachedLocalUsageSyncedAtSec = summary.generated_at;
+    }
+    if (!stopping) onStatus(controller.snapshot());
+  }).catch(() => {});
   await controller.start();
   void syncActiveAccountToUsageManager(true).catch(() => {});
   } catch (error) {
+    if (windowsIpcSession) {
+      await cleanupIpcSession(stateDir, process.pid).catch(() => {});
+    }
     await backendLease?.release().catch(() => {});
     throw error;
   }
@@ -1623,8 +2449,8 @@ function isDirectEntry(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
   const modulePath = fileURLToPath(import.meta.url);
-  if (resolve(entry) === modulePath) return true;
-  try { return realpathSync(entry) === realpathSync(modulePath); } catch { return false; }
+  if (pathsEqual(resolve(entry), modulePath)) return true;
+  try { return pathsEqual(realpathSync(entry), realpathSync(modulePath)); } catch { return false; }
 }
 if (process.env.GRAVITYBOX_IMPORT_ONLY !== '1' && isDirectEntry()) {
   run().catch(error => { console.error(`[GravityBox] ${sanitizeError((error as Error)?.message ?? bt('main.startup_failed'))}`); process.exitCode = 1; });

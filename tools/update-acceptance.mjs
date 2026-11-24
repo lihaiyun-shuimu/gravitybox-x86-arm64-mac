@@ -151,8 +151,10 @@ export async function collectAcceptance({
     installed: installedApp,
     installedFilesVerified,
     automated: {
-      unitIntegrationPassed: unit?.tests ?? null,
+      unitIntegrationTotal: unit?.tests ?? null,
+      unitIntegrationPassed: unit?.pass ?? null,
       unitIntegrationFailed: unit?.fail ?? null,
+      unitIntegrationSkipped: unit?.skipped ?? null,
       browserPassed: browser?.passed ?? null,
       dictionaryGates: gates.filter(gate => gate.pass === true).map(gate => gate.version),
       dictionaryGateFailed: gates.filter(gate => gate.pass !== true).map(gate => gate.version),
@@ -163,10 +165,33 @@ export async function collectAcceptance({
   };
 }
 
-/** 以现有摘要为底，覆盖可自动验证的字段；liveAcceptance/preservation/rollback 等人工证据原样保留。 */
+/** 以现有摘要为底，覆盖可自动验证的字段；人工证据原样保留并与对应 DMG SHA-256 绑定以识别陈旧。 */
 export function buildSummary(existing, collected) {
   const base = existing && typeof existing === 'object' ? existing : {};
   const automated = { ...(base.automated ?? {}), ...omitNulls(collected.automated) };
+  const hasManualEvidence = Boolean(base.liveAcceptance || base.preservation || base.rollback);
+  const priorManualDmgHash =
+    base.manualAcceptanceDmgSHA256 ?? (hasManualEvidence ? (base.dmgSHA256 ?? null) : null);
+  const nextDmgHash = collected.dmgSHA256 ?? null;
+  let manualAcceptanceFields = {};
+  if (hasManualEvidence && priorManualDmgHash) {
+    if (nextDmgHash && String(priorManualDmgHash).toLowerCase() !== String(nextDmgHash).toLowerCase()) {
+      manualAcceptanceFields = {
+        manualAcceptanceDmgSHA256: priorManualDmgHash,
+        manualAcceptanceStatus: 'stale',
+      };
+    } else if (nextDmgHash) {
+      manualAcceptanceFields = {
+        manualAcceptanceDmgSHA256: priorManualDmgHash,
+        manualAcceptanceStatus: base.manualAcceptanceStatus === 'stale' ? 'stale' : 'verified',
+      };
+    } else {
+      manualAcceptanceFields = {
+        manualAcceptanceDmgSHA256: priorManualDmgHash,
+        manualAcceptanceStatus: base.manualAcceptanceStatus ?? 'unverified_dmg',
+      };
+    }
+  }
   return {
     ...base,
     at: collected.at,
@@ -176,6 +201,7 @@ export function buildSummary(existing, collected) {
     verifiedAt: collected.verifiedAt,
     dmg: collected.dmg,
     dmgSHA256: collected.dmgSHA256,
+    ...manualAcceptanceFields,
     installed: collected.installed,
     installedFilesVerified: collected.installedFilesVerified,
     automated,
@@ -214,6 +240,9 @@ export async function updateAcceptance({ root = repoRoot, out = join(root, '文�
   const existing = await readJson(out);
   const collected = await collectAcceptance({ root, now, signatureProbe, ...(installedApp ? { installedApp } : {}), ...(stagingApp ? { stagingApp } : {}) });
   const summary = buildSummary(existing, collected);
+  if (summary.manualAcceptanceStatus === 'stale') {
+    collected.warnings.push(`人工验收记录（${String(summary.manualAcceptanceDmgSHA256 ?? '').slice(0, 12)}…）对应旧 DMG，与当前 DMG（${String(summary.dmgSHA256 ?? '').slice(0, 12)}…）不一致，已标记 manualAcceptanceStatus="stale"`);
+  }
   const changes = diffObjects(existing ?? {}, summary);
   if (!dryRun) {
     await mkdir(dirname(out), { recursive: true });

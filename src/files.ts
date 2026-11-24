@@ -3,6 +3,7 @@ import { renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { bt } from './i18n.js';
+import { atomicRenameWithRetry, isOwnedByCurrentUser, isWindows } from './platform/index.js';
 
 export interface AtomicWriteOptions {
   durability?: 'strict' | 'relaxed';
@@ -14,7 +15,7 @@ export async function atomicText(path: string, text: string, signal?: AbortSigna
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(bt('files.refuse_non_user_file'));
+    if (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info)) throw new Error(bt('files.refuse_non_user_file'));
   } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
@@ -26,7 +27,11 @@ export async function atomicText(path: string, text: string, signal?: AbortSigna
       if (strict) await handle.sync();
     } finally { await handle.close(); }
     signal?.throwIfAborted();
-    renameSync(temp, path);
+    if (isWindows()) {
+      await atomicRenameWithRetry(temp, path, { signal });
+    } else {
+      renameSync(temp, path);
+    }
     if (strict) {
       // Persist the directory entry as well, otherwise a power loss can roll the rename back.
       const dir = await open(dirname(path), 'r').catch(() => null);
@@ -57,7 +62,7 @@ export async function readOptionalJson<T = Record<string, unknown>>(path: string
 }
 
 function basenameForLog(filePath: string): string {
-  const idx = filePath.lastIndexOf('/');
+  const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
   return idx >= 0 ? filePath.slice(idx + 1) : filePath;
 }
 
@@ -86,7 +91,7 @@ export async function commitFileSet(journalPath: string, values: { path: string;
   const changes: FileChange[] = [];
   for (const value of values) {
     const info = await lstat(value.path).catch(error => { if (error.code !== 'ENOENT') throw error; return null; });
-    if (info && (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.())) throw new Error(bt('files.delete_identity_mismatch'));
+    if (info && (!info.isFile() || info.isSymbolicLink() || !isOwnedByCurrentUser(info))) throw new Error(bt('files.delete_identity_mismatch'));
     changes.push({ ...value, before: await readOptional(value.path) });
   }
   await atomicJson(journalPath, { schema: 1, changes });
@@ -119,7 +124,7 @@ export async function commitAccountAndIndex(accountPath:string,accountData:unkno
   await mkdir(dirname(accountPath),{recursive:true,mode:0o700});
   await mkdir(dirname(indexPath),{recursive:true,mode:0o700});
   for(const target of [accountPath,indexPath]) {
-    try {const info=await lstat(target);if(!info.isFile()||info.isSymbolicLink()||info.uid!==process.getuid?.())throw Error(bt('files.refuse_non_user_file'));}
+    try {const info=await lstat(target);if(!info.isFile()||info.isSymbolicLink()||!isOwnedByCurrentUser(info))throw Error(bt('files.refuse_non_user_file'));}
     catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   }
   const journalPath=indexPath+'.commit.json';
@@ -145,7 +150,7 @@ export function sanitizeError(msg: string, secrets: (string | undefined | null)[
   unique.forEach((secret, index) => { cleaned = cleaned.split(secret).join(SECRET_SENTINEL(index)); });
   cleaned = cleaned.replace(/\b((?:proxy-)?authorization\s*[:=]\s*)(?:bearer|basic|digest|token)\s+[^\s,;]+/gi, `$1${REDACTED_TOKEN}`);
   cleaned = cleaned.replace(/\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{4,}/gi, `$1 ${REDACTED_TOKEN}`);
-  cleaned = cleaned.replace(/(\bhttps?:\/\/[^/\s:@]+:)([^@\s/]+)(@)/gi, `$1${REDACTED_KEY}$3`);
+  cleaned = cleaned.replace(/(\b(?:https?|socks4a?|socks5h?|socks):\/\/[^/\s:@]*:)([^@\s/]+)(@)/gi, `$1${REDACTED_KEY}$3`);
   cleaned = cleaned.replace(/\b(?:sk-[A-Za-z0-9_-]{4,}|AIza[A-Za-z0-9_-]{4,}|ya29\.[A-Za-z0-9._-]+|gh[pousr]_[A-Za-z0-9]{4,}|xox[baprs]-[A-Za-z0-9-]{4,}|AKIA[0-9A-Z]{8,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/g, REDACTED_KEY);
   cleaned = cleaned.replace(/\u0000(\d+)\u0000/g, REDACTED_KEY);
   return cleaned.length > 300 ? `${cleaned.slice(0, 300)}...` : cleaned;

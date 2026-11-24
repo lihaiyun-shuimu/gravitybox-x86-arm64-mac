@@ -1,6 +1,6 @@
 import { readdir, rm } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { GENERATED_DIST_FILES } from './copy-runtime.mjs';
 
 /**
@@ -47,11 +47,21 @@ export async function cleanDist(options = {}) {
   const plan = await planDistCleanup(options);
   const projectRoot = options.projectRoot ?? defaultRoot;
   const distDir = options.distDir ?? 'dist';
-  for (const relative of plan.orphans) await rm(join(projectRoot, distDir, ...relative.split('/')), { force: true });
+  for (const relative of plan.orphans) {
+    await rm(join(projectRoot, distDir, ...relative.split('/')), { force: true, maxRetries: 3, retryDelay: 50 });
+  }
   return { ...plan, removed: plan.orphans };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isDirectEntry() {
+  if (!process.argv[1]) return false;
+  if (process.platform === 'win32') {
+    return resolve(process.argv[1]).toLowerCase() === resolve(fileURLToPath(import.meta.url)).toLowerCase();
+  }
+  return import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isDirectEntry()) {
   const dryRun = process.argv.includes('--dry-run');
   const plan = dryRun ? await planDistCleanup() : await cleanDist();
   if (!plan.orphans.length) process.stdout.write('dist 与 src 对应，无孤儿文件\n');

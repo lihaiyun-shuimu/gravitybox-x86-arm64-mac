@@ -1396,6 +1396,260 @@ test('v1.1.1 超大重复分块与大1.9/废弃字段3投影修复及策略A缓�
   });
 });
 
+test('P1-12 & P1-13: revalueLedger 保护缺 cacheWrite 合法锁/强制 environmentId=all/统计删锁变更；aggregateIndexCache 跨连接命中且上限 2 项受 epoch 失效控制', async t => {
+  await withFixture(t, async ({ stateDir }) => {
+    const {
+      aggregateLedger,
+      bumpAggregateModelCatalogEpoch,
+      getAggregateIndexCacheStats,
+      invalidateAggregateIndexCache,
+    } = await import('../dist/usage-aggregate.js');
+
+    // P1-12: revalueLedger
+    const revDir = join(stateDir, 'p1-12-revalue');
+    const ledger = new UsageLedger(revDir);
+    const now = Math.floor(Date.now() / 1000);
+    const cwEventKey = 'c'.repeat(64);
+    const sshEventKey = 'd'.repeat(64);
+    const legacySshKey = 'e'.repeat(64);
+
+    await ledger.save([
+      {
+        event_key: cwEventKey,
+        source_id: 'src-cw',
+        db_file: 'live-cw.db',
+        model: 'test-cw-model',
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+        cached_tokens: 0,
+        cache_write_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+        timestamp_seconds: now - 120,
+        environment_kind: 'local',
+        environment_id: 'local',
+      },
+      {
+        event_key: sshEventKey,
+        legacy_event_key: legacySshKey,
+        source_id: 'src-ssh',
+        db_file: 'remote-ssh.db',
+        model: 'test-ssh-model',
+        input_tokens: 1_000_000,
+        output_tokens: 0,
+        cached_tokens: 0,
+        total_tokens: 1_000_000,
+        timestamp_seconds: now - 60,
+        environment_kind: 'ssh',
+        environment_id: 'ssh:box-1',
+        environment_label: 'box-1',
+      },
+    ]);
+    await ledger.saveLocks({
+      [cwEventKey]: {
+        usd: 6.0,
+        price: { model: 'test-cw-model', input: 2.0, output: 0, cached: 0, cacheWrite: 4.0 },
+      },
+      [legacySshKey]: {
+        usd: 5.0,
+        price: { model: 'test-ssh-model', input: 5.0, output: 0, cached: 0 },
+      },
+    });
+
+    // 1) unpriced_only 模式：新价缺 cacheWrite 保留原有 $6 合法锁；预览聚合强制 environmentId='all' 涵盖 ssh:box-1
+    const previewUnpriced = await ledger.revalue({
+      action: 'preview',
+      mode: 'unpriced_only',
+      environmentId: 'local',
+      prices: {
+        'test-cw-model': { model: 'test-cw-model', input: 3.0, output: 0, cached: 0 },
+        'test-ssh-model': { model: 'test-ssh-model', input: 2.0, output: 0, cached: 0 },
+      },
+      liveFiles: ['live-cw.db', 'remote-ssh.db'],
+      now,
+    });
+    assert.equal(previewUnpriced.unverifiableCount, 1);
+    assert.equal(previewUnpriced.before, 11.0);
+    assert.equal(previewUnpriced.after, 8.0, 'unpriced_only 保留 cw 合法锁($6) + 全环境聚合含 SSH($2，ignoreLegacyRates=true) = $8');
+
+    // 2) force_all 模式：对齐 Release-Audit-P0 契约，移除未核实 cacheWrite 原锁并计入 changedCount/samples(after: null)，
+    //    即使调用方传入 environmentId: 'local'，预览聚合也必须覆盖全部环境（含 ssh:box-1）；
+    //    同时旧 legacySshKey 与 cwEventKey 被删锁均计入 changedCount 与 samples(after: null)。
+    const preview = await ledger.revalue({
+      action: 'preview',
+      mode: 'force_all',
+      environmentId: 'local',
+      prices: {
+        'test-cw-model': { model: 'test-cw-model', input: 3.0, output: 0, cached: 0 },
+        'test-ssh-model': { model: 'test-ssh-model', input: 2.0, output: 0, cached: 0 },
+      },
+      liveFiles: ['live-cw.db', 'remote-ssh.db'],
+      now,
+    });
+    assert.equal(preview.unverifiableCount, 1, '新价缺 cacheWrite 应计入 unverifiableCount');
+    assert.equal(preview.before, 11.0, '重估前总额应为 6.0 + 5.0');
+    assert.equal(preview.after, 2.0, 'force_all 移除缺 cacheWrite 的原锁后仅剩 ssh 重估($2)，不受传入 environmentId=local 干扰');
+    assert.ok(
+      preview.samples.some(s => s.key === legacySshKey && s.before === 5.0 && s.after === null),
+      'backupLocks 中被删除的遗留锁键应记录在 samples(after: null)'
+    );
+    assert.ok(
+      preview.samples.some(s => s.key === cwEventKey && s.before === 6.0 && s.after === null),
+      'backupLocks 中因缺 cacheWrite 被移除的原锁键应记录在 samples(after: null)'
+    );
+    assert.equal(preview.changedCount, 3, '新增 sshEventKey($2) + 删除 legacySshKey($5->null) + 删除 cwEventKey($6->null) 共 3 处变更');
+
+    // P1-13: aggregateIndexCache 跨独立 DatabaseSync 连接命中、上限 2 项淘汰、epoch 与 locale 失效
+    invalidateAggregateIndexCache();
+    const makeTempLedgerDb = async (name) => {
+      const d = join(stateDir, `p1-13-${name}`);
+      const l = new UsageLedger(d);
+      await l.save([
+        {
+          event_key: createHash('sha256').update(name).digest('hex'),
+          source_id: `src-${name}`,
+          db_file: `${name}.db`,
+          model: name === 'a' ? '' : 'gemini-3.8-flash',
+          input_tokens: 100,
+          output_tokens: 50,
+          cached_tokens: 0,
+          total_tokens: 150,
+          timestamp_seconds: now - 30,
+        },
+      ]);
+      return join(d, 'usage-ledger-v2.sqlite');
+    };
+    const dbPathA = await makeTempLedgerDb('a');
+    const dbPathB = await makeTempLedgerDb('b');
+    const dbPathC = await makeTempLedgerDb('c');
+    const aggOpts = { prices: {}, accounts: [], now };
+    const origLocale = getActiveLocale();
+    t.after(() => setActiveLocale(origLocale));
+
+    setActiveLocale('en');
+    const stats0 = getAggregateIndexCacheStats();
+    const dbA1 = new DatabaseSync(dbPathA);
+    const aggEn = aggregateLedger(dbA1, aggOpts);
+    dbA1.close();
+    assert.equal(aggEn.all_time.by_model[0].model, 'Unknown Model');
+    const stats1 = getAggregateIndexCacheStats();
+    assert.equal(stats1.misses, stats0.misses + 1);
+
+    // 重新打开同一路径的新 DatabaseSync 实例（同 locale）必须命中缓存（不再因 WeakMap 实例变化而失效）
+    const dbA2 = new DatabaseSync(dbPathA);
+    aggregateLedger(dbA2, aggOpts);
+    dbA2.close();
+    const stats2 = getAggregateIndexCacheStats();
+    assert.equal(stats2.hits, stats1.hits + 1, '重新打开同路径 DatabaseSync 实例应命中基于 dbPath+dev:ino 的索引缓存');
+
+    // 切换语言后不得命中英文缓存，必须按新 locale 重建返回中文占位名
+    setActiveLocale('zh-Hans');
+    const dbA3 = new DatabaseSync(dbPathA);
+    const aggZh = aggregateLedger(dbA3, aggOpts);
+    dbA3.close();
+    assert.equal(aggZh.all_time.by_model[0].model, '未知模型', '切换 locale 后索引缓存必须失效并按新语言解析未知模型名');
+
+    // 连续访问 B 和 C 后，缓存条数上限固定为 2（淘汰最久未用项）
+    const dbB = new DatabaseSync(dbPathB);
+    aggregateLedger(dbB, aggOpts);
+    dbB.close();
+    const dbC = new DatabaseSync(dbPathC);
+    aggregateLedger(dbC, aggOpts);
+    dbC.close();
+    const stats3 = getAggregateIndexCacheStats();
+    assert.equal(stats3.size, 2, 'aggregateIndexCache 上限必须严格保持 2 项');
+    assert.equal(stats3.maxSize, 2);
+
+    // 目录/观测元数据 epoch 递增后应清空旧缓存并触发重建
+    const prevEpoch = stats3.epoch;
+    const nextEpoch = bumpAggregateModelCatalogEpoch();
+    assert.equal(nextEpoch, prevEpoch + 1);
+    assert.equal(getAggregateIndexCacheStats().size, 0, 'bumpAggregateModelCatalogEpoch 后旧索引缓存应立即失效');
+  });
+});
+
+test('sqlite-worker 修复: closeSqliteDatabase 抗 ROLLBACK 异常防句柄泄漏，createSqlBlobChunkReader 单次物化中等 BLOB 且不越界超大 BLOB', async () => {
+  const { closeSqliteDatabase, createSqlBlobChunkReader } = await import('../dist/sqlite-worker.js');
+
+  // 1. ROLLBACK 抛错时仍必须执行 close()，且 close() 自身抛错也不向外泄漏异常
+  let closedCount = 0;
+  closeSqliteDatabase({
+    exec() { throw new Error('cannot rollback - no transaction is active'); },
+    close() { closedCount += 1; },
+  });
+  assert.equal(closedCount, 1, 'ROLLBACK 抛错后仍必须调用 db.close()');
+
+  assert.doesNotThrow(() => {
+    closeSqliteDatabase({
+      exec() { throw new Error('rollback failed'); },
+      close() { throw new Error('close failed'); },
+    });
+    closeSqliteDatabase(undefined);
+  });
+
+  // 2. <=64MB BLOB：前 3 次走 substr，第 4 次起单次物化并零拷贝切片
+  const payload = Uint8Array.from({ length: 64 }, (_, i) => i);
+  let substrCalls = 0;
+  let fullCalls = 0;
+  const reader = createSqlBlobChunkReader(
+    payload.byteLength,
+    7,
+    () => ({
+      get(start1Based, length, key) {
+        assert.equal(key, 7);
+        substrCalls += 1;
+        return { chunk: payload.slice(start1Based - 1, start1Based - 1 + length) };
+      },
+    }),
+    () => ({
+      get(key) {
+        assert.equal(key, 7);
+        fullCalls += 1;
+        return { data: payload };
+      },
+    })
+  );
+
+  assert.deepEqual([...reader(0, 4)], [0, 1, 2, 3]);
+  assert.deepEqual([...reader(4, 4)], [4, 5, 6, 7]);
+  assert.deepEqual([...reader(8, 4)], [8, 9, 10, 11]);
+  assert.equal(substrCalls, 3);
+  assert.equal(fullCalls, 0);
+
+  // 第 4、5 次读取应触发且仅触发 1 次全量物化，并用 subarray 返回切片
+  const slice4 = reader(12, 4);
+  const slice5 = reader(16, 4);
+  assert.deepEqual([...slice4], [12, 13, 14, 15]);
+  assert.deepEqual([...slice5], [16, 17, 18, 19]);
+  assert.equal(substrCalls, 3);
+  assert.equal(fullCalls, 1);
+
+  // 3. >64MB 超大 BLOB：即使超过 3 次调用也绝不全量物化
+  let hugeSubstrCalls = 0;
+  let hugeFullCalls = 0;
+  const hugeReader = createSqlBlobChunkReader(
+    65 * 1024 * 1024,
+    99,
+    () => ({
+      get(start1Based, length) {
+        hugeSubstrCalls += 1;
+        return { chunk: payload.slice(start1Based - 1, start1Based - 1 + length) };
+      },
+    }),
+    () => ({
+      get() {
+        hugeFullCalls += 1;
+        return { data: payload };
+      },
+    })
+  );
+  for (let i = 0; i < 5; i += 1) {
+    assert.deepEqual([...hugeReader(i, 2)], [i, i + 1]);
+  }
+  assert.equal(hugeSubstrCalls, 5);
+  assert.equal(hugeFullCalls, 0);
+});
+
+
 
 
 

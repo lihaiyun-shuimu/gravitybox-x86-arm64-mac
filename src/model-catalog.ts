@@ -9,7 +9,7 @@ import {
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const MIN_REMOTE_CAPACITY_TOKENS = 4_096;
-const MAX_REMOTE_CAPACITY_TOKENS = 2_000_000;
+const MAX_REMOTE_CAPACITY_TOKENS = 10_000_000;
 const MIN_OBSERVED_TOKENS = 1_024;
 const MAX_OBSERVED_TOKENS = 10_000_000;
 const PLACEHOLDER_ENUM_RE = /^MODEL_PLACEHOLDER_M(\d+)$/i;

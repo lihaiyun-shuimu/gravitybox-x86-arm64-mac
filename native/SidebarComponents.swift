@@ -61,6 +61,7 @@ final class SidebarRowView: NSTableRowView {
 // MARK: - Refined Sidebar Bottom Launcher Button (Matches SidebarRowView geometry & vector SF Symbols)
 final class SidebarLaunchButton: NSButton {
     override var allowsVibrancy: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     private var hoverTracking: NSTrackingArea?
     private let hoverMotion = DesignMotion()
     private let pressMotion = DesignMotion()
@@ -71,8 +72,13 @@ final class SidebarLaunchButton: NSButton {
         didSet {
             guard oldValue != hovered else { return }
             hoverMotion.animate(in: self, from: hoverProgress, to: hovered ? 1.0 : 0.0, curve: .hover, threshold: 0.04) { [weak self] val in
-                self?.hoverProgress = val
-                self?.needsDisplay = true
+                guard let self else { return }
+                let wasActive = self.hoverProgress > 0.5
+                self.hoverProgress = val
+                if (val > 0.5) != wasActive {
+                    self.syncForegroundColors()
+                }
+                self.needsDisplay = true
             }
         }
     }
@@ -97,6 +103,7 @@ final class SidebarLaunchButton: NSButton {
             hovered = false
             hoverProgress = 0
             pressProgress = 0
+            syncForegroundColors()
         }
     }
 
@@ -110,6 +117,7 @@ final class SidebarLaunchButton: NSButton {
         set {
             badgeLabel.stringValue = newValue
             badgeLabel.isHidden = newValue.isEmpty
+            syncAccessibilityLabel()
             needsDisplay = true
         }
     }
@@ -117,7 +125,18 @@ final class SidebarLaunchButton: NSButton {
     func setDisplayTitle(_ title: String) {
         self.title = title
         titleField.stringValue = title
-        setAccessibilityLabel(title)
+        syncAccessibilityLabel()
+    }
+
+    private func syncAccessibilityLabel() {
+        let titleText = titleField.stringValue
+        let badge = badgeLabel.stringValue
+        guard !badge.isEmpty else {
+            setAccessibilityLabel(titleText)
+            return
+        }
+        let separator = L10n.shared.isEnglish ? ", " : "，"
+        setAccessibilityLabel("\(titleText)\(separator)\(badge)")
     }
 
     override var intrinsicContentSize: NSSize {
@@ -138,7 +157,7 @@ final class SidebarLaunchButton: NSButton {
         setButtonType(.momentaryChange)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 36).isActive = true
-        setAccessibilityLabel(resolvedTitle)
+        syncAccessibilityLabel()
 
         iconView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
         iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 14.5, weight: isUpdatePrompt ? .semibold : .medium)

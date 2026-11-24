@@ -31,7 +31,7 @@ test('跨进程写锁串行化、拒绝活锁、同上下文可重入且完成�
 // Fixture state and hooks are scoped to this group; child cases run serially.
 describeContractGroup("锁与原子写入 · refactor", { concurrency: false }, async () => {
 
-async function state() { const directory = await mkdtemp('/tmp/gb-test-'); await mkdir(join(directory, '词典')); return directory; }
+async function state() { const directory = await mkdtemp(join(tmpdir(), 'gb-test-')); await mkdir(join(directory, '词典')); return directory; }
 test('原子写入在提交前取消时保留原文件', async () => {
   const directory = await state(); try { const path = join(directory, 'personal.json'); await atomicJson(path, { Save: '原译文' }); const abort = new AbortController(); abort.abort(); await assert.rejects(atomicJson(path, { Save: '新译文' }, abort.signal)); assert.deepEqual(JSON.parse(await readFile(path)), { Save: '原译文' }); } finally { await rm(directory, { recursive: true, force: true }); }
 });

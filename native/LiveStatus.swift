@@ -28,6 +28,12 @@ struct LiveStatus {
     var pricingRevision = ""
     var liveAccountEmail = ""
     var oauthClientConfigured = false
+    var sshWindowsCount = 0
+    var activeSshHosts: [String] = []
+    var focusedContextKey = "local"
+    var remoteObservedVersion = 0
+    var remoteSyncRevision = 0
+    var remoteSessions: [[String: Any]] = []
 
     init(_ raw: [String: Any] = [:]) {
         working = (raw["healing"] as? Bool == true) || (raw["runningTasks"] as? Int ?? 0) > 0
@@ -56,6 +62,12 @@ struct LiveStatus {
         pricingRevision = raw["pricingRevision"] as? String ?? ""
         liveAccountEmail = raw["liveAccountEmail"] as? String ?? ""
         oauthClientConfigured = raw["oauthClientConfigured"] as? Bool ?? false
+        sshWindowsCount = (raw["sshWindowsCount"] as? Int) ?? (raw["sshWindows"] as? Int) ?? 0
+        activeSshHosts = raw["activeSshHosts"] as? [String] ?? []
+        focusedContextKey = raw["focusedContextKey"] as? String ?? "local"
+        remoteObservedVersion = raw["remoteObservedVersion"] as? Int ?? 0
+        remoteSyncRevision = (raw["remoteSyncRevision"] as? NSNumber)?.intValue ?? (raw["remoteSyncRevision"] as? Int) ?? 0
+        remoteSessions = raw["remoteSessions"] as? [[String: Any]] ?? []
         if let errors = raw["errors"] as? [String], !errors.isEmpty {
             connectionError = errors.joined(separator: L10n.shared.isEnglish ? "; " : "；")
         }
@@ -111,5 +123,3 @@ struct LiveStatus {
         }
     }
 }
-
-// MARK: - G01/F04: 浅色可读色（只压暗、不换色相；深色沿用系统色）

@@ -29,7 +29,7 @@
   const visible=e=>!!e?.getClientRects().length&&getComputedStyle(e).visibility!=='hidden';
   const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
   function hasDraft(){return engine.draftState().busy;}
-  async function editorHash(){const values=[...document.querySelectorAll('input,textarea,[contenteditable="true"]')].map(e=>e.value??e.textContent??'');const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(values)));return [...new Uint8Array(hash)].map(n=>n.toString(16).padStart(2,'0')).join('');}
+  async function editorHash(){const values=[...document.querySelectorAll('input,textarea,[contenteditable]:not([contenteditable="false"])')].map(e=>e.value??e.textContent??'');const hash=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(values)));return [...new Uint8Array(hash)].map(n=>n.toString(16).padStart(2,'0')).join('');}
   const route=()=>/^\/customizations(?:\/installed)?$/.test(location.pathname)?location.pathname:location.pathname==='/history'?'/history':location.pathname.startsWith('/settings')?'/settings':location.pathname==='/sidecars'?'/automations':'/other';
   function choose(selector,names,root=document){const labels=namesFor(names);const candidates=[...root.querySelectorAll(selector)].filter(e=>visible(e)&&!e.closest(blocked)&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&labels.includes(text(e)));return candidates.length===1?candidates[0]:null;}
   function sidebar(){const labels=namesFor(['Sidebar','侧边栏']);return [...document.querySelectorAll('[aria-label]')].find(e=>labels.includes(e.getAttribute('aria-label'))&&visible(e));}
@@ -167,16 +167,22 @@
     async finish(){
       if(!current)return{routeRestored:false,editorsMatch:false,scrollRestored:0,userIntervened:false,message:msg('页面上下文不可用，恢复情况待确认','Page context unavailable; restoration unconfirmed')};
       const saved=current;
-      for(const type of ['pointerdown','keydown','input','compositionstart','wheel'])document.removeEventListener(type,intercept,true);
-      if(saved.intervened){current=null;return{routeRestored:false,editorsMatch:false,scrollRestored:0,userIntervened:true,message:msg('用户已接管，保留用户当前界面；没有清空或覆盖输入。','User took control; kept current view without clearing or overwriting input.')};}
-      await closeModel();await closeSettings();await wait(150);
-      const index=globalThis.navigation?.currentEntry?.index;
-      const delta=Number.isInteger(index)&&Number.isInteger(saved.index)?index-saved.index:history.length-saved.length;
-      if(location.href!==saved.url&&location.href===saved.lastURL&&delta>0&&delta<=40){history.go(-delta);for(let n=0;n<20&&location.href!==saved.url;n++)await wait(100);}
-      const routeRestored=location.href===saved.url;let restored=0;
-      if(routeRestored){for(const item of saved.scroll){let element=item.element.isConnected?item.element:null;if(!element&&item.id&&/^[\w-]+$/.test(item.id))element=document.querySelector(`[data-testid="${item.id}"]`);if(element){element.scrollTop=item.top;element.scrollLeft=item.left;restored++;}}if(saved.focused?.isConnected)saved.focused.focus({preventScroll:true});}
-      const editorsMatch=routeRestored&&(await editorHash())===saved.hash;const modelMatch=(document.querySelector('[data-testid="model-selector-trigger"]')?.getAttribute('aria-label')??null)===saved.model;current=null;
-      return{routeRestored,editorsMatch,modelMatch,scrollRestored:restored,scrollExpected:saved.scroll.length,userIntervened:false,message:routeRestored&&editorsMatch&&modelMatch?msg('已恢复原页面，编辑区哈希和模型选择一致。','Original view restored with matching editor hash and model selection.'):msg('页面、编辑区或模型选择恢复未完全确认，请检查当前窗口；没有强制改写内容。','View, editor, or model restoration partially unconfirmed; check the current window without forced changes.')};
+      try {
+        if(saved.intervened)return{routeRestored:false,editorsMatch:false,scrollRestored:0,userIntervened:true,message:msg('用户已接管，保留用户当前界面；没有清空或覆盖输入。','User took control; kept current view without clearing or overwriting input.')};
+        await closeModel();await closeSettings();await wait(150);
+        if(saved.intervened)return{routeRestored:false,editorsMatch:false,scrollRestored:0,userIntervened:true,message:msg('用户已接管，保留用户当前界面；没有清空或覆盖输入。','User took control; kept current view without clearing or overwriting input.')};
+        const index=globalThis.navigation?.currentEntry?.index;
+        const delta=Number.isInteger(index)&&Number.isInteger(saved.index)?index-saved.index:history.length-saved.length;
+        if(location.href!==saved.url&&location.href===saved.lastURL&&delta>0&&delta<=40){history.go(-delta);for(let n=0;n<20&&location.href!==saved.url&&!saved.intervened;n++)await wait(100);}
+        if(saved.intervened)return{routeRestored:false,editorsMatch:false,scrollRestored:0,userIntervened:true,message:msg('用户已接管，保留用户当前界面；没有清空或覆盖输入。','User took control; kept current view without clearing or overwriting input.')};
+        const routeRestored=location.href===saved.url;let restored=0;
+        if(routeRestored){for(const item of saved.scroll){let element=item.element.isConnected?item.element:null;if(!element&&item.id&&/^[\w-]+$/.test(item.id))element=document.querySelector(`[data-testid="${item.id}"]`);if(element){element.scrollTop=item.top;element.scrollLeft=item.left;restored++;}}if(saved.focused?.isConnected)saved.focused.focus({preventScroll:true});}
+        const editorsMatch=routeRestored&&(await editorHash())===saved.hash;const modelMatch=(document.querySelector('[data-testid="model-selector-trigger"]')?.getAttribute('aria-label')??null)===saved.model;
+        return{routeRestored,editorsMatch,modelMatch,scrollRestored:restored,scrollExpected:saved.scroll.length,userIntervened:false,message:routeRestored&&editorsMatch&&modelMatch?msg('已恢复原页面，编辑区哈希和模型选择一致。','Original view restored with matching editor hash and model selection.'):msg('页面、编辑区或模型选择恢复未完全确认，请检查当前窗口；没有强制改写内容。','View, editor, or model restoration partially unconfirmed; check the current window without forced changes.')};
+      } finally {
+        for(const type of ['pointerdown','keydown','input','compositionstart','wheel'])document.removeEventListener(type,intercept,true);
+        if(current===saved)current=null;
+      }
     }
   };
   const dispose=engine.dispose.bind(engine);engine.dispose=(...args)=>{for(const type of ['pointerdown','keydown','input','compositionstart','wheel'])document.removeEventListener(type,intercept,true);current=null;delete globalThis.__GRAVITYBOX_ATTACH_DEEP_SCAN__;return dispose(...args);};

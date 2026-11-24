@@ -1421,6 +1421,419 @@ test('Case K: Orchestrator (Neon + Hydrogen) 后切至第 3 个模型 Claude，N
   assert.equal(switchedToClaude.context.modelStages?.[2]?.section, 'primary');
   assert.equal(switchedToClaude.context.modelStages?.[2]?.isActive, true);
 });
+
+test('Case L: 独立模型切至 Orchestrator/新模型思考与首步流式瞬时切换矩阵 (Scenarios 1-6)', async (t) => {
+  t.after(() => clearObservedIdeModelsForTest());
+  clearObservedIdeModelsForTest();
+  registerObservedIdeModels([
+    { modelId: 'gemini-4-neon', displayName: 'Gemini 4 Neon (High)', modelOrAlias: 'MODEL_PLACEHOLDER_M532', modelEnum: 1532 },
+    { modelId: 'gemini-4-hydrogen', displayName: 'Gemini 4 Hydrogen (XHigh)', modelOrAlias: 'MODEL_PLACEHOLDER_M528', modelEnum: 1528 },
+  ]);
+
+  const standaloneHydrogenTurn1 = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 50,
+    endTimeSeconds: 60,
+    rawInputTokens: 12000,
+    cachedReadTokens: 80000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  };
+
+  // Scenario 1: Turn 1 standalone Hydrogen -> switch to Orchestrator Neon & Turn 2 started (stepType: 14, isStreaming: true, executorMetadata) before Neon usage
+  const s1 = buildConversationHudMetrics({
+    conversationId: 'conv-s1-switch-to-orch',
+    sessionRevision: 1,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    isStreaming: true,
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenTurn1,
+      { idx: 2, stepType: 14, status: 3 },
+    ],
+  });
+  assert.equal(s1.context.modelShortLabel, 'Neon');
+  assert.equal(s1.context.modelId, 'gemini-4-neon');
+  assert.equal(s1.context.hasUsageData, false);
+  assert.equal(s1.context.usedTokens, 0);
+  assert.equal(s1.context.usedRatio, 0);
+  assert.equal(s1.context.capacityTokens, 512000);
+  assert.equal(s1.context.modelStages?.length, 2);
+  assert.equal(s1.context.modelStages?.[0]?.modelId, 'gemini-4-neon');
+  assert.equal(s1.context.modelStages?.[0]?.isActive, true);
+  assert.equal(s1.context.modelStages?.[0]?.hasUsageData, false);
+  assert.equal(s1.context.modelStages?.[1]?.modelId, 'gemini-4-hydrogen');
+  assert.equal(s1.context.modelStages?.[1]?.isActive, false);
+  assert.equal(s1.context.modelStages?.[1]?.usedTokens, 92000);
+  assert.equal(s1.context.modelStages?.[1]?.capacityTokens, 200000, 'Turn 1 Hydrogen 应保留自身 200K 显式上限，不被 Turn 2 executorMetadata 污染');
+
+  // Scenario 2a (单元测试): Turn 2 Neon stepType: 15, status: 2, hasUsage: false 且含 estimatedTokensUsed: 120000
+  const neonEstimatedStep = {
+    idx: 3,
+    stepType: 15,
+    status: 2,
+    hasUsage: false,
+    startTimeSeconds: 100,
+    rawInputTokens: 99999,
+    cachedReadTokens: 88888,
+    outputTokens: 77777,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512000,
+      estimatedTokensUsed: 120000,
+    },
+  };
+  const s2Unit = buildConversationHudMetrics({
+    conversationId: 'conv-s2-estimated-ctx',
+    sessionRevision: 1,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    isStreaming: true,
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenTurn1,
+      { idx: 2, stepType: 14, status: 3 },
+      neonEstimatedStep,
+    ],
+  });
+  assert.equal(s2Unit.context.modelShortLabel, 'Neon');
+  assert.equal(s2Unit.context.modelId, 'gemini-4-neon');
+  assert.equal(s2Unit.context.hasUsageData, true);
+  assert.equal(s2Unit.context.usedTokens, 120000);
+  assert.equal(s2Unit.session.samples?.usage, 1, 'estimatedTokensUsed 不得污染 usageSampleCount');
+
+  // Scenario 2b (端到端临时 SQLite DB): 经过 ConversationMetricsEngine.getConversationMetrics 验证 gen_metadata 回填 estimatedTokensUsed
+  const { DatabaseSync } = await import('node:sqlite');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gravitybox-hud-s2-'));
+  try {
+    const convId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const dbPath = path.join(tmpDir, `${convId}.db`);
+    const encodeVarint = (val) => {
+      const bytes = [];
+      let v = BigInt(val);
+      while (v >= 0x80n) {
+        bytes.push(Number((v & 0x7fn) | 0x80n));
+        v >>= 7n;
+      }
+      bytes.push(Number(v));
+      return bytes;
+    };
+    const encodeSubmessage = (fieldNum, innerBytes) => [
+      ...encodeVarint((fieldNum << 3) | 2),
+      ...encodeVarint(innerBytes.length),
+      ...innerBytes,
+    ];
+    const encodeStr = (fieldNum, str) => encodeSubmessage(fieldNum, [...Buffer.from(str, 'utf8')]);
+    const encodeTs = (fieldNum, seconds) => encodeSubmessage(fieldNum, [0x08, ...encodeVarint(seconds), 0x10, 0x00]);
+    const encodeUsage = ({ rawInput = 0, outputTokens = 0, cachedTokens = 0 }) =>
+      encodeSubmessage(9, [
+        (2 << 3) | 0, ...encodeVarint(rawInput),
+        (3 << 3) | 0, ...encodeVarint(outputTokens),
+        (5 << 3) | 0, ...encodeVarint(cachedTokens),
+      ]);
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER NOT NULL, status INTEGER NOT NULL, metadata BLOB);
+      CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+      CREATE TABLE executor_metadata (id TEXT PRIMARY KEY, data BLOB);
+    `);
+
+    const execHex1 = '1122334455667788';
+    const execHex2 = '99aabbccddeeff00';
+    db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(0, 14, 3, null);
+    db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(
+      1,
+      15,
+      3,
+      Buffer.from([
+        ...encodeTs(1, 1794285000),
+        ...encodeTs(8, 1794285008),
+        ...encodeUsage({ rawInput: 12000, cachedTokens: 80000, outputTokens: 500 }),
+        ...encodeSubmessage(12, [...Buffer.from(execHex1, 'hex')]),
+      ])
+    );
+    db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(2, 14, 3, null);
+    db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(
+      3,
+      15,
+      2,
+      Buffer.from([
+        ...encodeTs(1, 1794285010),
+        ...encodeSubmessage(12, [...Buffer.from(execHex2, 'hex')]),
+      ])
+    );
+
+    // gen_metadata 0: Turn 1 Hydrogen usage + 200K 上限
+    const hCwMeta = [(4 << 3) | 0, ...encodeVarint(200000)];
+    const hChatModel = [
+      ...encodeSubmessage(4, [
+        (2 << 3) | 0, ...encodeVarint(12000),
+        (3 << 3) | 0, ...encodeVarint(500),
+        (5 << 3) | 0, ...encodeVarint(80000),
+      ]),
+      ...encodeSubmessage(9, encodeSubmessage(10, hCwMeta)),
+      ...encodeStr(19, 'gemini-4-hydrogen'),
+      ...encodeStr(21, 'Gemini 4 Hydrogen (High)'),
+    ];
+    db.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(
+      0,
+      Buffer.from([
+        ...encodeSubmessage(1, hChatModel),
+        ...encodeSubmessage(2, encodeVarint(1)),
+        ...encodeSubmessage(4, [...Buffer.from(execHex1, 'hex')]),
+      ])
+    );
+
+    // gen_metadata 1: Turn 2 Neon 仅有模型标识（无 estimatedTokensUsed、无 usage）
+    const nPlannerCfg = [
+      (1 << 3) | 0, ...encodeVarint(1532),
+      ...encodeSubmessage(60, [(1 << 3) | 0, ...encodeVarint(1528)]),
+    ];
+    const nChatModelIdentity = [
+      (3 << 3) | 0, ...encodeVarint(1532),
+      ...encodeSubmessage(9, encodeSubmessage(10, [(4 << 3) | 0, ...encodeVarint(512000)])),
+      ...encodeStr(19, 'gemini-4-neon'),
+      ...encodeStr(21, 'Gemini 4 Neon (High)'),
+    ];
+    db.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(
+      1,
+      Buffer.from([
+        ...encodeSubmessage(1, nChatModelIdentity),
+        ...encodeSubmessage(2, encodeVarint(3)),
+        ...encodeSubmessage(3, nPlannerCfg),
+        ...encodeSubmessage(4, [...Buffer.from(execHex2, 'hex')]),
+      ])
+    );
+
+    // gen_metadata 2: 后续关联同一 executionId 的 gen_metadata 回填 estimatedTokensUsed=120000，且不覆盖原有模型身份
+    const nChatModelEstOnly = [
+      ...encodeSubmessage(9, encodeSubmessage(10, [(1 << 3) | 0, ...encodeVarint(120000)])),
+    ];
+    db.prepare('INSERT INTO gen_metadata VALUES (?, ?)').run(
+      2,
+      Buffer.from([
+        ...encodeSubmessage(1, nChatModelEstOnly),
+        ...encodeSubmessage(2, encodeVarint(3)),
+        ...encodeSubmessage(4, [...Buffer.from(execHex2, 'hex')]),
+      ])
+    );
+
+    // executor_metadata: Turn 2 Orchestrator (Neon=1532 + Hydrogen=1528, 512K)
+    const execBlob = Buffer.from(
+      encodeSubmessage(10, [
+        ...encodeSubmessage(1, nPlannerCfg),
+        ...encodeSubmessage(2, [(5 << 3) | 0, ...encodeVarint(512000)]),
+      ])
+    );
+    db.prepare('INSERT INTO executor_metadata VALUES (?, ?)').run('main', execBlob);
+
+    const engine = new ConversationMetricsEngine({ conversationsDir: tmpDir });
+    const e2eMetrics = await engine.getConversationMetrics({
+      conversationId: convId,
+      sessionRevision: 1,
+      modelId: 'Orchestrator Gemini 4 Neon High',
+      isStreaming: true,
+    });
+    assert.equal(e2eMetrics.context.modelShortLabel, 'Neon');
+    assert.equal(e2eMetrics.context.modelId, 'gemini-4-neon');
+    assert.equal(e2eMetrics.context.hasUsageData, true);
+    assert.equal(e2eMetrics.context.usedTokens, 120000);
+    assert.equal(e2eMetrics.context.capacityTokens, 512000);
+    assert.equal(e2eMetrics.tokens.totalTokens, 92500, 'estimatedTokensUsed 不得污染 totalTokens');
+    assert.equal(e2eMetrics.session.samples?.usage, 1, 'estimatedTokensUsed 不得污染 usageSampleCount');
+    assert.equal(e2eMetrics.context.modelStages?.[1]?.capacityTokens, 200000);
+    engine.clearCache();
+    db.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // Scenario 3 (防误切 A): Turn 1 Hydrogen 仍在流式生成中，用户预先下拉切换 Orchestrator Neon -> 必须停留在 Hydrogen
+  const s3 = buildConversationHudMetrics({
+    conversationId: 'conv-s3-anti-premature-switch',
+    sessionRevision: 1,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    isStreaming: true,
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      { ...standaloneHydrogenTurn1, status: 2 },
+    ],
+  });
+  assert.equal(s3.context.modelShortLabel, 'Hydrogen');
+  assert.equal(s3.context.modelId, 'gemini-4-hydrogen');
+  assert.equal(s3.context.hasUsageData, true);
+  assert.equal(s3.context.usedTokens, 92000);
+
+  // Scenario 4 (防误切 B): Turn 2 Neon 规划完毕，Hydrogen 执行器已运行或正在工具思考 -> 不得跳回 Neon
+  const neonTurn2Step = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 100,
+    endTimeSeconds: 110,
+    rawInputTokens: 5000,
+    cachedReadTokens: 90000,
+    cacheWriteTokens: 0,
+    outputTokens: 600,
+    generation: {
+      modelEnum: 1532,
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenTurn2ExecStep = {
+    idx: 4,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 112,
+    endTimeSeconds: 118,
+    rawInputTokens: 10000,
+    cachedReadTokens: 130000,
+    cacheWriteTokens: 0,
+    outputTokens: 700,
+    generation: {
+      modelEnum: 1528,
+      planModelEnum: 1528,
+      executionModelEnum: 1528,
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+      maxContextTokens: 512000,
+    },
+  };
+  const s4 = buildConversationHudMetrics({
+    conversationId: 'conv-s4-executor-stays-hydrogen',
+    sessionRevision: 1,
+    modelId: 'Orchestrator Gemini 4 Neon High',
+    isStreaming: true,
+    executorMetadata: {
+      planModelEnum: 1532,
+      executionModelEnum: 1528,
+      checkpointMaxTokenLimit: 512000,
+    },
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      standaloneHydrogenTurn1,
+      { idx: 2, stepType: 14, status: 3 },
+      neonTurn2Step,
+      hydrogenTurn2ExecStep,
+      { idx: 5, stepType: 21, status: 2, startTimeSeconds: 119 },
+    ],
+  });
+  assert.equal(s4.context.modelShortLabel, 'Hydrogen');
+  assert.equal(s4.context.modelId, 'gemini-4-hydrogen');
+  assert.equal(s4.context.usedTokens, 140000);
+
+  // Scenario 5 (切回历史模型): Turn 1 Neon -> Turn 2 Hydrogen -> Turn 3 刚切回 Neon 发起流式 -> 立即激活 Neon 并恢复 Turn 1 自有上下文水位
+  const neonTurn1Step = {
+    idx: 1,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 20,
+    endTimeSeconds: 30,
+    rawInputTokens: 5000,
+    cachedReadTokens: 90000,
+    cacheWriteTokens: 0,
+    outputTokens: 400,
+    generation: {
+      responseModel: 'gemini-4-neon',
+      modelDisplayName: 'Gemini 4 Neon (High)',
+      maxContextTokens: 512000,
+    },
+  };
+  const hydrogenTurn2Standalone = {
+    idx: 3,
+    stepType: 15,
+    status: 3,
+    hasUsage: true,
+    startTimeSeconds: 50,
+    endTimeSeconds: 60,
+    rawInputTokens: 12000,
+    cachedReadTokens: 80000,
+    cacheWriteTokens: 0,
+    outputTokens: 500,
+    generation: {
+      responseModel: 'gemini-4-hydrogen',
+      modelDisplayName: 'Gemini 4 Hydrogen (High)',
+      maxContextTokens: 200000,
+    },
+  };
+  const s5 = buildConversationHudMetrics({
+    conversationId: 'conv-s5-switch-back-to-prior',
+    sessionRevision: 1,
+    modelId: 'Gemini 4 Neon (High)',
+    isStreaming: true,
+    steps: [
+      { idx: 0, stepType: 14, status: 3 },
+      neonTurn1Step,
+      { idx: 2, stepType: 14, status: 3 },
+      hydrogenTurn2Standalone,
+      { idx: 4, stepType: 14, status: 3 },
+    ],
+  });
+  assert.equal(s5.context.modelShortLabel, 'Neon');
+  assert.equal(s5.context.modelId, 'gemini-4-neon');
+  assert.equal(s5.context.hasUsageData, true);
+  assert.equal(s5.context.usedTokens, 95000, '切回历史模型时应恢复 Turn 1 Neon 自有上下文用量');
+  assert.equal(s5.context.capacityTokens, 512000);
+
+  // Scenario 6 (中止新轮): Turn 2 在无 usage 前被中止 (status 4/6/7, isStreaming: false) -> 不得卡死在空 Neon 槽位
+  for (const abortedStatus of [4, 6, 7]) {
+    const s6 = buildConversationHudMetrics({
+      conversationId: `conv-s6-aborted-${abortedStatus}`,
+      sessionRevision: 1,
+      modelId: 'Orchestrator Gemini 4 Neon High',
+      isStreaming: false,
+      executorMetadata: {
+        planModelEnum: 1532,
+        executionModelEnum: 1528,
+        checkpointMaxTokenLimit: 512000,
+      },
+      steps: [
+        { idx: 0, stepType: 14, status: 3 },
+        standaloneHydrogenTurn1,
+        { idx: 2, stepType: 14, status: 3 },
+        { idx: 3, stepType: 15, status: abortedStatus, hasUsage: false },
+      ],
+    });
+    assert.equal(s6.context.modelShortLabel, 'Hydrogen', `status=${abortedStatus} 中止后不应卡在空 Neon 槽位`);
+    assert.equal(s6.context.modelId, 'gemini-4-hydrogen');
+    assert.equal(s6.context.hasUsageData, true);
+    assert.equal(s6.context.usedTokens, 92000);
+  }
+});
 });
 
 describeContractGroup("HUD 前端探针 · resolveSubagentState 等待/阻塞态过滤", { concurrency: false }, async () => {

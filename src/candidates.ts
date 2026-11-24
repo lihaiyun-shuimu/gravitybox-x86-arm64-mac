@@ -16,7 +16,7 @@ export function pendingIdentity(item:PendingItem){return item.translationKey??it
 
 export function describeContext(scope:{route:string;kind:string}){
   const routeKeys:Record<string,string>={'/':'candidate.route.home','/settings':'candidate.route.settings','/history':'candidate.route.history','/customizations':'candidate.route.customizations','/customizations/installed':'candidate.route.installed','/sidecars':'candidate.route.automations','/automations':'candidate.route.automations','/other':'candidate.route.other','/fixture':'candidate.route.fixture'};
-  const kindKeys:Record<string,string>={button:'candidate.kind.button',heading:'candidate.kind.heading',tooltip:'candidate.kind.tooltip',placeholder:'candidate.kind.placeholder',menuitem:'candidate.kind.menuitem',tab:'candidate.kind.tab',label:'candidate.kind.label',description:'candidate.kind.description',attribute:'candidate.kind.attribute',option:'candidate.kind.option',toast:'candidate.kind.toast'};
+  const kindKeys:Record<string,string>={button:'candidate.kind.button',heading:'candidate.kind.heading',tooltip:'candidate.kind.tooltip',placeholder:'candidate.kind.placeholder',menuitem:'candidate.kind.menuitem',tab:'candidate.kind.tab',label:'candidate.kind.label',description:'candidate.kind.description',attribute:'candidate.kind.attribute',option:'candidate.kind.option',toast:'candidate.kind.toast',template:'candidate.kind.template'};
   return `${bt(routeKeys[scope.route]??'candidate.route.default')} · ${bt(kindKeys[scope.kind]??'candidate.kind.default')}`;
 }
 

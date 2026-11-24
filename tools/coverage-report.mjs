@@ -34,6 +34,7 @@ import { loadDictionaryLayers, compareLayers } from '../dist/dictionary.js';
 import { SUPPORTED_BUNDLES, extractUiStrings, foldDictionaryKey, normalizeText as normalized } from '../dist/bundle.js';
 import { verifyExtractionSnapshot } from './extraction-snapshot.mjs';
 import { extractUiStringsAst } from './extract-ui-ast.mjs';
+import { extractInlineGroupsAst, inlineSlotViolations, resolveInlineGroupCoverage } from './extract-inline-groups-ast.mjs';
 import { PROPER_NOUNS } from '../dist/coverage.js';
 import { appVersion as detectInstalledAppVersion } from './extract-ui-strings.mjs';
 export { PROPER_NOUNS };
@@ -271,16 +272,32 @@ export function reconcile(uiStrings, entries, bundleSource) {
  * "词典里的键在 main.js 里找不到"不等于该词条没用（可能来自尚未提取的界面），
  * 强行拦下会逼出"为了过门禁而删有效词条"的错误行为。它作为待人工复核清单输出。
  */
-export const DEFAULT_GATE = { minUiCoverage: 0.98, maxMissing: 0, maxProperNounViolations: 0 };
+export const DEFAULT_GATE = {
+  minUiCoverage: 0.98,
+  maxMissing: 0,
+  maxProperNounViolations: 0,
+  maxInlineGroupMissing: 0,
+  maxInlineSlotViolations: 0,
+};
 
 export function evaluateGate(summary, gate = DEFAULT_GATE, source = { verified: false, reason: '未提供界面包来源校验' }) {
+  const inlineSlotViolationCount = summary.inlineSlotViolations ?? 0;
   const checks = [
     /* 来源校验排第一：没有真实界面包来源时，下面的覆盖率数字没有意义，不能放行。 */
     { name: '界面包来源可验证且与受支持官方指纹一致', actual: source.verified ? '已验证' : '未验证', pass: source.verified === true, detail: source.reason ?? '' },
     { name: `界面位置覆盖率 ≥ ${(gate.minUiCoverage * 100).toFixed(0)}%`, actual: summary.uiCoverage, pass: summary.uiCoverage >= gate.minUiCoverage },
     { name: `需要补译的条数 ≤ ${gate.maxMissing}`, actual: summary.missing, pass: summary.missing <= gate.maxMissing },
     { name: `专有名词违规条数 ≤ ${gate.maxProperNounViolations}`, actual: summary.properNounViolations, pass: summary.properNounViolations <= gate.maxProperNounViolations },
+    { name: `内联占位符槽位违规条数 ≤ ${gate.maxInlineSlotViolations ?? 0}`, actual: inlineSlotViolationCount, pass: inlineSlotViolationCount <= (gate.maxInlineSlotViolations ?? 0) },
   ];
+  if (summary.inlineGroupsScanned === true) {
+    const inlineMissingCount = summary.inlineGroupMissing ?? 0;
+    checks.push({
+      name: `缺失的 JSX 内联组整句 ≤ ${gate.maxInlineGroupMissing ?? 0}`,
+      actual: inlineMissingCount,
+      pass: inlineMissingCount <= (gate.maxInlineGroupMissing ?? 0),
+    });
+  }
   const advisory = [
     { name: '死词条（界面包中找不到，待人工复核）', actual: summary.obsolete, severity: 'info' },
     { name: '提取器未覆盖（词典里有、包里有、但没被提取到）', actual: summary.notExtracted, severity: 'info' },
@@ -344,6 +361,40 @@ export async function runCoverageReport({
   }
   const { covered, missing, caseOnly, templates, fragments, obsolete, notExtracted } = reconcile(uiStrings, entries, bundleSource);
   const violations = preloadedDict?.violations ? [...preloadedDict.violations] : properNounViolations(entries);
+  const slotViolations = preloadedDict?.slotViolations ? [...preloadedDict.slotViolations] : inlineSlotViolations(entries);
+
+  let inlineGroupsScanned = false;
+  let inlineGroupsTotal = 0;
+  let inlineGroupsCovered = 0;
+  let inlineGroupsCompositional = 0;
+  const inlineGroupMissing = [];
+  if (sourceVerification.byteVerified && sourceVerification.bundleSource) {
+    let verifiedBundleSource = bundleSource;
+    if (!verifiedBundleSource) {
+      try { verifiedBundleSource = await readFile(sourceVerification.bundleSource, 'utf8'); } catch { verifiedBundleSource = undefined; }
+    }
+    if (verifiedBundleSource) {
+      inlineGroupsScanned = true;
+      const foldedEntries = new Map();
+      for (const [k, meta] of entries) {
+        const rawKey = stripScopedPrefix(k);
+        const f = foldDictionaryKey(rawKey);
+        if (!foldedEntries.has(f)) foldedEntries.set(f, meta.value);
+      }
+      const extractedGroups = extractInlineGroupsAst(verifiedBundleSource);
+      inlineGroupsTotal = extractedGroups.length;
+      for (const item of extractedGroups) {
+        const res = resolveInlineGroupCoverage(item.text, foldedEntries);
+        if (res.covered) {
+          inlineGroupsCovered += 1;
+          if (res.mode === 'compositional') inlineGroupsCompositional += 1;
+        } else {
+          inlineGroupMissing.push(item);
+        }
+      }
+    }
+  }
+
   const positional = covered.length + missing.length + caseOnly.length;
   const summary = {
     appVersion: uiStrings.appVersion,
@@ -362,6 +413,12 @@ export async function runCoverageReport({
     templates: templates.length,
     fragments: fragments.length,
     properNounViolations: violations.length,
+    inlineSlotViolations: slotViolations.length,
+    inlineGroupsScanned,
+    inlineGroupsTotal,
+    inlineGroupsCovered,
+    inlineGroupsCompositional,
+    inlineGroupMissing: inlineGroupMissing.length,
     // caseOnly 在运行时由无大小写折叠查表命中（engine.js foldedMap），不能当作未翻译。
     uiCoverage: positional ? (covered.length + caseOnly.length) / positional : 0,
   };
@@ -378,6 +435,8 @@ export async function runCoverageReport({
     obsolete: obsolete.slice(0, 500),
     notExtracted: notExtracted.slice(0, 500),
     properNounViolations: violations,
+    inlineSlotViolations: slotViolations,
+    inlineGroupMissing: inlineGroupMissing.sort((a, b) => (b.count ?? 0) - (a.count ?? 0) || a.text.localeCompare(b.text)),
     templates: templates.slice(0, 200),
     fragments: fragments.slice(0, 200),
   };

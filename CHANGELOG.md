@@ -6,6 +6,22 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+### Added
+- **SSH 远程窗口零外部 `ssh` 适配**：通过本机 CDP 通道适配 Antigravity `2.33.0+` SSH 远程窗口（不拉起外部 `ssh` 进程），提供完整双语热适配、实时 HUD（含降级状态）、与本机隔离的 `本机 / SSH: <host>` 只读配额查看及活跃 SSH 保护提醒（`src/ssh-context.ts` / `src/ssh-remote-rpc.ts`）。
+- **本机 + SSH 统一多环境用量账本**：保持 `PRAGMA user_version = 2` 兼容，新增 `sync_receipts` 原子提交与同源 RPC 增量同步（按 `trajectoryId` 去重并基于时间线判定账号归属），上线合并总览、`本机 % · SSH %` 占比与 `environmentId × accountId` 筛选（`src/remote-usage-sync.ts` / `src/usage-ledger.ts`）。
+- **HTTP / HTTPS 网络代理支持**：支持关闭、跟随 macOS 系统代理或手动配置 `http(s)://` 代理，为 Antigravity 注入环境变量并检测运行中进程的代理生效与 Shell 覆盖状态（`src/proxy.ts` / `native/SystemProxy.swift`）。
+- **Antigravity `2.34.0` 收录、BTW 分栏与目录更新**：收录 `2.34.0` 官方指纹与词典（`ui-strings/2.34.0.json`），支持 BTW 侧边提问分栏 HUD 观测与克隆前缀去重计费；为 `gemini-2.5-pro` 补全 `> 200K` 上下文阶梯定价、移除 `gpt-oss-120b`，并放宽未来模型前缀识别与过滤非商业订阅等级标签（`src/pricing.ts` / `assets/model-catalog.json`）。
+
+### Changed
+- **启动方式重构为「启动时自动打开 Antigravity」**：因新版 Antigravity 官方应用默认不再开启调试端口（且本工具坚持不修改官方安装包），原「跟随 Antigravity 启停」已替换为 **「启动时自动打开 Antigravity」**（打开 GravityBox 时自动驻留菜单栏并拉起带调试端口的 Antigravity），同时将安全重启等待放宽至 15 秒并防止重复触发（`native/Configuration.swift` / `native/AssistantProcessLifecycle.swift` / `native/Preferences.swift`）。
+- **SSH 多主机 UI 与用量展示统一**：总览页新增伴生 SSH 主机列表与下钻顶栏、菜单栏支持可展开范围切换胶囊、用量页内嵌环境占比条、账号页新增远端只读卡片，并统一主界面与菜单栏的「部分计价 / 未计价」及「缓存命中率」展示口径（`native/Presentation.swift`）。
+
+### Fixed
+- **`sqlite-worker` 稳定性修复（`#26`，致谢 `@Agonie0v0`）**：修复无活跃事务关闭连接时的句柄泄漏，并优化中等 BLOB 的单次切片读取（`src/sqlite-worker.ts`）。
+- **原生交互与本地化/安全加固**：完善 `firstMouse` 首次点击响应、`NSMenu` 弹窗锚定与收起行为；隔离 IDE 内联/非内联翻译模板并新增组合式回退，同时加固切号回滚与维护进程守卫（进程探测为 `unknown` 时拒绝清理）。
+
 ## [1.1.3] - 2026-11-21
 
 ### Added
@@ -25,7 +41,7 @@
 - **Unified HUD Prior Model Context & Neutral Role Badges**：取消「Orchestrator 上下文」独立特例标题，将多模型与编排器阶段收敛为单一平铺「曾用模型上下文 / Prior Model Context」列表（仅展示非当前模型）；上下文卡片顶部微调至 `344px` 保持单行不折行，并以统一的原生磨砂中性灰胶囊标记「规划 / Plan」与「执行 / Exec」角色（`runtime/hud-instance.js` / `runtime/hud-styles.js` / `runtime/hud-i18n.js` / `assets/i18n/`）。
 
 ### Fixed
-- **HUD Streaming, Subagent Attribution & Projection Accuracy**：按物理 `modelId` 实现 1:1 去重，修复编排器规划阶段待介入执行槽位未吸收历史同模型记录导致 `Hydrogen` 重复出现后消失的问题；同步修正独立子代理分栏 `backendIsStreaming` 门控与退出复位、`findLastSubstantiveStep` 跳过尾部透明交接步（`101`/`98`）、`isSubagentTrajectory` 排除 `trajectory_metadata_blob` 自身 UUID 引用防误判、`step_type 85/127/132` 双大字段超 64KB 时保留 `render_info` Protobuf 投影、`hasValidStartedAtField4` 未来时间戳上界校验、`resolveEffectivePricingTable` 历史账本回退 `billingPrices` 与远端清空复位，以及多子代理跨并发波次两阶段防抖保活与严格隔离父会话的同子库模型回退（`hud-instance.js` / `metrics-engine.ts` / `sqlite-worker.ts`）。
+- **HUD Streaming, Subagent Attribution & Projection Accuracy**：修正独立子代理分栏 `backendIsStreaming` 门控与退出复位、`findLastSubstantiveStep` 跳过尾部透明交接步（`101`/`98`）、`isSubagentTrajectory` 排除 `trajectory_metadata_blob` 自身 UUID 引用防误判、`step_type 85/127/132` 双大字段超 64KB 时保留 `render_info` Protobuf 投影、`hasValidStartedAtField4` 未来时间戳上界校验、`resolveEffectivePricingTable` 历史账本回退 `billingPrices` 与远端清空复位，以及多子代理跨并发波次两阶段防抖保活与严格隔离父会话的同子库模型回退（`hud-instance.js` / `metrics-engine.ts` / `sqlite-worker.ts`）。
 - **Account Readiness, Enterprise Boundary, Recovery & Pricing Integrity**：补齐 `quota_refresh_error_code` 四端投影并收敛非鉴权错误误报；抽取 `resolveUnsavedLiveSubscriptionTier` 防止未保存 `enterprise_vertex` 账号误判 `FREE`；补齐中断回滚恢复路径对同源 `agy` CLI 凭据的对称还原、`autoHealUnpricedHistory` 仅统计实际有效新落锁数量、`importAccountsFromJson` 非字符串字段类型清洗与换新 `refresh_token` 时重置过期 `access_token`、`MenuFloatingPanel` 淡入与异步缩放顶边锚定竞态、菜单栏单账号卡片 `QuotaPresentation.warningSummary` 渲染、`PricingSyncSheetController` 空格型 `Orchestrator <Model>` 折叠、对齐 Claude API / Gemini Developer API 最新官方定价来源与生效区间，并消除 `AppUpdateManager` Swift 6 Sendable 编译警告（`account-quota.ts` / `accounts.ts` / `account-switch.ts` / `usage.ts` / `pricing.ts` / `main.ts` / `Assistant.swift` / `AppUpdateManager.swift` / `model-catalog.json` / `pricing-feed.json`）。
 - **Antigravity `2.34.0` Live Quota Probe & Current Account Save (`#24`)**：兼容 Antigravity `2.34.0` 将本地 `language_server` CSRF 令牌从命令行参数迁移至环境变量 `ANTIGRAVITY_SERVER_CSRF_TOKEN` 的变更（通过 `ps eww` 读取同 UID 进程环境并结合扩展端口与端口探测兜底，规避误退化到云端 `missing_oauth_client` 报错）；修复「保存当前账号」合并桌面 `state.vscdb` / 钥匙串凭据时保留最新 `access_token` 与过期时间，并在实时配额刷新失败时不落盘过期/空配额缓存，同时补齐未配置 `.env` 场景下禁用/过期错误码提示文案（`account-probe.ts` / `accounts.ts` / `account-quota.ts` / `assets/i18n/`）。
 
@@ -193,7 +209,8 @@
 ### Fixed
 - **Native UI**：保持菜单栏状态图标在不同翻译开关状态下的不透明度一致（`b9921e8`，已包含于 1.0.0）。
 
-[Unreleased]: https://github.com/Enzoo404/gravitybox/compare/v1.1.3...HEAD
+[Unreleased]: https://github.com/Enzoo404/gravitybox/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/Enzoo404/gravitybox/compare/v1.1.3...v1.2.0
 [1.1.3]: https://github.com/Enzoo404/gravitybox/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/Enzoo404/gravitybox/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/Enzoo404/gravitybox/compare/v1.1.0...v1.1.1

@@ -451,6 +451,25 @@ try {
     assert.equal(await main.evaluate('document.querySelector("#j04-notail-link")?.textContent'), 'quuxdocs');
     await main.evaluate('document.querySelector("#j04-notail-probe").remove()');
   });
+  await check('内联组防劫持与句子级组合回退：权限/删除确认完整汉化，未收录长句保持英文，MCP短标题正常汉化', async () => {
+    await main.evaluate(`document.body.insertAdjacentHTML('beforeend',
+      '<div id="inline-combo-probe" data-gravitybox-ui>' +
+        '<span id="perm-sub">Configure what the agent can do in local and remote conversations. <a id="perm-link" href="https://example.com">Learn more</a>.</span>' +
+        '<p id="del-confirm">Are you sure you want to delete <strong>my-mcp</strong>? This action cannot be undone.</p>' +
+        '<span id="unknown-cfg">Configure frobnicator widgets across orbital clusters. <a id="unknown-cfg-link" href="/x">Learn more</a>.</span>' +
+        '<h2 id="mcp-cfg-title">Configure chrome-devtools</h2>' +
+      '</div>'
+    )`);
+    await until(async () => await text(main, '#perm-sub') === '配置智能体在本地与远程对话中的操作权限。 了解更多。');
+    assert.equal(await main.evaluate('document.querySelector("#perm-link")?.textContent'), '了解更多');
+    assert.equal(await main.evaluate('document.querySelector("#perm-link")?.getAttribute("href")'), 'https://example.com');
+    await until(async () => await text(main, '#del-confirm') === '您确定要删除 my-mcp 吗？此操作无法撤销。');
+    await until(async () => await text(main, '#mcp-cfg-title') === '配置 chrome-devtools');
+    const unknownText = await text(main, '#unknown-cfg');
+    assert.equal(unknownText.includes('配置 frobnicator'), false, '未收录 Configure 长句绝不可被 Configure {server} 劫持成半中半英: ' + unknownText);
+    assert.equal(unknownText.startsWith('Configure frobnicator widgets across orbital clusters.'), true);
+    await main.evaluate('document.querySelector("#inline-combo-probe").remove()');
+  });
   await check('%s/ICU 占位符不支持时明确披露（能力清单与候选标记）', async () => {
     const tree = await main.send('Page.getFrameTree');const context = await main.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
     const caps = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.capabilities()', context.executionContextId);
@@ -1805,6 +1824,73 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     assert.notEqual(compactTagCheck.shortDisplay, 'none');
     assert.equal(compactTagCheck.shortText, 'H');
 
+    // 8. Orchestrator 切回未压缩 Planner (Neon=0次, Hydrogen=2次) 时：常驻胶囊隐藏压缩徽标，对话统计弹窗显示会话总计「共 2 次」
+    await main.evaluate(`document.querySelector('#hud-e2e-fixture').style.width = '560px'`);
+    await main.evaluate(`(() => {
+      const mgr = globalThis.__GRAVITYBOX_HUD_V1__?.manager;
+      const inst = mgr ? [...mgr.instances.values()][0] : null;
+      if (!inst) return;
+      mgr.dispatchMetrics({
+        conversationId: inst.getCurrentConvId(),
+        sessionRevision: inst.getSessionRevision(),
+        metricsSequence: Math.max(Date.now() + 20_000_000, (inst.lastMetricsSequence || 0) + 1),
+        updatedAt: Date.now(),
+        availability: 'ready',
+        isStreaming: false,
+        session: { turns: 6, steps: 28, compactionCount: 2, modelDurationSeconds: 150, toolDurationSeconds: 30, averageTtftSeconds: 1.1, outputTps: 105, outputTpsFormatted: '105 tok/s', currentTurnDurationSeconds: 180, currentTurnDurationCompactZh: '本轮 3m' },
+        tokens: { totalTokens: 85300000, totalTokensCompact: '85.3M tok', cacheHitRate: 0.92, cacheHitRateFormatted: '92%' },
+        context: {
+          hasUsageData: true,
+          modelId: 'gemini-4-neon',
+          modelDisplayName: 'Orchestrator (Neon)',
+          modelShortLabel: 'Neon',
+          modelCompactLabel: 'N',
+          isMultiModel: true,
+          isOrchestrator: true,
+          activeModelCompactionCount: 0,
+          usedTokens: 344000,
+          usedTokensCompact: '344K',
+          peakContextTokens: 486000,
+          capacityTokens: 512000,
+          capacityTokensCompact: '512K',
+          isFallbackCapacity: false,
+          usedRatio: 344000 / 512000,
+          usedRatioFormatted: '67.1%',
+          breakdown: { cachedContextTokens: 339000, cachedContextRatio: 66.2, uncachedContextTokens: 5010, uncachedContextRatio: 0.98, latestOutputTokens: 366 },
+          modelStages: [
+            { slotKey: 'orchestrator:neon', role: 'planner', section: 'primary', modelId: 'gemini-4-neon', modelDisplayName: 'Orchestrator (Neon)', shortLabel: 'Neon', compactLabel: 'N', hasUsageData: true, isActive: true, usedTokens: 344000, peakContextTokens: 486000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 344000 / 512000, usedRatioFormatted: '67.1%' },
+            { slotKey: 'orchestrator:hydrogen', role: 'executor', section: 'primary', modelId: 'gemini-4-hydrogen', modelDisplayName: 'Gemini 4 Hydrogen (Orchestrator)', shortLabel: 'Hydrogen', compactLabel: 'H', hasUsageData: true, isActive: false, compactionCount: 2, usedTokens: 183000, peakContextTokens: 183000, capacityTokens: 512000, isFallbackCapacity: false, usedRatio: 183000 / 512000, usedRatioFormatted: '35.7%' }
+          ]
+        }
+      });
+    })()`, ctx.executionContextId);
+    await until(async () => await main.evaluate(`(() => {
+      const sr = document.querySelector('#__gravitybox_hud_host__')?.shadowRoot;
+      return sr?.querySelector('#hud-ctx-model-full')?.textContent.trim() === 'Neon';
+    })()`));
+    const orchIsolationCheck = await main.evaluate(`(() => {
+      const sr = document.querySelector('#__gravitybox_hud_host__').shadowRoot;
+      sr.querySelector('.capsule-session').click();
+      const popSession = sr.querySelector('#hud-popover-session');
+      const popSessionRect = popSession.getBoundingClientRect();
+      const out = {
+        modelLabel: sr.querySelector('#hud-ctx-model-full')?.textContent.trim(),
+        badgeHidden: sr.querySelector('#hud-compaction-badge')?.hasAttribute('hidden'),
+        hasCompClass: sr.querySelector('.capsule-context')?.classList.contains('has-compaction'),
+        sessionCompRowExists: Boolean(sr.querySelector('#row-session-compactions')),
+        popSessionWidth: Math.round(popSessionRect.width),
+        peakText: sr.querySelector('#val-ctx-peak')?.textContent.trim(),
+      };
+      if (!popSession.hasAttribute('hidden')) sr.querySelector('.capsule-session').click();
+      return out;
+    })()`);
+    assert.equal(orchIsolationCheck.modelLabel, 'Neon');
+    assert.equal(orchIsolationCheck.badgeHidden, true, 'Neon 未压缩时常驻胶囊不得显示 Hydrogen 的压缩徽标');
+    assert.equal(orchIsolationCheck.hasCompClass, false);
+    assert.equal(orchIsolationCheck.sessionCompRowExists, false, '对话统计弹窗不应包含上下文压缩行');
+    assert.equal(orchIsolationCheck.popSessionWidth, 296);
+    assert.equal(orchIsolationCheck.peakText.includes('已压缩'), false);
+
     await main.evaluate('document.querySelector("#hud-e2e-fixture").remove()');
     await main.evaluate('globalThis.__GRAVITYBOX_HUD_V1__?.reconcileMounts()', ctx.executionContextId);
     } finally {
@@ -1875,6 +1961,190 @@ ${engine}`,auth.executionContextId);assert.equal(await cdp.evaluate('!!globalThi
     })()`));
     await main.evaluate(`document.querySelector('#binding-pane-0').remove();document.querySelector('#binding-pane-1').remove()`);await command('resume');
     await until(async()=>await text(main,'#settings')==='设置');
+  });
+  await check('SSH 弹窗词条、路径白名单、动态进度与多行错误容器拆译', async () => {
+    const tree = await main.send('Page.getFrameTree');
+    const ctx = await main.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
+    await main.evaluate(`(() => {
+      const tpl = document.querySelector('#ssh-modal-fixture');
+      const frag = tpl.content.cloneNode(true);
+      const p = frag.querySelector('#ssh-dlg-prompt-two-nodes');
+      p.append(document.createTextNode('Enter [user@]host[:port], or pick a host from your SSH config.'), document.createTextNode(' Then create the project in its window.'));
+      document.body.appendChild(frag);
+    })()`);
+    await until(async () => await text(main, '#ssh-dlg-title') === '连接到 SSH 主机');
+    await until(async () => await text(main, '#ssh-cfg-val') === '~/.ssh/config（默认）');
+    assert.equal(await text(main, '#ssh-dlg-prompt-two-nodes'), '输入 [user@]host[:port]，或从您的 SSH 配置中选择主机，然后在该主机窗口中创建项目。');
+    assert.equal((await text(main, '#ssh-cfg-lbl')).trim(), 'SSH 配置：');
+    assert.equal(await text(main, '#ssh-progress'), '正在连接到 demo-host 上运行中的服务…');
+    assert.equal(await text(main, '#ssh-hidden-count'), '2 个已隐藏主机');
+    assert.equal(await text(main, '#ssh-toast-title'), '已连接到 demo-host');
+    assert.equal(await text(main, '#ssh-user-alias'), 'demo-ssh-host', '用户真实 SSH 主机别名必须保留原文');
+    await until(async () => /demo-host 返回：/.test(await text(main, '#ssh-err-text')));
+    const errText = await text(main, '#ssh-err-text');
+    assert.match(errText, /^CONNECTION_FAILED: 无法连接到 SSH 主机。/);
+    assert.match(errText, /demo-host 返回：ssh: connect to host demo-host port 22: Operation timed out/);
+    assert.match(errText, /Logs: \/Users\/demo\/Library\/Logs\/Antigravity\/main\.log/);
+    const toastMsg = await text(main, '#ssh-toast-msg');
+    assert.match(toastMsg, /^SSH_CONFIG_INVALID: SSH 无法使用您的配置文件。/);
+    assert.match(toastMsg, /demo-host 返回：bad configuration option/);
+    assert.match(toastMsg, /Logs: \/Users\/demo\/Library\/Logs\/Antigravity\/main\.log/);
+    assert.equal(typeof await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().scanCount', ctx.executionContextId), 'number');
+    await main.evaluate('document.querySelector("#ssh-fixture-root").remove()');
+  });
+  await check('P1-30 ~ P1-35 & P1-37: 弹窗项目名子元素保护、动态编辑器类名回退、监听不泄漏、相对时间防误译、2.34.0 模板与深扫保护', async () => {
+    const tree = await main.send('Page.getFrameTree');
+    const ctx = await main.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
+
+    // P1-30: 弹窗内嵌套 span 项目按钮与 role="button" 项目控件保持原文
+    await main.evaluate(`(() => {
+      document.body.insertAdjacentHTML('beforeend',
+        '<div id="p1-runtime-probe">' +
+          '<div role="dialog" aria-label="Switch Project">' +
+            '<button id="p1-dlg-proj-btn"><span id="p1-dlg-proj-span">Settings</span></button>' +
+            '<div role="button" id="p1-dlg-proj-role"><span id="p1-dlg-proj-role-span">Settings</span></div>' +
+            '<button id="p1-dlg-normal-btn">Cancel</button>' +
+          '</div>' +
+          '<div id="p1-dyn-code" data-gravitybox-ui><button id="p1-dyn-code-btn">Settings</button></div>' +
+          '<div data-testid="quota-card"><button id="p1-quota-5h">5h</button><button id="p1-quota-7d">7d</button></div>' +
+          '<div data-testid="conversation-row-sidebar"><span id="p1-sidebar-rel">13m</span></div>' +
+          '<div data-gravitybox-ui>' +
+            '<p id="p1-sr-inline">In System Settings, click <strong>+</strong>, choose <strong>Antigravity</strong>, then turn it on.</p>' +
+            '<p id="p1-sr-relaunch">Relaunch Antigravity to finish Screen Recording.</p>' +
+            '<button id="p1-sub-more">Show 3 more subagents</button>' +
+            '<button id="p1-wrap-btn">Enable Word Wrap (Alt+Z)</button>' +
+            '<p id="p1-save-err">Failed to save settings: disk full</p>' +
+          '</div>' +
+          '<div data-message-id="p1-stream-msg" class="markdown"><p id="p1-stream-text">Settings</p></div>' +
+        '</div>'
+      );
+    })()`);
+
+    await until(async () => await text(main, '#p1-dlg-normal-btn') === '取消');
+    await until(async () => await text(main, '#p1-dyn-code-btn') === '设置');
+    await until(async () => await text(main, '#p1-sidebar-rel') === '13分钟前');
+    await until(async () => await text(main, '#p1-sr-relaunch') === '重新启动 Antigravity 以完成屏幕录制配置。');
+
+    // P1-30 断言（含增量修改子节点文本后仍保持英文）
+    assert.equal(await text(main, '#p1-dlg-proj-span'), 'Settings');
+    assert.equal(await text(main, '#p1-dlg-proj-role-span'), 'Settings');
+    await main.evaluate('document.querySelector("#p1-dlg-proj-span").textContent = "Settings"');
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.equal(await text(main, '#p1-dlg-proj-span'), 'Settings');
+
+    // P1-31: 动态添加 .monaco-editor 后必须触发 reconcile 还原英文
+    await main.evaluate('document.querySelector("#p1-dyn-code").classList.add("monaco-editor")');
+    await until(async () => await text(main, '#p1-dyn-code-btn') === 'Settings');
+    await main.evaluate('document.querySelector("#p1-dyn-code").classList.remove("monaco-editor"); document.querySelector("#p1-dyn-code").classList.add("xterm")');
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.equal(await text(main, '#p1-dyn-code-btn'), 'Settings');
+
+    // P1-33: 配额区域 5h / 7d 不被误译为 "5小时前" / "7天前"，侧边栏 13m 与 #time-badge 仍正常
+    assert.equal(await text(main, '#p1-quota-5h'), '5h');
+    assert.equal(await text(main, '#p1-quota-7d'), '7d');
+    assert.equal(await text(main, '#p1-sidebar-rel'), '13分钟前');
+    assert.equal(await text(main, '#time-badge'), '5天前');
+
+    // P1-34: 2.34.0 新增内联与动态模板全部准确汉化
+    assert.equal(await text(main, '#p1-sr-inline'), '请在系统设置中点击 +，选择 Antigravity，然后开启它。');
+    assert.equal(await text(main, '#p1-sub-more'), '显示另外 3 个子智能体');
+    assert.equal(await text(main, '#p1-wrap-btn'), '开启自动换行 (Alt+Z)');
+    assert.equal(await text(main, '#p1-save-err'), '保存设置失败：disk full');
+
+    // P1-35: 流式受保护正文高频更新保持英文且不触发多余扫描错误
+    const beforeScan = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().scanCount', ctx.executionContextId);
+    await main.evaluate(`(() => {
+      const p = document.querySelector('#p1-stream-text');
+      for (let i = 0; i < 20; i++) p.textContent = 'Settings chunk ' + i;
+    })()`);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    const afterScan = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.state().scanCount', ctx.executionContextId);
+    assert.equal(await text(main, '#p1-stream-text'), 'Settings chunk 19');
+    assert.ok(afterScan - beforeScan <= 2, `受保护流式正文变更不应高频触发 flush（scanCount 增量=${afterScan - beforeScan}）`);
+
+    // P1-32: 重复注入引擎脚本不重复注册 focus 监听器
+    await main.send('Page.bringToFront');
+    const engineCode = await readFile(join(root, 'runtime/engine.js'), 'utf8');
+    await main.evaluate(`(() => {
+      globalThis.__p1FocusOrig = globalThis.__gravityboxWindowFocus;
+      globalThis.__p1FocusCalls = 0;
+      globalThis.__gravityboxWindowFocus = (...args) => { globalThis.__p1FocusCalls++; return globalThis.__p1FocusOrig?.(...args); };
+    })()`, ctx.executionContextId);
+    await main.evaluate(engineCode, ctx.executionContextId);
+    await main.evaluate(engineCode, ctx.executionContextId);
+    await main.evaluate('window.dispatchEvent(new Event("focus"))', ctx.executionContextId);
+    const focusCalls = await main.evaluate(`(() => {
+      const n = globalThis.__p1FocusCalls;
+      globalThis.__gravityboxWindowFocus = globalThis.__p1FocusOrig;
+      delete globalThis.__p1FocusOrig;
+      delete globalThis.__p1FocusCalls;
+      return n;
+    })()`, ctx.executionContextId);
+    assert.equal(focusCalls, 1, `重复注入后单次 focus 事件仅应触发 1 次回调，实际 ${focusCalls}`);
+
+    // P1-37: deepScan editorHash 覆盖 contenteditable="plaintext-only"
+    const savedInputVal = await main.evaluate('document.querySelector("#input").value');
+    await main.evaluate(`(() => {
+      document.querySelector("#p1-runtime-probe")?.remove();
+      document.querySelector("#input").value = "";
+      document.body.insertAdjacentHTML("beforeend", '<div id="p1-plain-ed" contenteditable="plaintext-only"></div>');
+    })()`);
+    const beginRes = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.deepScan.begin([])', ctx.executionContextId);
+    assert.equal(beginRes.ok, true, JSON.stringify(beginRes));
+    await main.evaluate('document.querySelector("#p1-plain-ed").textContent = "user typed"');
+    const finishRes = await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.deepScan.finish()', ctx.executionContextId);
+    assert.equal(finishRes.editorsMatch, false, 'plaintext-only 编辑区内容变化必须被 editorHash 检测到');
+    await main.evaluate(`(() => {
+      document.querySelector("#p1-plain-ed")?.remove();
+      document.querySelector("#input").value = ${JSON.stringify(savedInputVal)};
+    })()`);
+  });
+  await check('P0-01: 节点原位复用进入保护区后自动恢复原文并注销记录，切语言不覆盖用户新值', async () => {
+    const tree = await main.send('Page.getFrameTree');
+    const ctx = await main.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: 'GRAVITYBOX-localization-v1' });
+    await main.evaluate(`(() => {
+      document.body.insertAdjacentHTML('beforeend',
+        '<div id="p0-reuse-wrap">' +
+          '<button id="p0-reuse-msg">Settings</button>' +
+          '<button id="p0-reuse-role">Settings</button>' +
+          '<a id="p0-reuse-link" href="/settings">Settings</a>' +
+          '<button id="p0-reuse-user">Settings</button>' +
+        '</div>');
+    })()`);
+    await until(async () =>
+      (await text(main, '#p0-reuse-msg')) === '设置' &&
+      (await text(main, '#p0-reuse-role')) === '设置' &&
+      (await text(main, '#p0-reuse-link')) === '设置' &&
+      (await text(main, '#p0-reuse-user')) === '设置'
+    );
+
+    // 1. 节点原位加上 data-message-id / data-message-author-role / 会话 href 后，必须恢复原文并注销翻译记录
+    await main.evaluate(`(() => {
+      document.querySelector('#p0-reuse-msg').setAttribute('data-message-id', 'msg-1');
+      document.querySelector('#p0-reuse-role').setAttribute('data-message-author-role', 'user');
+      document.querySelector('#p0-reuse-link').setAttribute('href', '/c/12345678-1234-4123-8123-123456789abc');
+    })()`);
+    await until(async () =>
+      (await text(main, '#p0-reuse-msg')) === 'Settings' &&
+      (await text(main, '#p0-reuse-role')) === 'Settings' &&
+      (await text(main, '#p0-reuse-link')) === 'Settings'
+    );
+
+    // 2. 先复用为带保护属性并被用户写入新内容，即使来回切换语言也不得覆盖用户最新正文
+    await main.evaluate(`(() => {
+      const u = document.querySelector('#p0-reuse-user');
+      u.setAttribute('data-message-id', 'msg-user');
+      u.firstChild.nodeValue = 'User edited message Settings';
+    })()`);
+    await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.toggleLanguage("en")', ctx.executionContextId);
+    assert.equal(await text(main, '#p0-reuse-user'), 'User edited message Settings');
+    assert.equal(await text(main, '#p0-reuse-msg'), 'Settings');
+    await main.evaluate('globalThis.__GRAVITYBOX_ENGINE_V1__.toggleLanguage("zh")', ctx.executionContextId);
+    assert.equal(await text(main, '#p0-reuse-user'), 'User edited message Settings');
+    assert.equal(await text(main, '#p0-reuse-msg'), 'Settings');
+    assert.equal(await text(main, '#p0-reuse-role'), 'Settings');
+    assert.equal(await text(main, '#p0-reuse-link'), 'Settings');
+    await main.evaluate('document.querySelector("#p0-reuse-wrap")?.remove()');
   });
   const resources = (await execute('/bin/ps', ['-p', String(backend.pid), '-o', 'rss=,%cpu=,time='])).stdout.trim();
   const finalStatus = await status();

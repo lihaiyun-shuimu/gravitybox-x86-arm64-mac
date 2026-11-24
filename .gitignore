@@ -6,7 +6,6 @@
 *~
 .env
 .env.*
-!.env.example
 
 # Regenerable dependencies, builds and verification output
 /node_modules/
@@ -19,7 +18,8 @@
 /成品/
 /dict/.backups/
 /dict/.imports/
-/文档/当前版本验收摘要.json
+/文档/
+/pricing-watch-alert.json
 /vendor/
 *.dmg
 *.sha256
@@ -30,6 +30,12 @@
 /assets/master-1024.svg
 /assets/icons/*
 !/assets/icons/menu-connected.png
+
+# Unreferenced promotional media (kept locally, excluded from Git)
+/assets/screenshots/*.mp4
+/assets/screenshots/promo-*.png
+/assets/screenshots/cover-*.png
+/assets/screenshots/hud-promo-*.png
 
 # Local assistant instructions
 /AGENTS.md

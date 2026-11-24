@@ -72,7 +72,9 @@ async function createStateVscdb(vscdbPath, {
     'CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);',
     ...rows.map(([k, v]) => `INSERT INTO ItemTable(key, value) VALUES('${k.replaceAll("'", "''")}', '${v.replaceAll("'", "''")}');`),
   ].join('\n');
-  await execFileAsync('/usr/bin/sqlite3', [vscdbPath, sql]);
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(vscdbPath);
+  try { db.exec(sql); } finally { db.close(); }
 }
 
 function makeLiveStatus(email, pct = 82) {

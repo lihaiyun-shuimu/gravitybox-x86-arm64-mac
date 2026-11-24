@@ -59,12 +59,94 @@ export interface HourlyTokenUsage {
   request_count: number;
 }
 
+export interface SyncReceipt {
+  source_id: string;
+  environment_id: string;
+  cursor_offset: number;
+  step_offset: number;
+  last_modified_sec: number;
+  step_count: number;
+  committed_at: number;
+}
+
+export type EnvironmentKind = 'local' | 'ssh';
+export type EnvironmentLifecycleState =
+  | 'online'
+  | 'auth_expired'
+  | 'offline_recent'
+  | 'historical_only';
+export type EnvironmentQuotaFreshness =
+  | 'fresh'
+  | 'stale'
+  | 'error_fallback'
+  | 'auth_expired'
+  | 'offline_snapshot';
+
+export interface EnvironmentNode {
+  environmentId: string;
+  machineId?: string;
+  kind: EnvironmentKind;
+  hostLabel: string;
+  lifecycleState: EnvironmentLifecycleState;
+  windowCount: number;
+  focused: boolean;
+  probing: boolean;
+  accountEmail: string;
+  accountName: string;
+  tier: string;
+  quota: Record<string, unknown> | null;
+  quotaFreshness: EnvironmentQuotaFreshness;
+  lastFocusedAt: number;
+  lastQuotaObservedAt: number | null;
+  lastUsageSyncedAt: number | null;
+  lastError: string;
+}
+
+export interface AvailableEnvironmentUsageOption {
+  id: string;
+  kind: 'all' | 'local' | 'ssh';
+  label: string;
+  host_label?: string;
+  total_tokens?: number;
+  request_count?: number;
+  estimated_usd?: number;
+  online?: boolean;
+  last_synced_at?: number;
+  lifecycle_state?: EnvironmentLifecycleState;
+  window_count?: number;
+}
+
+export interface KnownEnvironmentContext {
+  id: string;
+  kind: 'local' | 'ssh';
+  host_label?: string;
+  label?: string;
+  online?: boolean;
+  last_synced_at?: number;
+  lifecycle_state?: EnvironmentLifecycleState;
+  window_count?: number;
+}
+
+export interface EnvironmentShareBreakdown {
+  local_tokens: number;
+  ssh_tokens: number;
+  local_requests: number;
+  ssh_requests: number;
+  local_usd: number;
+  ssh_usd: number;
+  local_share_pct: number;
+  ssh_share_pct: number;
+  has_ssh_data: boolean;
+  offline_ssh_hosts: string[];
+}
+
 export interface TokenUsagePeriod {
   totals: TokenUsageTotals;
   estimated_usd: number;
   by_model: ModelTokenUsage[];
   priced_models?: number;
   unpriced_models?: number;
+  environment_breakdown?: EnvironmentShareBreakdown;
 }
 
 export interface TokenUsageSummary {
@@ -99,6 +181,13 @@ export interface TokenUsageSummary {
   historical_amount_receipts?: { unmatchedCount: number; unmatchedUsd: number };
   available_accounts?: AvailableAccountUsageOption[];
   selected_account_id?: string;
+  available_environments?: AvailableEnvironmentUsageOption[];
+  selected_environment_id?: string;
+  environment_breakdown?: EnvironmentShareBreakdown;
+  remote_sync_revision?: number;
+  environments?: EnvironmentNode[];
+  environments_revision?: number;
+  focused_environment_id?: string;
 }
 
 export interface AvailableAccountUsageOption {
@@ -117,7 +206,12 @@ export interface GenerationEvent {
   source_observed_at?: number;
   generation_index?: number;
   legacy_event_key?: string;
-  account_confidence?: 'observed' | 'unknown' | 'legacy';
+  account_confidence?: 'observed' | 'inferred' | 'unknown' | 'legacy';
+  environment_kind?: 'local' | 'ssh';
+  environment_id?: string;
+  environment_label?: string;
+  trajectory_id?: string;
+  execution?: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
@@ -129,6 +223,30 @@ export interface GenerationEvent {
   account_email?: string;
   account_type?: 'consumer' | 'enterprise_vertex' | 'unknown';
   project_id?: string;
+}
+
+/**
+ * 归一化事件的执行环境标签；未携带 `environment_kind` 的 1.1.3 本地历史记录
+ * 在内存中默认归为 `{ kind: 'local', id: 'local', label: '' }`，绝不回写改写存量 payload。
+ */
+export function normalizeEventEnvironment(
+  ev?: Pick<GenerationEvent, 'environment_kind' | 'environment_id' | 'environment_label'> | null
+): { kind: 'local' | 'ssh'; id: string; label: string } {
+  if (ev?.environment_kind === 'ssh') {
+    const rawId = typeof ev.environment_id === 'string' ? ev.environment_id.trim() : '';
+    const rawLabel = typeof ev.environment_label === 'string' ? ev.environment_label.trim() : '';
+    const id = rawId || (rawLabel ? `ssh:${rawLabel}` : 'ssh');
+    return {
+      kind: 'ssh',
+      id,
+      label: rawLabel || rawId || 'ssh',
+    };
+  }
+  return {
+    kind: 'local',
+    id: 'local',
+    label: '',
+  };
 }
 
 /**
@@ -326,9 +444,30 @@ export function resolveDynamicOrchestratorModel(
     const m = known.match(versionedRe);
     if (m) return `gemini-${m[1]}-${codename}`;
   }
-  // Only infer gemini-4-<codename> when the upstream ID itself explicitly starts with gemini-pro-orchestrator-
+  // Infer gemini-<highestMajor>-<codename> when the upstream ID itself explicitly starts with gemini-pro-orchestrator-
   if (idCodename) {
-    return `gemini-4-${codename}`;
+    let highestMajor = 0;
+    const majorRe = /^gemini-(\d+)-/i;
+    const considerMajor = (raw: string) => {
+      const cleaned = stripModelProviderPrefix(String(raw ?? '')).trim();
+      const match = cleaned.match(majorRe);
+      if (match) {
+        const major = Number.parseInt(match[1]!, 10);
+        if (Number.isSafeInteger(major) && major > highestMajor) {
+          highestMajor = major;
+        }
+      }
+    };
+    if (siblingModelIds) {
+      for (const raw of siblingModelIds) {
+        considerMajor(raw);
+      }
+    }
+    for (const known of getEffectiveModelAliasKeys()) {
+      considerMajor(known);
+    }
+    const major = highestMajor > 0 ? highestMajor : 4;
+    return `gemini-${major}-${codename}`;
   }
   return null;
 }

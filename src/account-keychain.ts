@@ -1,17 +1,82 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { bt } from './i18n.js';
+import {
+  credDelete,
+  credRead,
+  credWrite,
+  isWindows,
+  Win32HelperError,
+  type Win32HelperOptions,
+} from './platform/index.js';
 
 const execFileAsync = promisify(execFile);
 
+export type KeychainPayloadEncoding = 'go-keyring-base64' | 'raw';
+
 export interface KeychainAdapter {
+  readonly payloadEncoding?: KeychainPayloadEncoding;
   readPassword(service: string, account: string): Promise<string | null>;
   writePassword(service: string, account: string, password: string): Promise<void>;
   deletePassword(service: string, account: string): Promise<void>;
 }
 
-export class SystemKeychainAdapter implements KeychainAdapter {
+/**
+ * Windows Credential Manager adapter backed by `gravitybox-win-helper.exe`.
+ * Uses raw UTF-8 payload bytes to match `zalando/go-keyring/keyring_windows.go`.
+ */
+export class WindowsCredentialManagerAdapter implements KeychainAdapter {
+  readonly payloadEncoding: KeychainPayloadEncoding = 'raw';
+
+  constructor(private readonly options?: Win32HelperOptions) {}
+
   async readPassword(service: string, account: string): Promise<string | null> {
+    try {
+      const value = await credRead(service, account, this.options);
+      return value && value.length > 0 ? value : null;
+    } catch {
+      throw new Error(bt('keychain.err.read'));
+    }
+  }
+
+  async writePassword(service: string, account: string, password: string): Promise<void> {
+    try {
+      await credWrite(service, account, password, this.options);
+    } catch (error) {
+      if (error instanceof Win32HelperError && error.code === 'HELPER_TIMEOUT') {
+        throw new Error(bt('keychain.err.write_timeout'));
+      }
+      throw new Error(bt('keychain.err.write'));
+    }
+  }
+
+  async deletePassword(service: string, account: string): Promise<void> {
+    try {
+      await credDelete(service, account, this.options);
+    } catch {
+      throw new Error(bt('keychain.err.delete'));
+    }
+  }
+}
+
+export class SystemKeychainAdapter implements KeychainAdapter {
+  private readonly windowsAdapter: WindowsCredentialManagerAdapter | null;
+  readonly payloadEncoding: KeychainPayloadEncoding;
+
+  constructor(options?: Win32HelperOptions) {
+    if (isWindows()) {
+      this.windowsAdapter = new WindowsCredentialManagerAdapter(options);
+      this.payloadEncoding = 'raw';
+    } else {
+      this.windowsAdapter = null;
+      this.payloadEncoding = 'go-keyring-base64';
+    }
+  }
+
+  async readPassword(service: string, account: string): Promise<string | null> {
+    if (this.windowsAdapter) {
+      return this.windowsAdapter.readPassword(service, account);
+    }
     try {
       const { stdout } = await execFileAsync('/usr/bin/security', [
         'find-generic-password',
@@ -29,10 +94,13 @@ export class SystemKeychainAdapter implements KeychainAdapter {
   }
 
   async writePassword(service: string, account: string, password: string): Promise<void> {
+    if (this.windowsAdapter) {
+      return this.windowsAdapter.writePassword(service, account, password);
+    }
     return new Promise((resolve, reject) => {
       const q = (val: string) => `"${String(val).replace(/[\\"\r\n]/g, m => (m === '\r' || m === '\n' ? '' : `\\${m}`))}"`;
       // 通过 security -i 批处理从 stdin 传入完整命令与密码，既不在 argv 暴露凭据，也不触发 /dev/tty getpass() 阻塞
-      const child = spawn('/usr/bin/security', ['-i'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn('/usr/bin/security', ['-i'], { stdio: ['pipe', 'ignore', 'pipe'] });
       let settled = false;
       const finish = (err?: Error) => {
         if (settled) return;
@@ -61,6 +129,9 @@ export class SystemKeychainAdapter implements KeychainAdapter {
   }
 
   async deletePassword(service: string, account: string): Promise<void> {
+    if (this.windowsAdapter) {
+      return this.windowsAdapter.deletePassword(service, account);
+    }
     try {
       await execFileAsync('/usr/bin/security', ['delete-generic-password', '-s', service, '-a', account], { timeout: 5000 });
     } catch (error) { if ((error as { code?: number }).code !== 44) throw new Error(bt('keychain.err.delete')); }
@@ -69,6 +140,11 @@ export class SystemKeychainAdapter implements KeychainAdapter {
 
 export class MockKeychainAdapter implements KeychainAdapter {
   private store = new Map<string, string>();
+  readonly payloadEncoding: KeychainPayloadEncoding;
+
+  constructor(options?: { payloadEncoding?: KeychainPayloadEncoding }) {
+    this.payloadEncoding = options?.payloadEncoding ?? 'go-keyring-base64';
+  }
 
   async readPassword(service: string, account: string): Promise<string | null> {
     return this.store.get(`${service}:${account}`) ?? null;
@@ -126,13 +202,44 @@ export function buildGoOauthPayload(acc: KeychainSyncAccount): string {
 }
 
 /**
- * 将指定账号写入系统 Keychain (gemini/antigravity) 免密持久化
+ * 解码系统凭据库中读取的 OAuth JSON 载荷：
+ * - macOS `go-keyring` 使用 `go-keyring-base64:<base64>` 包装；
+ * - Windows `go-keyring` 直接存储原始 UTF-8 JSON `{...}`。
+ */
+export function decodeKeychainOauthPayload(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith('go-keyring-base64:')) {
+    try {
+      return Buffer.from(trimmed.slice('go-keyring-base64:'.length), 'base64').toString('utf8');
+    } catch {
+      return null;
+    }
+  }
+  if (trimmed.startsWith('{')) {
+    return trimmed;
+  }
+  return null;
+}
+
+export function encodeKeychainOauthPayload(
+  acc: KeychainSyncAccount,
+  encoding: KeychainPayloadEncoding = isWindows() ? 'raw' : 'go-keyring-base64',
+): string {
+  const payload = buildGoOauthPayload(acc);
+  if (encoding === 'raw') return payload;
+  const b64 = Buffer.from(payload, 'utf8').toString('base64');
+  return `go-keyring-base64:${b64}`;
+}
+
+/**
+ * 将指定账号写入系统凭据库 (gemini/antigravity) 免密持久化
  */
 export async function syncAccountToKeychain(
   acc: KeychainSyncAccount,
   keychain: KeychainAdapter = new SystemKeychainAdapter()
 ): Promise<void> {
-  const payload = buildGoOauthPayload(acc);
-  const b64 = Buffer.from(payload, 'utf8').toString('base64');
-  await keychain.writePassword('gemini', 'antigravity', `go-keyring-base64:${b64}`);
+  const encoding: KeychainPayloadEncoding = keychain.payloadEncoding ?? 'go-keyring-base64';
+  await keychain.writePassword('gemini', 'antigravity', encodeKeychainOauthPayload(acc, encoding));
 }

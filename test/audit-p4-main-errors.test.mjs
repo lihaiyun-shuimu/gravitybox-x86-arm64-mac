@@ -134,22 +134,11 @@ test('B13: 聚合 accounts.activeTier 对空串/未知值回落 待确认', asyn
   }
 });
 
+import { sendBackendRpc } from './test-ipc.mjs';
+
 // 真实后台契约：dashboard_summary 仍 ok:true，并稳定携带 errors 字段与枚举套餐。
 function rpc(directory, payload) {
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(join(directory, 'control.sock'));
-    const chunks = [];
-    socket.setTimeout(8000, () => { socket.destroy(); reject(new Error('IPC 超时')); });
-    socket.on('connect', () => socket.write(JSON.stringify(payload) + '\n'));
-    socket.on('error', reject);
-    socket.on('data', chunk => {
-      chunks.push(chunk);
-      const buffer = Buffer.concat(chunks);
-      if (!buffer.includes(0x0a)) return;
-      socket.end();
-      try { resolve(JSON.parse(buffer.toString('utf8').split('\n')[0])); } catch { reject(new Error('响应格式错误')); }
-    });
-  });
+  return sendBackendRpc(directory, payload, { timeoutMs: 8000 });
 }
 async function until(fn, timeout = 15000) {
   const deadline = Date.now() + timeout;

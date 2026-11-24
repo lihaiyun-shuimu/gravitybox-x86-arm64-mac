@@ -2303,3 +2303,204 @@ test('CSR 空壳定价页自动回退抓取同路径 .md 并归类为 Google 厂
   assert.match(report.summaryMarkdown, /\| Google \| `200` \| Parsed \(1 models\) \| https:\/\/aistudio\.google\.com\/docs\/pricing\.md \|/);
 });
 
+test('P1-15: 2 位数版本别名生成、预入库优先采用上游上下文窗口、同日 validFrom>=todayStartIso 就地更新防倒挂区间', () => {
+  // 1) 2 位数 Gemini 代号自动生成预入库别名
+  const aliases10 = buildAutoStagedAliases('gemini-10-nova');
+  assert.equal(aliases10['gemini-pro-orchestrator-nova'], 'gemini-10-nova');
+  assert.equal(aliases10['gemini-10-nova-tiered-high'], 'gemini-10-nova');
+  const aliases12 = buildAutoStagedAliases('gemini-12.5-aurora');
+  assert.equal(aliases12['Orchestrator (Aurora)'], 'gemini-12.5-aurora');
+
+  // 2) LiteLLM / OpenRouter 提取 contextWindow 并穿透到 applyStagedNewModels
+  const ltMap = parseLiteLlmRates({
+    'gemini/gemini-10-nova': {
+      input_cost_per_token: 2e-6,
+      output_cost_per_token: 10e-6,
+      cache_read_input_token_cost: 0.2e-6,
+      max_input_tokens: 4_000_000,
+    },
+  });
+  const orMap = parseOpenRouterRates({
+    data: [
+      {
+        id: 'openai/o10-mini',
+        context_length: 1_048_576,
+        pricing: { prompt: '0.000001', completion: '0.000004', input_cache_read: '0.0000001' },
+      },
+    ],
+  });
+  assert.equal(ltMap.get('gemini-10-nova')?.contextWindow, 4_000_000);
+  assert.equal(orMap.get('o10-mini')?.contextWindow, 1_048_576);
+
+  const nowMs = Date.parse('2026-11-22T12:00:00Z');
+  const staged = evaluateNewModelStagingCandidate({
+    id: 'gemini-10-nova',
+    vendor: 'Google',
+    url: 'https://cloud.google.com/vertex-ai/generative-ai/pricing',
+    official: {
+      officialModelName: 'Gemini 10 Nova',
+      inputPer1M: 2.0,
+      outputPer1M: 10.0,
+      cachedPer1M: 0.2,
+      confidence: 'high',
+      evidenceVerified: true,
+    },
+    litellm: ltMap.get('gemini-10-nova'),
+    nowMs,
+  });
+  assert.equal(staged.stageable, true);
+  assert.equal(staged.contextWindow, 4_000_000);
+
+  const catalog = { names: {}, capacities: {}, prices: {}, aliases: {}, feedModels: [] };
+  applyStagedNewModels(catalog, [staged], nowMs);
+  assert.equal(catalog.capacities['gemini-10-nova'], 4_000_000, '预入库应优先采用上游 4M 上下文窗口');
+
+  // 3) applyVerifiedPriceUpdate: 无 intervals 但 baseProv.validFrom >= todayStartIso 时就地更新，禁止产生 validFrom > validUntil 倒挂区间
+  const sameDayNoIvCatalog = {
+    prices: {
+      'gemini-10-nova': {
+        model: 'gemini-10-nova',
+        input: 2.0,
+        output: 10.0,
+        cached: 0.2,
+        provenance: {
+          validFrom: '2026-11-22T06:00:00Z',
+          validUntil: null,
+          verification: 'confirmed',
+        },
+      },
+    },
+    pricingVersion: '2026-11-22',
+  };
+  applyVerifiedPriceUpdate(
+    sameDayNoIvCatalog,
+    'gemini-10-nova',
+    { input: 1.8, output: 9.0, cached: 0.18 },
+    nowMs,
+    { bumpVersion: false }
+  );
+  const noIvList = sameDayNoIvCatalog.prices['gemini-10-nova'].intervals;
+  assert.equal(noIvList.length, 1, '同日生效条目无 intervals 时应就地更新而非拆分倒挂区间');
+  assert.equal(noIvList[0].validFrom, '2026-11-22T06:00:00Z');
+  assert.equal(noIvList[0].validUntil, null);
+  assert.equal(noIvList[0].input, 1.8);
+
+  // 4) applyVerifiedPriceUpdate: 已有 intervals 且 activeIv.validFrom >= todayStartIso（非精确等于 00:00:00Z）时同样就地更新
+  const sameDayWithIvCatalog = {
+    prices: {
+      'gemini-10-nova': {
+        model: 'gemini-10-nova',
+        input: 2.0,
+        output: 10.0,
+        cached: 0.2,
+        intervals: [
+          {
+            model: 'gemini-10-nova',
+            validFrom: null,
+            validUntil: '2026-11-21T23:59:59Z',
+            input: 2.5,
+            output: 12.0,
+            cached: 0.25,
+          },
+          {
+            model: 'gemini-10-nova',
+            validFrom: '2026-11-22T08:00:00Z',
+            validUntil: null,
+            input: 2.0,
+            output: 10.0,
+            cached: 0.2,
+          },
+        ],
+      },
+    },
+    pricingVersion: '2026-11-22',
+  };
+  applyVerifiedPriceUpdate(
+    sameDayWithIvCatalog,
+    'gemini-10-nova',
+    { input: 1.75, output: 8.75, cached: 0.175 },
+    nowMs,
+    { bumpVersion: false }
+  );
+  const withIvList = sameDayWithIvCatalog.prices['gemini-10-nova'].intervals;
+  assert.equal(withIvList.length, 2, '同日稍晚 validFrom 的活跃区间应就地更新，不得新增第 3 段导致前段 validUntil 倒挂');
+  assert.equal(withIvList[1].validFrom, '2026-11-22T08:00:00Z');
+  assert.equal(withIvList[1].validUntil, null);
+  assert.equal(withIvList[1].input, 1.75);
+});
+
+test('P2-3: anchor_missing 触发 .md 回退并独立容错，collectExpiringIntervals 按 key+validUntil 去重', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-p2-3-md-fallback-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const catalogPath = join(dir, 'model-catalog.json');
+  const feedPath = join(dir, 'pricing-feed.json');
+  const reportPath = join(dir, 'report.json');
+  const nowMs = Date.parse('2026-11-22T12:00:00Z');
+
+  // 顶层与 intervals[0] 含相同 validUntil，验证去重后仅告警 1 条
+  const catalog = {
+    schema: 1,
+    names: { 'gemini-3.6-flash': 'Gemini 3.6 Flash' },
+    capacities: { 'gemini-3.6-flash': 1_000_000 },
+    aliases: {},
+    activeModels: ['gemini-3.6-flash'],
+    feedModels: ['gemini-3.6-flash'],
+    pricingVersion: '2026-11-20',
+    pricingUpdatedAt: '2026-11-20T00:00:00Z',
+    prices: {
+      'gemini-3.6-flash': {
+        model: 'gemini-3.6-flash',
+        input: 0.75,
+        output: 3.75,
+        cached: 0.075,
+        validUntil: '2026-11-25T23:59:59Z',
+        provenance: {
+          sourceUrl: 'https://aistudio.google.com/docs/pricing',
+          platform: 'Google AI Studio',
+          validUntil: '2026-11-25T23:59:59Z',
+          verification: 'confirmed',
+        },
+        intervals: [
+          {
+            model: 'gemini-3.6-flash',
+            validFrom: null,
+            validUntil: '2026-11-25T23:59:59Z',
+            input: 0.75,
+            output: 3.75,
+            cached: 0.075,
+          },
+        ],
+      },
+    },
+  };
+  await writeFile(catalogPath, JSON.stringify(catalog, null, 2) + '\n', 'utf8');
+
+  // 1) 主页内容 >= 250 字符但缺失关键词锚点（anchor_missing），且 .md 回退请求抛错 -> 独立 try/catch 保留原 anchor_missing 告警
+  const requested = [];
+  const report = await runAutoUpdatePricing({
+    catalogPath,
+    feedPath,
+    reportPath,
+    dryRun: true,
+    nowMs,
+    geminiApiKey: '',
+    fetchImpl: async (url) => {
+      const target = String(url);
+      requested.push(target);
+      if (target === 'https://aistudio.google.com/docs/pricing') {
+        return new Response(`<html><body><main>${'Welcome to developer portal navigation menu. '.repeat(12)}</main></body></html>`, { status: 200 });
+      }
+      if (target === 'https://aistudio.google.com/docs/pricing.md') {
+        throw new Error('simulated md fallback network failure');
+      }
+      if (target.includes('litellm')) return new Response(JSON.stringify({}), { status: 200 });
+      if (target.includes('openrouter')) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      return new Response('', { status: 404 });
+    },
+  });
+
+  assert.ok(requested.includes('https://aistudio.google.com/docs/pricing.md'), 'anchor_missing 应触发 .md 回退探测');
+  assert.ok(report.pageAlerts.some((msg) => msg.includes('anchor_missing')), '.md 回退抛错不得掩盖原始 anchor_missing 告警');
+  assert.equal(report.expiring.length, 1, '顶层与 intervals 重复的同 key+validUntil 应去重为 1 条');
+});
+

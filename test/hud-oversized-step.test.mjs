@@ -94,9 +94,22 @@ function generationBlob({
   ]);
 }
 
+const openDbsByTest = new WeakMap();
+function trackDb(t, db) {
+  let list = openDbsByTest.get(t);
+  if (!list) { list = []; openDbsByTest.set(t, list); }
+  list.push(db);
+  return db;
+}
+function closeTrackedDbs(t) {
+  const list = openDbsByTest.get(t);
+  if (!list) return;
+  for (const db of list.splice(0)) { try { db.close(); } catch {} }
+}
+
 function createWalDb(t, dir, id, parentId) {
-  const db = new DatabaseSync(path.join(dir, `${id}.db`));
-  t.after(() => db.close());
+  const db = trackDb(t, new DatabaseSync(path.join(dir, `${id}.db`)));
+  t.after(() => { try { db.close(); } catch {} });
   db.exec(`
     PRAGMA journal_mode = WAL;
     CREATE TABLE steps (
@@ -132,7 +145,7 @@ function createWalDb(t, dir, id, parentId) {
 
 test('oversized write_file step_type=132 does not freeze HUD turns, context/model, or incremental stepPrefixCutoffIdx', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-oversized-step-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
   const mainId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
   const db = createWalDb(t, dir, mainId);
@@ -270,7 +283,7 @@ test('oversized write_file step_type=132 does not freeze HUD turns, context/mode
 
 test('subagent step_type=132 with >64KB field 4.8 result still preserves 4.2 & 4.3 and aggregates child DB', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gb-hud-oversized-subagent-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => { closeTrackedDbs(t); fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }); });
 
   const mainId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
   const childId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';

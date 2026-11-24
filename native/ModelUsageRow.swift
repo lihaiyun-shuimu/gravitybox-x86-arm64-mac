@@ -9,7 +9,7 @@ final class ModelUsageRow: NSView {
     init(name: String, rawModelId: String? = nil, tokens: String, input: String, output: String, requests: Int, cost: String, share: Int, shareText: String? = nil, isUnpriced explicitUnpriced: Bool? = nil) {
         let isUnpriced = explicitUnpriced ?? (cost == L10n.t("menu_panel.usage.unpriced") || cost == "未计价" || cost == "Unpriced")
         let copyId = (rawModelId?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 } ?? name
-        nameLabel = text(Self.displayName(name), size: 13, weight: .semibold)
+        nameLabel = text(name, size: 13, weight: .semibold)
         costLabel = text(cost, size: 14, weight: .semibold, color: isUnpriced ? Design.secondary : .labelColor)
         tokensLabel = text(L10n.t("usage.model_row.tokens", ["tokens": tokens]), size: 12, weight: .medium)
         super.init(frame: .zero)
@@ -17,12 +17,12 @@ final class ModelUsageRow: NSView {
         identifier = NSUserInterfaceItemIdentifier("model-usage-row")
         nameLabel.lineBreakMode = .byTruncatingMiddle
         nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        nameLabel.setAccessibilityLabel(L10n.t("usage.model_row.a11y", ["display": Self.displayName(name), "id": copyId]))
+        nameLabel.setAccessibilityLabel(L10n.t("usage.model_row.a11y", ["display": name, "id": copyId]))
         tokensLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         costLabel.font = .monospacedDigitSystemFont(ofSize: isUnpriced ? 12.5 : 14, weight: .semibold)
         costLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let icon = symbol("sparkles", size: 15, color: Design.secondary)
+        let icon = symbol("hexagon", size: 15, color: Design.secondary)
         if let brand = ModelIcons.brands(for: name).first, let image = ModelIcons.image(brand) {
             icon.image = image
             icon.contentTintColor = ModelIcons.tintColor(for: image)
@@ -63,10 +63,6 @@ final class ModelUsageRow: NSView {
         fillWidth(heading, in: body)
         fillWidth(metrics, in: body)
         setAccessibilityElement(false)
-    }
-
-    static func displayName(_ id: String) -> String {
-        id
     }
 
     required init?(coder: NSCoder) { fatalError() }

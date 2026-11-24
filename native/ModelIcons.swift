@@ -20,7 +20,7 @@ enum ModelIcons {
     }
     static func fallbackIcon(size: CGFloat = 13) -> NSImage? {
         let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
-        let img = NSImage(systemSymbolName: "sparkles", accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+        let img = NSImage(systemSymbolName: "hexagon", accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
         img?.isTemplate = true
         return img
     }

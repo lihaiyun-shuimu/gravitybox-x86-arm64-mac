@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { atomicJson, readOptionalJson } from './files.js';
 import { APP_VERSION } from './version.js';
 import {
@@ -20,6 +20,7 @@ import {
   type ApiPricingInterval,
 } from './pricing.js';
 import { bt } from './i18n.js';
+import { resolveOutboundFetch } from './proxy.js';
 
 export interface PricingSyncMutableState {
   lastRemoteSyncAt: number;
@@ -311,7 +312,8 @@ async function fetchBoundedPricingFeed(
     if (options?.force) {
       headers['Cache-Control'] = 'no-cache';
     }
-    res = await fetch(currentUrl, {
+    const outboundFetch = resolveOutboundFetch(globalThis.fetch);
+    res = await outboundFetch(currentUrl, {
       signal,
       redirect: 'manual',
       headers,
@@ -419,6 +421,29 @@ function persistPricingSyncStatus(
   }).catch(() => {});
 }
 
+async function isRemotePricingCacheValid(cachePath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(cachePath, 'utf8');
+    if (!raw.trim()) return false;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const prices = (parsed as Record<string, unknown>).prices;
+    if (!prices || typeof prices !== 'object' || Array.isArray(prices)) return false;
+    validateRawPrices(prices);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isCdnMirrorUrl(rawUrl: string): boolean {
+  try {
+    return new URL(rawUrl).hostname.toLowerCase() === 'cdn.jsdelivr.net';
+  } catch {
+    return false;
+  }
+}
+
 export async function executeRemotePricingSync(options: {
   candidateUrls: string[];
   remotePricingCachePath: string;
@@ -428,14 +453,20 @@ export async function executeRemotePricingSync(options: {
   force?: boolean;
 }): Promise<{ synced: boolean; unchanged?: boolean; error?: string; count?: number; sourceUrl?: string; version?: string; updatedAt?: string }> {
   const { candidateUrls, remotePricingCachePath, pricingSyncStatePath, state, now, force } = options;
-  const cacheExists = await access(remotePricingCachePath).then(() => true, () => false);
+  const cacheValid = await isRemotePricingCacheValid(remotePricingCachePath);
   let lastError: any = null;
-  for (const targetUrl of candidateUrls) {
+  let deferredCdnUnchanged:
+    | (() => Promise<{ synced: boolean; unchanged?: boolean; count?: number; sourceUrl?: string; version?: string; updatedAt?: string }>)
+    | null = null;
+  for (let idx = 0; idx < candidateUrls.length; idx++) {
+    const targetUrl = candidateUrls[idx]!;
+    const shouldProbeNextOnUnchanged = idx + 1 < candidateUrls.length && isCdnMirrorUrl(targetUrl);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     try {
       const canUseEtag = Boolean(
-        cacheExists &&
+        cacheValid &&
+        !force &&
         state.lastSyncedEtag &&
         (!state.lastSyncedSourceUrl || targetUrl === state.lastSyncedSourceUrl)
       );
@@ -444,24 +475,34 @@ export async function executeRemotePricingSync(options: {
         force,
       });
       if (fetched.notModified) {
-        state.lastRemoteSyncAt = now;
-        state.lastCheckAt = now;
-        state.nextAutoSyncAt = now + 86_400_000;
-        state.lastSyncSuccess = true;
-        state.lastCheckSuccess = true;
-        state.lastSyncError = null;
-        state.lastSyncedSourceUrl = targetUrl;
-        if (fetched.etag) state.lastSyncedEtag = fetched.etag;
-        await persistPricingSyncStatus(pricingSyncStatePath, state);
-        return {
-          synced: true,
-          unchanged: true,
-          sourceUrl: targetUrl,
-          version: state.lastSyncedVersion || PRICING_METADATA.version,
-          updatedAt: state.lastSyncedUpdatedAt || PRICING_METADATA.updatedAt,
+        const finalizeNotModified = async () => {
+          state.lastRemoteSyncAt = now;
+          state.lastCheckAt = now;
+          state.nextAutoSyncAt = now + 86_400_000;
+          state.lastSyncSuccess = true;
+          state.lastCheckSuccess = true;
+          state.lastSyncError = null;
+          state.lastSyncedSourceUrl = targetUrl;
+          if (fetched.etag) state.lastSyncedEtag = fetched.etag;
+          await persistPricingSyncStatus(pricingSyncStatePath, state);
+          return {
+            synced: true,
+            unchanged: true,
+            sourceUrl: targetUrl,
+            version: state.lastSyncedVersion || PRICING_METADATA.version,
+            updatedAt: state.lastSyncedUpdatedAt || PRICING_METADATA.updatedAt,
+          };
         };
+        if (shouldProbeNextOnUnchanged) {
+          deferredCdnUnchanged = finalizeNotModified;
+          continue;
+        }
+        return await finalizeNotModified();
       }
       const { data, sha256 } = parseFetchedFeedBytes(fetched.bytes!);
+      if (data && typeof data === 'object' && !Array.isArray(data) && data.schema !== undefined && data.schema !== 1) {
+        throw new Error(bt('pricing.err.table_invalid'));
+      }
       const prices = data && typeof data === 'object' && data.prices ? data.prices : data;
       const validated = validateRawPrices(prices);
       const remoteMeta = sanitizeRemoteModelMetadata(data);
@@ -479,10 +520,63 @@ export async function executeRemotePricingSync(options: {
         { version: PRICING_METADATA.version, updatedAt: PRICING_METADATA.updatedAt }
       );
       const isOlderDatedFeed = cmpToBuiltin !== null && cmpToBuiltin < 0;
-      if (cacheExists && state.lastSyncedSha256 && sha256 === state.lastSyncedSha256 && (cmpToSynced === null || cmpToSynced === 0)) {
+      const shaUnchanged = Boolean(
+        cacheValid &&
+        state.lastSyncedSha256 &&
+        sha256 === state.lastSyncedSha256 &&
+        (cmpToSynced === null || cmpToSynced === 0)
+      );
+      if (shaUnchanged && !force) {
+        const finalizeShaUnchanged = async () => {
+          resetAndRegisterRemoteModelMetadata(remoteMeta, {
+            onlyNewEntries: isOlderDatedFeed,
+            authoritativeSnapshot: !isOlderDatedFeed,
+          });
+          state.lastRemoteSyncAt = now;
+          state.lastCheckAt = now;
+          state.nextAutoSyncAt = now + 86_400_000;
+          state.lastSyncSuccess = true;
+          state.lastCheckSuccess = true;
+          state.lastSyncError = null;
+          state.lastSyncedSourceUrl = targetUrl;
+          if (fetched.etag) state.lastSyncedEtag = fetched.etag;
+          await persistPricingSyncStatus(pricingSyncStatePath, state);
+          return {
+            synced: true,
+            unchanged: true,
+            count: Object.keys(validated).length,
+            sourceUrl: targetUrl,
+            version: feedVersion,
+            updatedAt: feedUpdatedAt,
+          };
+        };
+        if (shouldProbeNextOnUnchanged) {
+          deferredCdnUnchanged = finalizeShaUnchanged;
+          continue;
+        }
+        return await finalizeShaUnchanged();
+      }
+
+      const persistedPrices = isOlderDatedFeed
+        ? Object.fromEntries(Object.entries(validated).filter(([k]) => !Object.hasOwn(DEFAULT_API_PRICES, k)))
+        : validated;
+      const finalizeWrite = async () => {
         resetAndRegisterRemoteModelMetadata(remoteMeta, {
           onlyNewEntries: isOlderDatedFeed,
           authoritativeSnapshot: !isOlderDatedFeed,
+        });
+        await atomicJson(remotePricingCachePath, {
+          version: 1,
+          syncedAt: new Date(now).toISOString(),
+          sourceUrl: targetUrl,
+          feedVersion,
+          ...(feedUpdatedAt ? { feedUpdatedAt } : {}),
+          sha256,
+          ...(remoteMeta.aliases !== undefined ? { aliases: remoteMeta.aliases } : {}),
+          ...(remoteMeta.activeModels ? { activeModels: remoteMeta.activeModels } : {}),
+          ...(remoteMeta.feedModels ? { feedModels: remoteMeta.feedModels } : {}),
+          ...(remoteMeta.models ? { models: remoteMeta.models } : {}),
+          prices: persistedPrices,
         });
         state.lastRemoteSyncAt = now;
         state.lastCheckAt = now;
@@ -491,64 +585,34 @@ export async function executeRemotePricingSync(options: {
         state.lastCheckSuccess = true;
         state.lastSyncError = null;
         state.lastSyncedSourceUrl = targetUrl;
-        if (fetched.etag) state.lastSyncedEtag = fetched.etag;
+        state.lastSyncedVersion = feedVersion;
+        state.lastSyncedUpdatedAt = feedUpdatedAt;
+        state.lastSyncedEtag = fetched.etag ?? '';
+        state.lastSyncedSha256 = sha256;
         await persistPricingSyncStatus(pricingSyncStatePath, state);
         return {
           synced: true,
-          unchanged: true,
+          unchanged: shaUnchanged,
           count: Object.keys(validated).length,
           sourceUrl: targetUrl,
           version: feedVersion,
           updatedAt: feedUpdatedAt,
         };
-      }
-
-      const persistedPrices = isOlderDatedFeed
-        ? Object.fromEntries(Object.entries(validated).filter(([k]) => !Object.hasOwn(DEFAULT_API_PRICES, k)))
-        : validated;
-      resetAndRegisterRemoteModelMetadata(remoteMeta, {
-        onlyNewEntries: isOlderDatedFeed,
-        authoritativeSnapshot: !isOlderDatedFeed,
-      });
-      await atomicJson(remotePricingCachePath, {
-        version: 1,
-        syncedAt: new Date(now).toISOString(),
-        sourceUrl: targetUrl,
-        feedVersion,
-        ...(feedUpdatedAt ? { feedUpdatedAt } : {}),
-        sha256,
-        ...(remoteMeta.aliases !== undefined ? { aliases: remoteMeta.aliases } : {}),
-        ...(remoteMeta.activeModels ? { activeModels: remoteMeta.activeModels } : {}),
-        ...(remoteMeta.feedModels ? { feedModels: remoteMeta.feedModels } : {}),
-        ...(remoteMeta.models ? { models: remoteMeta.models } : {}),
-        prices: persistedPrices,
-      });
-      state.lastRemoteSyncAt = now;
-      state.lastCheckAt = now;
-      state.nextAutoSyncAt = now + 86_400_000;
-      state.lastSyncSuccess = true;
-      state.lastCheckSuccess = true;
-      state.lastSyncError = null;
-      state.lastSyncedSourceUrl = targetUrl;
-      state.lastSyncedVersion = feedVersion;
-      state.lastSyncedUpdatedAt = feedUpdatedAt;
-      state.lastSyncedEtag = fetched.etag ?? '';
-      state.lastSyncedSha256 = sha256;
-      await persistPricingSyncStatus(pricingSyncStatePath, state);
-      return {
-        synced: true,
-        unchanged: false,
-        count: Object.keys(validated).length,
-        sourceUrl: targetUrl,
-        version: feedVersion,
-        updatedAt: feedUpdatedAt,
       };
+      if (shaUnchanged && shouldProbeNextOnUnchanged) {
+        deferredCdnUnchanged = finalizeWrite;
+        continue;
+      }
+      return await finalizeWrite();
     } catch (err: any) {
       lastError = err;
       continue;
     } finally {
       clearTimeout(timer);
     }
+  }
+  if (deferredCdnUnchanged) {
+    return await deferredCdnUnchanged();
   }
 
   // 所有候选源均尝试失败：保留上次成功同步时间，仅推进检查时间戳与 5 分钟重试冷却

@@ -1157,8 +1157,8 @@ test('动态配额过期阈值：30/60 分钟自动刷新下在周期窗口内�
   }
 });
 
-test('mergeLiveQuotaWithSaved 与 refreshQuota 防止已过期 live reset_time 污染并回退云端核实最新窗口', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'gb-quota-overdue-'));
+test('重置窗口纠偏：live 缺分组不伪改 last_updated；过期 live 桶保留未过期 saved 桶且强刷可回退云端', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gb-reset-overdue-'));
   const origin = 'https://daily-cloudcode-pa.googleapis.com';
   const mgr = new AccountsManager(dir, {
     providerContext: { origin, userAgent: 'antigravity/2.33.0', appVersion: '2.33.0' },
@@ -1279,6 +1279,83 @@ test('mergeLiveQuotaWithSaved 与 refreshQuota 防止已过期 live reset_time �
     const ov = mgr.getAccountQuotaOverview(refreshed, { nowMs });
     assert.equal(ov.geminiFiveHourRemaining, 100);
     assert.equal(ov.familyWindows.gemini.fiveHour?.stale, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('P1-13: OAuth 429/503/invalid_client 保留快照且不影响备用推荐，仅 invalid_grant 触发重新授权', async () => {
+  const { evaluateStandbyCandidate } = await import('../dist/account-quota.js');
+  const { bt } = await import('../dist/i18n.js');
+  const dir = await mkdtemp(join(tmpdir(), 'gb-oauth-429-'));
+  try {
+    const mgr = new AccountsManager(dir);
+    await mgr.init();
+    const nowMs = Date.now();
+    const nowSec = Math.floor(nowMs / 1000);
+    const resetIso = new Date(nowMs + 4 * 3600 * 1000).toISOString();
+    const seed = {
+      models: [{ name: 'gemini-3.8-flash', percentage: 85, percentage_known: true, reset_time: resetIso }],
+      quota_groups: [{
+        display_name: 'Gemini',
+        buckets: [
+          { bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 0.85, remaining_fraction_known: true, reset_time: resetIso },
+          { bucket_id: 'gemini-week', window: 'weekly', remaining_fraction: 0.85, remaining_fraction_known: true, reset_time: resetIso },
+        ],
+      }],
+      last_updated: nowSec,
+      is_forbidden: false,
+      model_forwarding_rules: {},
+    };
+
+    for (const [label, status, body, expectedCode, expectedReadiness] of [
+      ['429 限流', 429, { error: 'rate_limit_exceeded' }, 'oauth_rate_limited', 'needs_refresh'],
+      ['503 故障', 503, { error: 'temporarily_unavailable' }, 'oauth_server_error', 'needs_refresh'],
+      ['invalid_client 配置错误', 401, { error: 'invalid_client' }, 'oauth_client_error', 'needs_refresh'],
+      ['invalid_grant 撤权', 400, { error: 'invalid_grant' }, 'refresh_failed', 'needs_authorization'],
+    ]) {
+      const acc = await mgr.upsertAccount({
+        email: `oauth-${status}-${expectedCode}@example.test`,
+        refreshToken: `1//ref-${expectedCode}`,
+        accessToken: 'pending_refresh',
+        expiryTimestamp: nowSec - 120,
+      });
+      acc.quota = JSON.parse(JSON.stringify(seed));
+      await mgr.saveAccount(acc);
+
+      const savedEnvId = process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+      const savedEnvSecret = process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+      process.env.GRAVITYBOX_GOOGLE_CLIENT_ID = 'test-client-id';
+      process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET = 'test-client-secret';
+      try {
+        await assert.rejects(
+          mgr.refreshQuota(acc.id, async (url) => {
+            if (String(url).includes('oauth2.googleapis.com/token')) {
+              return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+            }
+            throw new Error(`unexpected url: ${url}`);
+          })
+        );
+      } finally {
+        if (savedEnvId === undefined) delete process.env.GRAVITYBOX_GOOGLE_CLIENT_ID;
+        else process.env.GRAVITYBOX_GOOGLE_CLIENT_ID = savedEnvId;
+        if (savedEnvSecret === undefined) delete process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET;
+        else process.env.GRAVITYBOX_GOOGLE_CLIENT_SECRET = savedEnvSecret;
+      }
+
+      const after = await mgr.getAccount(acc.id);
+      assert.equal(after.quota_refresh_error_code, expectedCode, `${label}: 错误码不匹配`);
+      assert.equal(after.quota?.models?.[0]?.percentage, 85, `${label}: 必须保留既有配额快照`);
+      const readiness = accountCredentialReadiness(after, nowSec);
+      assert.equal(readiness.state, expectedReadiness, `${label}: 就绪状态不匹配`);
+      const candidate = evaluateStandbyCandidate(after, 'all', { nowMs });
+      if (expectedReadiness === 'needs_authorization') {
+        assert.equal(candidate, null, `${label}: 明确撤权不得进入备用推荐`);
+      } else {
+        assert.ok(candidate !== null, `${label}: 暂时限流/故障不得剔除备用推荐资格`);
+      }
+      assert.ok(bt(`account_cloud.err.${expectedCode}`));
+    }
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }

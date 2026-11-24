@@ -55,8 +55,8 @@ final class AccountPolicySheet: NSObject {
     unowned let app: Assistant
     let activeAccount: [String: Any]?
     let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: AccountPolicySheet.sheetWidth, height: 340), styleMask: [.titled], backing: .buffered, defer: false)
-    let strategyPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let strategyPopup = DesignPopUpButton(frame: .zero, pullsDown: false)
+    let modelPopup = DesignPopUpButton(frame: .zero, pullsDown: false)
     let monitoredSubLabel = text("", size: 11, color: Design.secondary, wrap: true)
     let reserve = PolicyNumberField(string: "")
     let candidate = PolicyNumberField(string: "")
@@ -75,6 +75,7 @@ final class AccountPolicySheet: NSObject {
     private var candidateSubLabel: NSTextField!
     private let initialRawMonitoredModel: String
     private var userChangedMonitoredScope = false
+    private var saving = false
     private let cancelButton = button(L10n.t("common.cancel", fallback: "取消"), target: nil, action: #selector(cancel))
     let saved: () -> Void
     var onDismiss: (() -> Void)?
@@ -212,7 +213,7 @@ final class AccountPolicySheet: NSObject {
         saveButton.keyEquivalent = "\r"
         errorLabel.isHidden = true
 
-        let headerBadge = iconBadge("arrow.triangle.2.circlepath", tint: Design.blue, size: 32)
+        let headerBadge = iconBadge("arrow.left.arrow.right", tint: Design.blue, size: 32)
         let titleLabel = text(L10n.t("policy.title", fallback: "备用推荐配置"), size: 16, weight: .semibold, color: .labelColor)
         self.titleLabel = titleLabel
         let heading = horizontal([headerBadge, titleLabel, flexibleSpace()], spacing: 10)
@@ -354,10 +355,12 @@ final class AccountPolicySheet: NSObject {
     }
 
     @objc func cancel() {
+        guard !saving else { return }
         window.sheetParent?.endSheet(window)
     }
 
     @objc func save() {
+        guard !saving else { return }
         guard let low = Int(reserve.stringValue.trimmingCharacters(in: .whitespaces)), (1...98).contains(low) else {
             errorLabel.stringValue = L10n.t("policy.error.reserve_range", fallback: "触发阈值请输入 1–98 之间的整数。")
             errorLabel.isHidden = false
@@ -382,7 +385,10 @@ final class AccountPolicySheet: NSObject {
         let strat = strategyPopup.selectedItem?.representedObject as? String ?? "priority"
         let selectedModel = modelPopup.selectedItem?.representedObject as? String ?? "all"
         let model = (!userChangedMonitoredScope && !initialRawMonitoredModel.isEmpty) ? initialRawMonitoredModel : selectedModel
+        saving = true
         saveButton.isEnabled = false
+        cancelButton.isEnabled = false
+        let onSaved = self.saved
         app.bridge.send([
             "command": "auto_switch_set",
             "config": [
@@ -392,13 +398,19 @@ final class AccountPolicySheet: NSObject {
                 "monitored_model": model
             ]
         ]) { [weak self] response in
-            guard let self else { return }
-            self.saveButton.isEnabled = true
             switch response {
             case .success:
-                self.saved()
+                onSaved()
+                guard let self else { return }
+                self.saving = false
+                self.saveButton.isEnabled = true
+                self.cancelButton.isEnabled = true
                 self.cancel()
             case .failure(let error):
+                guard let self else { return }
+                self.saving = false
+                self.saveButton.isEnabled = true
+                self.cancelButton.isEnabled = true
                 self.errorLabel.stringValue = error.localizedDescription
                 self.errorLabel.isHidden = false
                 self.resizeSheetToFit()
